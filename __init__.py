@@ -522,12 +522,12 @@ class OracleMemoryProvider(MemoryProvider):
                     continue
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        for mid, vec in zip(ids, vecs):
-                            if vec is None:
-                                continue
-                            cur.execute(
+                        # Optimize: Use executemany for bulk updating embeddings in a single round-trip
+                        binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
+                        if binds:
+                            cur.executemany(
                                 f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2",
-                                (vec, mid),
+                                binds,
                             )
                     conn.commit()
             except Exception as e:
