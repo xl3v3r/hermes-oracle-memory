@@ -17,9 +17,8 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
-
+from collections import OrderedDict, deque
+from typing import Any
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
@@ -179,7 +178,7 @@ class OracleMemoryProvider(MemoryProvider):
         self._embed_lock = threading.Lock()
         self._embed_cache: OrderedDict[str, array.array] = OrderedDict()
         self._embed_cache_lock = threading.Lock()
-        self._embed_pending: list[tuple[str, str]] = []
+        self._embed_pending: deque[tuple[str, str]] = deque()
         self._embed_worker: threading.Thread | None = None
         self._oci_embed_failed_at: float | None = None
         self._lock = threading.Lock()
@@ -301,31 +300,39 @@ class OracleMemoryProvider(MemoryProvider):
     def _ensure_schema(self) -> None:
         if not self._pool:
             return
+        # Use DBMS_ASSERT to safely quote the table name and EXECUTE IMMEDIATE to run DDL.
+        # This prevents SQL injection vulnerabilities when executing dynamically built schema statements.
         stmts = [
-            f"""
-            CREATE TABLE {self._table} (
-                memory_id VARCHAR2(128) PRIMARY KEY,
-                session_id VARCHAR2(128),
-                agent_id VARCHAR2(64),
-                role VARCHAR2(64),
-                content CLOB,
-                embedding VECTOR,
-                created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
-                target VARCHAR2(32) DEFAULT 'memory',
-                metadata JSON,
-                content_txt VARCHAR2(4000)
-            )
+            """
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' (
+                    memory_id VARCHAR2(128) PRIMARY KEY,
+                    session_id VARCHAR2(128),
+                    agent_id VARCHAR2(64),
+                    role VARCHAR2(64),
+                    content CLOB,
+                    embedding VECTOR,
+                    created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
+                    target VARCHAR2(32) DEFAULT ''memory'',
+                    metadata JSON,
+                    content_txt VARCHAR2(4000)
+                )';
+            END;
             """,
-            f"CREATE SEARCH INDEX {self._table}_txt_idx ON {self._table}(content) FOR JSON",
-            f"ALTER TABLE {self._table} ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP)",
-            f"ALTER TABLE {self._table} ADD (target VARCHAR2(32) DEFAULT 'memory')",
-            f"ALTER TABLE {self._table} ADD (metadata JSON)",
-            f"ALTER TABLE {self._table} ADD (content_txt VARCHAR2(4000))",
+            """
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE SEARCH INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_TXT_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(content) FOR JSON';
+            END;
+            """,
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP)'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (target VARCHAR2(32) DEFAULT ''memory'')'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (metadata JSON)'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (content_txt VARCHAR2(4000))'; END;",
         ]
         with self._pool.acquire() as conn, conn.cursor() as cur:
             for sql in stmts:
                 try:
-                    cur.execute(sql)
+                    cur.execute(sql, [self._table])
                 except Exception as e:
                     if "ORA-01430" not in str(e):  # column already exists
                         logger.debug("schema stmt skipped: %s", e)
@@ -512,8 +519,7 @@ class OracleMemoryProvider(MemoryProvider):
                 if not self._embed_pending:
                     self._embed_worker = None
                     return
-                batch = self._embed_pending[:_EMBED_BATCH]
-                del self._embed_pending[:_EMBED_BATCH]
+                batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
             ids = [m for m, _ in batch]
             texts = [c for _, c in batch]
             try:
@@ -522,12 +528,12 @@ class OracleMemoryProvider(MemoryProvider):
                     continue
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        for mid, vec in zip(ids, vecs):
-                            if vec is None:
-                                continue
-                            cur.execute(
+                        # Optimize: Use executemany for bulk updating embeddings in a single round-trip
+                        binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
+                        if binds:
+                            cur.executemany(
                                 f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2",
-                                (vec, mid),
+                                binds,
                             )
                     conn.commit()
             except Exception as e:
@@ -603,6 +609,83 @@ class OracleMemoryProvider(MemoryProvider):
         if vec is None and not self._onnx_model:
             self._queue_embed_backfill(memory_id, content)
 
+    def _insert_many(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        if not self._pool:
+            raise RuntimeError(self._init_error or "pool not initialized")
+
+        if not rows:
+            return
+
+        binds_list = []
+        backfill_queue = []
+        for row in rows:
+            memory_id = row.get("memory_id")
+            session_id = row.get("session_id") or self._session_id or "none"
+            role = row.get("role")
+            content = row.get("content")
+            target = row.get("target")
+            metadata = row.get("metadata")
+            embedding = row.get("embedding")
+
+            vec = embedding if embedding is not None else None
+            meta = json.dumps(metadata or {})
+            txt = (content or "")[:4000]
+
+            if self._onnx_model:
+                binds = (
+                    memory_id,
+                    session_id,
+                    self._agent_id,
+                    role,
+                    content,
+                    txt,
+                    target,
+                    meta,
+                    txt,
+                )
+            else:
+                binds = (
+                    memory_id,
+                    session_id,
+                    self._agent_id,
+                    role,
+                    content,
+                    vec,
+                    target,
+                    meta,
+                    txt,
+                )
+
+            binds_list.append(binds)
+
+            if vec is None and not self._onnx_model:
+                backfill_queue.append((memory_id, content))
+
+        if self._onnx_model:
+            sql = f"""
+                INSERT INTO {self._table}
+                    (memory_id, session_id, agent_id, role, content, embedding,
+                     created_at, target, metadata, content_txt)
+                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9)
+            """
+        else:
+            sql = f"""
+                INSERT INTO {self._table}
+                    (memory_id, session_id, agent_id, role, content, embedding,
+                     created_at, target, metadata, content_txt)
+                VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
+            """
+
+        with self._pool.acquire() as conn, conn.cursor() as cur:
+            cur.executemany(sql, binds_list)
+            conn.commit()
+
+        for memory_id, content in backfill_queue:
+            self._queue_embed_backfill(memory_id, content)
+
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
         " AND NVL(session_id, 'x') <> 'diagnostic-session-001' "
@@ -613,7 +696,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         cur.execute(sql, binds)
         out = []
-        for row in cur:
+        for row in cur.fetchall():
             content = row[4].read() if isinstance(row[4], oracledb.LOB) else row[4]
             dist = float(row[7]) if row[7] is not None else None
             txt = float(row[6] or 0)
@@ -635,6 +718,142 @@ class OracleMemoryProvider(MemoryProvider):
                 }
             )
         return out
+
+    def _build_text_search_sql(self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+        sql = f"""
+            SELECT memory_id, session_id, agent_id, role, content, target,
+                   SCORE(1) AS txt_score, NULL AS distance
+            FROM {self._table}
+            WHERE CONTAINS(content, :q, 1) > 0
+            {self._JUNK}{tgt_sql}
+            ORDER BY txt_score DESC
+            FETCH FIRST :k ROWS ONLY
+        """
+        binds = {"q": contains_q, "k": fetch_k}
+        if tgt_sql:
+            binds["tgt"] = tgt
+        return sql, binds
+
+    def _build_vector_search_sql(self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+        if self._onnx_model:
+            sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       0 AS txt_score,
+                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                FROM {self._table}
+                WHERE embedding IS NOT NULL
+                {self._JUNK}{tgt_sql}
+                ORDER BY distance ASC
+                FETCH FIRST :k ROWS ONLY
+            """
+            binds = {"qv": query[:4000], "k": fetch_k}
+        else:
+            sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       0 AS txt_score,
+                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
+                FROM {self._table}
+                WHERE embedding IS NOT NULL
+                {self._JUNK}{tgt_sql}
+                ORDER BY distance ASC
+                FETCH FIRST :k ROWS ONLY
+            """
+            binds = {"v": vec, "k": fetch_k}
+
+        if tgt_sql:
+            binds["tgt"] = tgt
+        return sql, binds
+
+    def _build_hybrid_search_sql(self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+        if self._onnx_model:
+            fused_sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           0 AS txt_score,
+                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                    FROM {self._table}
+                    WHERE embedding IS NOT NULL
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY distance ASC
+                    FETCH FIRST :k ROWS ONLY
+                )
+                UNION ALL
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           SCORE(1) AS txt_score, NULL AS distance
+                    FROM {self._table}
+                    WHERE CONTAINS(content, :q, 1) > 0
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY txt_score DESC
+                    FETCH FIRST :k ROWS ONLY
+                )
+            """
+            fused_binds: dict = {
+                "qv": query[:4000],
+                "q": contains_q,
+                "k": fetch_k,
+            }
+        else:
+            fused_sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           0 AS txt_score,
+                           VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
+                    FROM {self._table}
+                    WHERE embedding IS NOT NULL
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY distance ASC
+                    FETCH FIRST :k ROWS ONLY
+                )
+                UNION ALL
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           SCORE(1) AS txt_score, NULL AS distance
+                    FROM {self._table}
+                    WHERE CONTAINS(content, :q, 1) > 0
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY txt_score DESC
+                    FETCH FIRST :k ROWS ONLY
+                )
+            """
+            fused_binds = {"v": vec, "q": contains_q, "k": fetch_k}
+        if tgt_sql:
+            fused_binds["tgt"] = tgt
+        return fused_sql, fused_binds
+
+    def _execute_hybrid_search(
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str
+    ) -> list:
+        fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt)
+        merged: dict = {}
+        try:
+            for r in self._fetch_rows(cur, fused_sql, fused_binds):
+                prev = merged.get(r["memory_id"])
+                if prev:
+                    prev["score"] = round(
+                        min(1.0, prev["score"] + r["score"] * 0.3), 4
+                    )
+                else:
+                    merged[r["memory_id"]] = r
+        except Exception as e:
+            logger.debug(
+                "fused hybrid failed (%s); falling back to vector-only", e
+            )
+            v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt)
+            for r in self._fetch_rows(cur, v_sql, v_binds):
+                merged[r["memory_id"]] = r
+        ranked = sorted(
+            merged.values(), key=lambda x: x["score"], reverse=True
+        )
+        return self._rerank(query, ranked, top_k, cur=cur)
 
     def _search(
         self, query: str, top_k: int = 8, mode: str = "hybrid", target: str = "any"
@@ -658,158 +877,13 @@ class OracleMemoryProvider(MemoryProvider):
         with self._pool.acquire() as conn:
             with conn.cursor() as cur:
                 if mode == "text":
-                    sql = f"""
-                        SELECT memory_id, session_id, agent_id, role, content, target,
-                               SCORE(1) AS txt_score, NULL AS distance
-                        FROM {self._table}
-                        WHERE CONTAINS(content, :q, 1) > 0
-                        {self._JUNK}{tgt_sql}
-                        ORDER BY txt_score DESC
-                        FETCH FIRST :k ROWS ONLY
-                    """
-                    binds = {"q": contains_q, "k": fetch_k}
-                    if tgt_sql:
-                        binds["tgt"] = tgt
+                    sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                     rows = self._fetch_rows(cur, sql, binds)
                 elif mode == "vector":
-                    if self._onnx_model:
-                        sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   0 AS txt_score,
-                                   VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
-                            FROM {self._table}
-                            WHERE embedding IS NOT NULL
-                            {self._JUNK}{tgt_sql}
-                            ORDER BY distance ASC
-                            FETCH FIRST :k ROWS ONLY
-                        """
-                        binds = {"qv": query[:4000], "k": fetch_k}
-                    else:
-                        sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   0 AS txt_score,
-                                   VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
-                            FROM {self._table}
-                            WHERE embedding IS NOT NULL
-                            {self._JUNK}{tgt_sql}
-                            ORDER BY distance ASC
-                            FETCH FIRST :k ROWS ONLY
-                        """
-                        binds = {"v": vec, "k": fetch_k}
-
-                    if tgt_sql:
-                        binds["tgt"] = tgt
+                    sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt)
                     rows = self._fetch_rows(cur, sql, binds)
                 else:
-                    if self._onnx_model:
-                        fused_sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                            UNION ALL
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       SCORE(1) AS txt_score, NULL AS distance
-                                FROM {self._table}
-                                WHERE CONTAINS(content, :q, 1) > 0
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY txt_score DESC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                        """
-                        fused_binds = {
-                            "qv": query[:4000],
-                            "q": contains_q,
-                            "k": fetch_k,
-                        }
-                    else:
-                        fused_sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                            UNION ALL
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       SCORE(1) AS txt_score, NULL AS distance
-                                FROM {self._table}
-                                WHERE CONTAINS(content, :q, 1) > 0
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY txt_score DESC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                        """
-                        fused_binds = {"v": vec, "q": contains_q, "k": fetch_k}
-                    if tgt_sql:
-                        fused_binds["tgt"] = tgt
-                    merged: dict = {}
-                    try:
-                        for r in self._fetch_rows(cur, fused_sql, fused_binds):
-                            prev = merged.get(r["memory_id"])
-                            if prev:
-                                prev["score"] = round(
-                                    min(1.0, prev["score"] + r["score"] * 0.3), 4
-                                )
-                            else:
-                                merged[r["memory_id"]] = r
-                    except Exception as e:
-                        logger.debug(
-                            "fused hybrid failed (%s); falling back to vector-only", e
-                        )
-                        if self._onnx_model:
-                            v_sql = f"""
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            """
-                            v_binds = {"qv": query[:4000], "k": fetch_k}
-                        else:
-                            v_sql = f"""
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            """
-                            v_binds = {"v": vec, "k": fetch_k}
-
-                        if tgt_sql:
-                            v_binds["tgt"] = tgt
-                        for r in self._fetch_rows(cur, v_sql, v_binds):
-                            merged[r["memory_id"]] = r
-                    ranked = sorted(
-                        merged.values(), key=lambda x: x["score"], reverse=True
-                    )
-                    rows = self._rerank(query, ranked, top_k, cur=cur)
+                    rows = self._execute_hybrid_search(cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt)
         return rows[:top_k]
 
     def _rerank(self, query: str, rows: list, top_k: int, cur=None) -> list:
@@ -1101,8 +1175,11 @@ class OracleMemoryProvider(MemoryProvider):
                     return tool_error("memory_id required")
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        sql = f"DELETE FROM {self._table} WHERE memory_id = :1"  # nosec B608
-                        cur.execute(sql, (mid,))
+                        query = f"DELETE FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                        cur.execute(
+                            query,
+                            (mid,),
+                        )
                         n = cur.rowcount
                     conn.commit()
                 if not n:
@@ -1181,17 +1258,20 @@ class OracleMemoryProvider(MemoryProvider):
             for i in range(0, len(words), step):
                 chunks.append(" ".join(words[i : i + max_words]))
         ids = []
+        rows = []
         for i, ch in enumerate(chunks):
             mid = f"chk_{uuid.uuid4().hex[:16]}"
-            self._insert(
-                memory_id=mid,
-                session_id=self._session_id,
-                role="chunk",
-                content=ch,
-                target="memory",
-                metadata={"kind": "chunk", "index": i},
-            )
+            rows.append({
+                "memory_id": mid,
+                "session_id": self._session_id,
+                "role": "chunk",
+                "content": ch,
+                "target": "memory",
+                "metadata": {"kind": "chunk", "index": i},
+            })
             ids.append(mid)
+
+        self._insert_many(rows)
         return ids
 
     def shutdown(self) -> None:
