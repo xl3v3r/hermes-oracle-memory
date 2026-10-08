@@ -602,6 +602,83 @@ class OracleMemoryProvider(MemoryProvider):
         if vec is None and not self._onnx_model:
             self._queue_embed_backfill(memory_id, content)
 
+    def _insert_many(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        if not self._pool:
+            raise RuntimeError(self._init_error or "pool not initialized")
+
+        if not rows:
+            return
+
+        binds_list = []
+        backfill_queue = []
+        for row in rows:
+            memory_id = row.get("memory_id")
+            session_id = row.get("session_id") or self._session_id or "none"
+            role = row.get("role")
+            content = row.get("content")
+            target = row.get("target")
+            metadata = row.get("metadata")
+            embedding = row.get("embedding")
+
+            vec = embedding if embedding is not None else None
+            meta = json.dumps(metadata or {})
+            txt = (content or "")[:4000]
+
+            if self._onnx_model:
+                binds = (
+                    memory_id,
+                    session_id,
+                    self._agent_id,
+                    role,
+                    content,
+                    txt,
+                    target,
+                    meta,
+                    txt,
+                )
+            else:
+                binds = (
+                    memory_id,
+                    session_id,
+                    self._agent_id,
+                    role,
+                    content,
+                    vec,
+                    target,
+                    meta,
+                    txt,
+                )
+
+            binds_list.append(binds)
+
+            if vec is None and not self._onnx_model:
+                backfill_queue.append((memory_id, content))
+
+        if self._onnx_model:
+            sql = f"""
+                INSERT INTO {self._table}
+                    (memory_id, session_id, agent_id, role, content, embedding,
+                     created_at, target, metadata, content_txt)
+                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9)
+            """
+        else:
+            sql = f"""
+                INSERT INTO {self._table}
+                    (memory_id, session_id, agent_id, role, content, embedding,
+                     created_at, target, metadata, content_txt)
+                VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
+            """
+
+        with self._pool.acquire() as conn, conn.cursor() as cur:
+            cur.executemany(sql, binds_list)
+            conn.commit()
+
+        for memory_id, content in backfill_queue:
+            self._queue_embed_backfill(memory_id, content)
+
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
         " AND NVL(session_id, 'x') <> 'diagnostic-session-001' "
@@ -1182,17 +1259,20 @@ class OracleMemoryProvider(MemoryProvider):
             for i in range(0, len(words), step):
                 chunks.append(" ".join(words[i : i + max_words]))
         ids = []
+        rows = []
         for i, ch in enumerate(chunks):
             mid = f"chk_{uuid.uuid4().hex[:16]}"
-            self._insert(
-                memory_id=mid,
-                session_id=self._session_id,
-                role="chunk",
-                content=ch,
-                target="memory",
-                metadata={"kind": "chunk", "index": i},
-            )
+            rows.append({
+                "memory_id": mid,
+                "session_id": self._session_id,
+                "role": "chunk",
+                "content": ch,
+                "target": "memory",
+                "metadata": {"kind": "chunk", "index": i},
+            })
             ids.append(mid)
+
+        self._insert_many(rows)
         return ids
 
     def shutdown(self) -> None:
