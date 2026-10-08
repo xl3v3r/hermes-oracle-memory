@@ -613,7 +613,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         cur.execute(sql, binds)
         out = []
-        for row in cur:
+        for row in cur.fetchall():
             content = row[4].read() if isinstance(row[4], oracledb.LOB) else row[4]
             dist = float(row[7]) if row[7] is not None else None
             txt = float(row[6] or 0)
