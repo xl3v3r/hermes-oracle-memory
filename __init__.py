@@ -301,31 +301,39 @@ class OracleMemoryProvider(MemoryProvider):
     def _ensure_schema(self) -> None:
         if not self._pool:
             return
+        # Use DBMS_ASSERT to safely quote the table name and EXECUTE IMMEDIATE to run DDL.
+        # This prevents SQL injection vulnerabilities when executing dynamically built schema statements.
         stmts = [
-            f"""
-            CREATE TABLE {self._table} (
-                memory_id VARCHAR2(128) PRIMARY KEY,
-                session_id VARCHAR2(128),
-                agent_id VARCHAR2(64),
-                role VARCHAR2(64),
-                content CLOB,
-                embedding VECTOR,
-                created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
-                target VARCHAR2(32) DEFAULT 'memory',
-                metadata JSON,
-                content_txt VARCHAR2(4000)
-            )
+            """
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' (
+                    memory_id VARCHAR2(128) PRIMARY KEY,
+                    session_id VARCHAR2(128),
+                    agent_id VARCHAR2(64),
+                    role VARCHAR2(64),
+                    content CLOB,
+                    embedding VECTOR,
+                    created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
+                    target VARCHAR2(32) DEFAULT ''memory'',
+                    metadata JSON,
+                    content_txt VARCHAR2(4000)
+                )';
+            END;
             """,
-            f"CREATE SEARCH INDEX {self._table}_txt_idx ON {self._table}(content) FOR JSON",
-            f"ALTER TABLE {self._table} ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP)",
-            f"ALTER TABLE {self._table} ADD (target VARCHAR2(32) DEFAULT 'memory')",
-            f"ALTER TABLE {self._table} ADD (metadata JSON)",
-            f"ALTER TABLE {self._table} ADD (content_txt VARCHAR2(4000))",
+            """
+            BEGIN
+                EXECUTE IMMEDIATE 'CREATE SEARCH INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_TXT_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(content) FOR JSON';
+            END;
+            """,
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP)'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (target VARCHAR2(32) DEFAULT ''memory'')'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (metadata JSON)'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (content_txt VARCHAR2(4000))'; END;",
         ]
         with self._pool.acquire() as conn, conn.cursor() as cur:
             for sql in stmts:
                 try:
-                    cur.execute(sql)
+                    cur.execute(sql, [self._table])
                 except Exception as e:
                     if "ORA-01430" not in str(e):  # column already exists
                         logger.debug("schema stmt skipped: %s", e)
