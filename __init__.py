@@ -19,7 +19,6 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from typing import Any
-
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
