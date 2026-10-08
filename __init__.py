@@ -711,6 +711,142 @@ class OracleMemoryProvider(MemoryProvider):
             )
         return out
 
+    def _build_text_search_sql(self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+        sql = f"""
+            SELECT memory_id, session_id, agent_id, role, content, target,
+                   SCORE(1) AS txt_score, NULL AS distance
+            FROM {self._table}
+            WHERE CONTAINS(content, :q, 1) > 0
+            {self._JUNK}{tgt_sql}
+            ORDER BY txt_score DESC
+            FETCH FIRST :k ROWS ONLY
+        """
+        binds = {"q": contains_q, "k": fetch_k}
+        if tgt_sql:
+            binds["tgt"] = tgt
+        return sql, binds
+
+    def _build_vector_search_sql(self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+        if self._onnx_model:
+            sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       0 AS txt_score,
+                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                FROM {self._table}
+                WHERE embedding IS NOT NULL
+                {self._JUNK}{tgt_sql}
+                ORDER BY distance ASC
+                FETCH FIRST :k ROWS ONLY
+            """
+            binds = {"qv": query[:4000], "k": fetch_k}
+        else:
+            sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       0 AS txt_score,
+                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
+                FROM {self._table}
+                WHERE embedding IS NOT NULL
+                {self._JUNK}{tgt_sql}
+                ORDER BY distance ASC
+                FETCH FIRST :k ROWS ONLY
+            """
+            binds = {"v": vec, "k": fetch_k}
+
+        if tgt_sql:
+            binds["tgt"] = tgt
+        return sql, binds
+
+    def _build_hybrid_search_sql(self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+        if self._onnx_model:
+            fused_sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           0 AS txt_score,
+                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                    FROM {self._table}
+                    WHERE embedding IS NOT NULL
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY distance ASC
+                    FETCH FIRST :k ROWS ONLY
+                )
+                UNION ALL
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           SCORE(1) AS txt_score, NULL AS distance
+                    FROM {self._table}
+                    WHERE CONTAINS(content, :q, 1) > 0
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY txt_score DESC
+                    FETCH FIRST :k ROWS ONLY
+                )
+            """
+            fused_binds: dict = {
+                "qv": query[:4000],
+                "q": contains_q,
+                "k": fetch_k,
+            }
+        else:
+            fused_sql = f"""
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           0 AS txt_score,
+                           VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
+                    FROM {self._table}
+                    WHERE embedding IS NOT NULL
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY distance ASC
+                    FETCH FIRST :k ROWS ONLY
+                )
+                UNION ALL
+                SELECT memory_id, session_id, agent_id, role, content, target,
+                       txt_score, distance
+                FROM (
+                    SELECT memory_id, session_id, agent_id, role, content, target,
+                           SCORE(1) AS txt_score, NULL AS distance
+                    FROM {self._table}
+                    WHERE CONTAINS(content, :q, 1) > 0
+                    {self._JUNK}{tgt_sql}
+                    ORDER BY txt_score DESC
+                    FETCH FIRST :k ROWS ONLY
+                )
+            """
+            fused_binds = {"v": vec, "q": contains_q, "k": fetch_k}
+        if tgt_sql:
+            fused_binds["tgt"] = tgt
+        return fused_sql, fused_binds
+
+    def _execute_hybrid_search(
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str
+    ) -> list:
+        fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt)
+        merged: dict = {}
+        try:
+            for r in self._fetch_rows(cur, fused_sql, fused_binds):
+                prev = merged.get(r["memory_id"])
+                if prev:
+                    prev["score"] = round(
+                        min(1.0, prev["score"] + r["score"] * 0.3), 4
+                    )
+                else:
+                    merged[r["memory_id"]] = r
+        except Exception as e:
+            logger.debug(
+                "fused hybrid failed (%s); falling back to vector-only", e
+            )
+            v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt)
+            for r in self._fetch_rows(cur, v_sql, v_binds):
+                merged[r["memory_id"]] = r
+        ranked = sorted(
+            merged.values(), key=lambda x: x["score"], reverse=True
+        )
+        return self._rerank(query, ranked, top_k, cur=cur)
+
     def _search(
         self, query: str, top_k: int = 8, mode: str = "hybrid", target: str = "any"
     ) -> list:
@@ -733,158 +869,13 @@ class OracleMemoryProvider(MemoryProvider):
         with self._pool.acquire() as conn:
             with conn.cursor() as cur:
                 if mode == "text":
-                    sql = f"""
-                        SELECT memory_id, session_id, agent_id, role, content, target,
-                               SCORE(1) AS txt_score, NULL AS distance
-                        FROM {self._table}
-                        WHERE CONTAINS(content, :q, 1) > 0
-                        {self._JUNK}{tgt_sql}
-                        ORDER BY txt_score DESC
-                        FETCH FIRST :k ROWS ONLY
-                    """
-                    binds = {"q": contains_q, "k": fetch_k}
-                    if tgt_sql:
-                        binds["tgt"] = tgt
+                    sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                     rows = self._fetch_rows(cur, sql, binds)
                 elif mode == "vector":
-                    if self._onnx_model:
-                        sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   0 AS txt_score,
-                                   VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
-                            FROM {self._table}
-                            WHERE embedding IS NOT NULL
-                            {self._JUNK}{tgt_sql}
-                            ORDER BY distance ASC
-                            FETCH FIRST :k ROWS ONLY
-                        """
-                        binds = {"qv": query[:4000], "k": fetch_k}
-                    else:
-                        sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   0 AS txt_score,
-                                   VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
-                            FROM {self._table}
-                            WHERE embedding IS NOT NULL
-                            {self._JUNK}{tgt_sql}
-                            ORDER BY distance ASC
-                            FETCH FIRST :k ROWS ONLY
-                        """
-                        binds = {"v": vec, "k": fetch_k}
-
-                    if tgt_sql:
-                        binds["tgt"] = tgt
+                    sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt)
                     rows = self._fetch_rows(cur, sql, binds)
                 else:
-                    if self._onnx_model:
-                        fused_sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                            UNION ALL
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       SCORE(1) AS txt_score, NULL AS distance
-                                FROM {self._table}
-                                WHERE CONTAINS(content, :q, 1) > 0
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY txt_score DESC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                        """
-                        fused_binds = {
-                            "qv": query[:4000],
-                            "q": contains_q,
-                            "k": fetch_k,
-                        }
-                    else:
-                        fused_sql = f"""
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                            UNION ALL
-                            SELECT memory_id, session_id, agent_id, role, content, target,
-                                   txt_score, distance
-                            FROM (
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       SCORE(1) AS txt_score, NULL AS distance
-                                FROM {self._table}
-                                WHERE CONTAINS(content, :q, 1) > 0
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY txt_score DESC
-                                FETCH FIRST :k ROWS ONLY
-                            )
-                        """
-                        fused_binds = {"v": vec, "q": contains_q, "k": fetch_k}
-                    if tgt_sql:
-                        fused_binds["tgt"] = tgt
-                    merged: dict = {}
-                    try:
-                        for r in self._fetch_rows(cur, fused_sql, fused_binds):
-                            prev = merged.get(r["memory_id"])
-                            if prev:
-                                prev["score"] = round(
-                                    min(1.0, prev["score"] + r["score"] * 0.3), 4
-                                )
-                            else:
-                                merged[r["memory_id"]] = r
-                    except Exception as e:
-                        logger.debug(
-                            "fused hybrid failed (%s); falling back to vector-only", e
-                        )
-                        if self._onnx_model:
-                            v_sql = f"""
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            """
-                            v_binds = {"qv": query[:4000], "k": fetch_k}
-                        else:
-                            v_sql = f"""
-                                SELECT memory_id, session_id, agent_id, role, content, target,
-                                       0 AS txt_score,
-                                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
-                                FROM {self._table}
-                                WHERE embedding IS NOT NULL
-                                {self._JUNK}{tgt_sql}
-                                ORDER BY distance ASC
-                                FETCH FIRST :k ROWS ONLY
-                            """
-                            v_binds = {"v": vec, "k": fetch_k}
-
-                        if tgt_sql:
-                            v_binds["tgt"] = tgt
-                        for r in self._fetch_rows(cur, v_sql, v_binds):
-                            merged[r["memory_id"]] = r
-                    ranked = sorted(
-                        merged.values(), key=lambda x: x["score"], reverse=True
-                    )
-                    rows = self._rerank(query, ranked, top_k, cur=cur)
+                    rows = self._execute_hybrid_search(cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt)
         return rows[:top_k]
 
     def _rerank(self, query: str, rows: list, top_k: int, cur=None) -> list:
