@@ -17,7 +17,7 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
@@ -179,7 +179,7 @@ class OracleMemoryProvider(MemoryProvider):
         self._embed_lock = threading.Lock()
         self._embed_cache: OrderedDict[str, array.array] = OrderedDict()
         self._embed_cache_lock = threading.Lock()
-        self._embed_pending: list[tuple[str, str]] = []
+        self._embed_pending: deque[tuple[str, str]] = deque()
         self._embed_worker: threading.Thread | None = None
         self._oci_embed_failed_at: float | None = None
         self._lock = threading.Lock()
@@ -512,8 +512,7 @@ class OracleMemoryProvider(MemoryProvider):
                 if not self._embed_pending:
                     self._embed_worker = None
                     return
-                batch = self._embed_pending[:_EMBED_BATCH]
-                del self._embed_pending[:_EMBED_BATCH]
+                batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
             ids = [m for m, _ in batch]
             texts = [c for _, c in batch]
             try:
