@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 from agent.secret_scope import get_secret
