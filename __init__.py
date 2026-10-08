@@ -1101,10 +1101,8 @@ class OracleMemoryProvider(MemoryProvider):
                     return tool_error("memory_id required")
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        cur.execute(
-                            f"DELETE FROM {self._table} WHERE memory_id = :1",
-                            (mid,),
-                        )
+                        sql = f"DELETE FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                        cur.execute(sql, (mid,))
                         n = cur.rowcount
                     conn.commit()
                 if not n:
