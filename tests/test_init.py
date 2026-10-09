@@ -1,12 +1,16 @@
-import unittest
+import os
 import sys
+import unittest
 from unittest.mock import MagicMock
+
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
 # Use conftest to mock dependencies properly
 import tests.conftest
+from __init__ import _is_internal_gateway_turn, OracleMemoryProvider
 
-# Now we can import the function we want to test
-from __init__ import _is_internal_gateway_turn
 
 class TestInternalGatewayTurn(unittest.TestCase):
 
@@ -46,6 +50,51 @@ class TestInternalGatewayTurn(unittest.TestCase):
     def test_empty_and_none(self):
         self.assertFalse(_is_internal_gateway_turn(""))
         self.assertFalse(_is_internal_gateway_turn(None))
+
+
+class TestOracleMemoryProviderConfigSchema(unittest.TestCase):
+
+    def test_get_config_schema(self):
+        provider = OracleMemoryProvider()
+        schema = provider.get_config_schema()
+
+        self.assertIsInstance(schema, list)
+        self.assertEqual(len(schema), 5)
+
+        expected_keys = {"key", "description", "secret", "required"}
+        for item in schema:
+            self.assertIsInstance(item, dict)
+            self.assertTrue(expected_keys.issubset(item.keys()))
+            self.assertIsInstance(item["key"], str)
+            self.assertIsInstance(item["description"], str)
+            self.assertIsInstance(item["secret"], bool)
+            self.assertIsInstance(item["required"], bool)
+
+            if item["key"] == "user":
+                self.assertEqual(item["env_var"], "OCI_DB_USER")
+                self.assertTrue(item["required"])
+                self.assertTrue(item["secret"])
+            elif item["key"] == "password":
+                self.assertEqual(item["env_var"], "OCI_DB_PASSWORD")
+                self.assertTrue(item["required"])
+                self.assertTrue(item["secret"])
+            elif item["key"] == "dsn":
+                self.assertEqual(item["env_var"], "OCI_DB_DSN")
+                self.assertTrue(item["required"])
+                self.assertTrue(item["secret"])
+            elif item["key"] == "table_name":
+                self.assertEqual(item["env_var"], "HERMES_ORACLE_TABLE")
+                self.assertEqual(item["default"], "hermes_agent_memory")
+                self.assertFalse(item["required"])
+                self.assertFalse(item["secret"])
+            elif item["key"] == "onnx_model_name":
+                self.assertEqual(item["env_var"], "HERMES_ORACLE_ONNX_MODEL")
+                self.assertFalse(item["required"])
+                self.assertFalse(item["secret"])
+
+        keys = {item["key"] for item in schema}
+        self.assertEqual(keys, {"user", "password", "dsn", "table_name", "onnx_model_name"})
+
 
 if __name__ == '__main__':
     unittest.main()
