@@ -35,3 +35,16 @@ tools_mod.registry = tools_registry_mod
 
 sys.modules['tools'] = tools_mod
 sys.modules['tools.registry'] = tools_registry_mod
+
+if 'oracledb' not in sys.modules:
+    try:
+        import oracledb
+    except ImportError:
+        sys.modules['oracledb'] = MagicMock()
+
+if 'oci' not in sys.modules:
+    try:
+        import oci
+    except ImportError:
+        sys.modules['oci'] = MagicMock()
+

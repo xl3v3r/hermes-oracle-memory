@@ -39,3 +39,42 @@ Then restart the gateway / start a new session.
 | `oracle_update` | replace content by memory_id |
 | `oracle_delete` | delete by memory_id |
 | `oracle_chunk` | split text with in-database UTL_TO_CHUNKS |
+
+## Testing & Verification
+
+Unit tests are isolated from external dependencies and live in `tests/`:
+
+```bash
+# Run tests with pytest
+pytest
+
+# Or run with Python's built-in unittest
+python3 -m unittest discover tests
+```
+
+Tests use `tests/conftest.py` which provides lightweight mocks for Hermes host structures (`agent`, `tools`) and database drivers (`oracledb`, `oci`), enabling tests to run cleanly in CI/CD and automated agent environments without needing a live Oracle database.
+
+## Jules AI Agent Integration (jules.google.com)
+
+This repository is maintained and updated asynchronously with [Jules](https://jules.google.com) (`google-labs-jules[bot]`).
+
+### How to Message & Interact with Jules from GitHub
+
+1. **Pull Requests:** When Jules opens a pull request, you can reply directly to any review comment or PR thread with feedback, requested modifications, or next steps. Jules will process your instructions asynchronously and push commits to the PR.
+2. **Issues & Mentions:** You can prompt Jules on issues by mentioning `@google-labs-jules` or adding the `jules` label to the issue.
+3. **Web Interface:** You can also manage tasks, start new prompts, and view execution progress directly at [jules.google.com](https://jules.google.com).
+
+## Packaging & Releases
+
+Package metadata and dependencies are defined in `pyproject.toml` and `plugin.yaml`.
+
+To build the wheel and source distribution:
+
+```bash
+# Using uv
+uv build
+
+# Or using python -m build
+python3 -m build
+```
+

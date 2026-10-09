@@ -1,17 +1,14 @@
-import sys
-import importlib.util
 import os
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-# Get path to root __init__.py
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-init_path = os.path.join(root_dir, "__init__.py")
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
-spec = importlib.util.spec_from_file_location("oracle_plugin", init_path)
-oracle_plugin = importlib.util.module_from_spec(spec)
-sys.modules["oracle_plugin"] = oracle_plugin
-spec.loader.exec_module(oracle_plugin)
+import tests.conftest
+import __init__ as oracle_plugin
 
 
 class TestOraclePlugin(unittest.TestCase):
@@ -75,9 +72,16 @@ class TestOraclePlugin(unittest.TestCase):
 
     def test_unavailable_reason_handles_magicmock(self):
         provider = oracle_plugin.OracleMemoryProvider()
-        with patch.object(oracle_plugin, "get_secret", return_value=MagicMock()):
+        with patch.object(oracle_plugin, "get_secret", return_value=MagicMock()), \
+             patch.dict(sys.modules, {"oracledb": MagicMock()}):
             reason = provider.unavailable_reason()
             self.assertIn("missing env", reason)
+
+    def test_unavailable_reason_missing_oracledb(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        with patch.dict(sys.modules, {"oracledb": None}):
+            reason = provider.unavailable_reason()
+            self.assertEqual(reason, "oracledb is not installed in the Hermes venv")
 
     def test_is_internal_gateway_turn_handles_magicmock(self):
         self.assertFalse(oracle_plugin._is_internal_gateway_turn(MagicMock()))
@@ -85,3 +89,4 @@ class TestOraclePlugin(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

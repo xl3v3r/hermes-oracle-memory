@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-oracle-memory"
+version = "1.0.1"
+description = "Oracle AI Database 26ai memory provider plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Taylor Ripley (xl3v3r)"}
+]
+dependencies = [
+    "oracledb>=4.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"hermes_oracle_memory" = "."}
+package-data = {"hermes_oracle_memory" = ["plugin.yaml"]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
