@@ -1,42 +1,36 @@
-import pytest
 import sys
+import importlib.util
 import os
 
-# Create a minimal mock framework just for this test file
-import importlib.util
-from unittest.mock import MagicMock
+# Get path to root __init__.py
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+init_path = os.path.join(root_dir, "__init__.py")
 
-# Only patch if 'agent' is not already available
-if importlib.util.find_spec('agent') is None:
-    # Safely mock the missing dependencies locally without touching conftest.py
-    # and only if they are genuinely missing (like in an isolated plugin repo)
-    class _MockModule:
-        pass
+spec = importlib.util.spec_from_file_location("oracle_plugin", init_path)
+oracle_plugin = importlib.util.module_from_spec(spec)
+sys.modules["oracle_plugin"] = oracle_plugin
+spec.loader.exec_module(oracle_plugin)
 
-    agent_mock = MagicMock()
-    agent_mock.memory_provider = MagicMock()
-    class DummyMemoryProvider: pass
-    agent_mock.memory_provider.MemoryProvider = DummyMemoryProvider
-    agent_mock.memory_provider.RecallStatus = MagicMock()
-    agent_mock.memory_provider.is_trivial_prompt = MagicMock()
-    agent_mock.secret_scope = MagicMock()
+def test_recall_status_none():
+    provider = oracle_plugin.OracleMemoryProvider()
+    provider._prefetch_count = 0
+    assert provider.recall_status() is None
 
-    tools_mock = MagicMock()
-    tools_mock.registry = MagicMock()
+def test_recall_status_positive():
+    provider = oracle_plugin.OracleMemoryProvider()
+    provider._prefetch_count = 5
+    status = provider.recall_status()
+    assert status is not None
+    assert status.provider_label == "Oracle 26ai"
+    assert status.count == 5
 
-    sys.modules['agent'] = agent_mock
-    sys.modules['agent.memory_provider'] = agent_mock.memory_provider
-    sys.modules['agent.secret_scope'] = agent_mock.secret_scope
-    sys.modules['tools'] = tools_mock
-    sys.modules['tools.registry'] = tools_mock.registry
-
-# Adjust import to import from the current directory where __init__.py is located
-# It acts as a module in this specific plugin directory structure
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from __init__ import OracleMemoryProvider
+def test_recall_status_negative():
+    provider = oracle_plugin.OracleMemoryProvider()
+    provider._prefetch_count = -1
+    assert provider.recall_status() is None
 
 def test_contains_query_edge_cases():
-    provider = OracleMemoryProvider()
+    provider = oracle_plugin.OracleMemoryProvider()
 
     # Test None
     assert provider._contains_query(None) == "memory"
