@@ -1,6 +1,8 @@
 # Oracle 26ai Memory Provider
 
-Primary Hermes memory backend on Oracle Autonomous AI Database (VECTOR + Oracle Text).
+## About
+
+`hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
 
 ## Requirements
 
@@ -56,13 +58,14 @@ Tests use `tests/conftest.py` which provides lightweight mocks for Hermes host s
 
 ## Jules AI Agent Integration (jules.google.com)
 
-This repository is maintained and updated asynchronously with [Jules](https://jules.google.com) (`google-labs-jules[bot]`).
+This repository is maintained and updated asynchronously with [Jules](https://jules.google.com) (`google-labs-jules[bot]`). Contributor guidelines and autonomous agent configuration instructions are defined in [`AGENTS.md`](./AGENTS.md).
 
 ### How to Message & Interact with Jules from GitHub
 
 1. **Pull Requests:** When Jules opens a pull request, you can reply directly to any review comment or PR thread with feedback, requested modifications, or next steps. Jules will process your instructions asynchronously and push commits to the PR.
-2. **Issues & Mentions:** You can prompt Jules on issues by mentioning `@google-labs-jules` or adding the `jules` label to the issue.
-3. **Web Interface:** You can also manage tasks, start new prompts, and view execution progress directly at [jules.google.com](https://jules.google.com).
+2. **Mentions & Commands:** You can message Jules in PR comments or issue discussions by mentioning `@jules` or `@google-labs-jules[bot]`.
+3. **Issue Labeling:** Adding the `jules` label to any GitHub issue triggers Jules to analyze the issue, create a plan, and submit a pull request.
+4. **Web Interface:** You can also dispatch tasks, track progress, and configure preferences (such as Reactive Mode) directly at [jules.google.com](https://jules.google.com).
 
 ## Packaging & Releases
 
@@ -77,4 +80,3 @@ uv build
 # Or using python -m build
 python3 -m build
 ```
-

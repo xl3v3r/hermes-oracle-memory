@@ -1,0 +1,6 @@
+include plugin.yaml
+include README.md
+include AGENTS.md
+exclude test_oracle.py
+exclude pytest.ini
+recursive-exclude tests *
