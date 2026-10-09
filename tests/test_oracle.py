@@ -83,8 +83,38 @@ class TestOraclePlugin(unittest.TestCase):
             reason = provider.unavailable_reason()
             self.assertEqual(reason, "oracledb is not installed in the Hermes venv")
 
-    def test_is_internal_gateway_turn_handles_magicmock(self):
-        self.assertFalse(oracle_plugin._is_internal_gateway_turn(MagicMock()))
+    def test_is_available_no_oracledb(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        with patch.dict(sys.modules, {"oracledb": None}):
+            self.assertFalse(provider.is_available())
+
+    def test_is_available_missing_secrets(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        with patch.dict(sys.modules, {"oracledb": MagicMock()}):
+            with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, *args: None):
+                self.assertFalse(provider.is_available())
+
+    def test_is_available_some_missing_secrets(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        secrets = {
+            "OCI_DB_USER": "user",
+            "OCI_DB_PASSWORD": None,
+            "OCI_DB_DSN": "dsn",
+        }
+        with patch.dict(sys.modules, {"oracledb": MagicMock()}):
+            with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, *args: secrets.get(k)):
+                self.assertFalse(provider.is_available())
+
+    def test_is_available_all_present(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        secrets = {
+            "OCI_DB_USER": "user",
+            "OCI_DB_PASSWORD": "password",
+            "OCI_DB_DSN": "dsn",
+        }
+        with patch.dict(sys.modules, {"oracledb": MagicMock()}):
+            with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, *args: secrets.get(k)):
+                self.assertTrue(provider.is_available())
 
 
 if __name__ == "__main__":
