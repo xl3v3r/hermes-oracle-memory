@@ -157,6 +157,8 @@ _PROMPT_BODY = (
 
 
 def _is_internal_gateway_turn(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
     return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
 
 
@@ -194,10 +196,16 @@ class OracleMemoryProvider(MemoryProvider):
             import oracledb  # noqa: F401
         except Exception:
             return False
+        user = get_secret("OCI_DB_USER")
+        pwd = get_secret("OCI_DB_PASSWORD")
+        dsn = get_secret("OCI_DB_DSN")
         return bool(
-            get_secret("OCI_DB_USER")
-            and get_secret("OCI_DB_PASSWORD")
-            and get_secret("OCI_DB_DSN")
+            isinstance(user, str)
+            and user
+            and isinstance(pwd, str)
+            and pwd
+            and isinstance(dsn, str)
+            and dsn
         )
 
     def unavailable_reason(self) -> str:
@@ -208,7 +216,7 @@ class OracleMemoryProvider(MemoryProvider):
         missing = [
             k
             for k in ("OCI_DB_USER", "OCI_DB_PASSWORD", "OCI_DB_DSN")
-            if not get_secret(k)
+            if not isinstance(get_secret(k), str) or not get_secret(k)
         ]
         if missing:
             return f"missing env: {', '.join(missing)}"
@@ -255,22 +263,29 @@ class OracleMemoryProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._session_id = session_id or ""
-        self._agent_id = kwargs.get("agent_identity") or "hermes"
-        self._agent_context = kwargs.get("agent_context") or "primary"
+        self._session_id = session_id if isinstance(session_id, str) else ""
+        agent_id = kwargs.get("agent_identity")
+        self._agent_id = agent_id if isinstance(agent_id, str) and agent_id else "hermes"
+        agent_ctx = kwargs.get("agent_context")
+        self._agent_context = agent_ctx if isinstance(agent_ctx, str) and agent_ctx else "primary"
 
         # Load table name dynamically for OpenClaw shared memory compatibility
         import re as _re
 
-        raw_table = get_secret("HERMES_ORACLE_TABLE") or "hermes_agent_memory"
-        self._table = _re.sub(r"[^a-zA-Z0-9_]", "", raw_table)
-        self._onnx_model = _re.sub(
-            r"[^a-zA-Z0-9_]", "", get_secret("HERMES_ORACLE_ONNX_MODEL") or ""
-        )
+        raw_table = get_secret("HERMES_ORACLE_TABLE")
+        table_str = raw_table if isinstance(raw_table, str) and raw_table else "hermes_agent_memory"
+        self._table = _re.sub(r"[^a-zA-Z0-9_]", "", table_str) or "hermes_agent_memory"
 
-        self._user = get_secret("OCI_DB_USER", "ADMIN") or "ADMIN"
-        password = get_secret("OCI_DB_PASSWORD")
-        self._dsn = get_secret("OCI_DB_DSN") or ""
+        raw_onnx = get_secret("HERMES_ORACLE_ONNX_MODEL")
+        onnx_str = raw_onnx if isinstance(raw_onnx, str) else ""
+        self._onnx_model = _re.sub(r"[^a-zA-Z0-9_]", "", onnx_str)
+
+        user_val = get_secret("OCI_DB_USER", "ADMIN")
+        self._user = user_val if isinstance(user_val, str) and user_val else "ADMIN"
+        pwd_val = get_secret("OCI_DB_PASSWORD")
+        password = pwd_val if isinstance(pwd_val, str) else ""
+        dsn_val = get_secret("OCI_DB_DSN")
+        self._dsn = dsn_val if isinstance(dsn_val, str) else ""
         if not password or not self._dsn:
             self._init_error = "OCI_DB_PASSWORD or OCI_DB_DSN missing"
             logger.error("Oracle memory: %s", self._init_error)
@@ -437,7 +452,7 @@ class OracleMemoryProvider(MemoryProvider):
             # preferred path anyway; fail soft and let the caller keep the None vec.
             logger.debug("OpenRouter embed skipped: no OPENROUTER_API_KEY in scope")
             return out
-        if not key:
+        if not key or not isinstance(key, str):
             return out
         try:
             import urllib.request
@@ -940,7 +955,7 @@ class OracleMemoryProvider(MemoryProvider):
         self._start_prefetch(query)
 
     def _start_prefetch(self, query: str) -> None:
-        if not query or not self._pool or is_trivial_prompt(query):
+        if not isinstance(query, str) or not query or not self._pool or is_trivial_prompt(query):
             return
 
         def _run():
@@ -972,7 +987,7 @@ class OracleMemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not query or is_trivial_prompt(query):
+        if not isinstance(query, str) or not query or is_trivial_prompt(query):
             return ""
         with self._lock:
             cached = None
@@ -1003,7 +1018,8 @@ class OracleMemoryProvider(MemoryProvider):
         return RecallStatus(provider_label="Oracle 26ai", count=n)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        self._start_prefetch(message)
+        if isinstance(message, str):
+            self._start_prefetch(message)
 
     def sync_turn(
         self,
@@ -1015,7 +1031,7 @@ class OracleMemoryProvider(MemoryProvider):
     ) -> None:
         if not self._pool or self._agent_context not in ("primary", ""):
             return
-        if _is_internal_gateway_turn(user_content) or is_trivial_prompt(user_content):
+        if not isinstance(user_content, str) or _is_internal_gateway_turn(user_content) or is_trivial_prompt(user_content):
             return
         sid = session_id or self._session_id
 
@@ -1048,7 +1064,7 @@ class OracleMemoryProvider(MemoryProvider):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if not self._pool or action != "add" or not content:
+        if not self._pool or action != "add" or not isinstance(content, str) or not content:
             return
         try:
             self._insert(
@@ -1063,13 +1079,13 @@ class OracleMemoryProvider(MemoryProvider):
             logger.debug("oracle on_memory_write failed: %s", e)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        if not self._pool or not messages:
+        if not self._pool or not isinstance(messages, list) or not messages:
             return
         try:
             user_bits = [
                 (m.get("content") or "")[:400]
                 for m in messages
-                if m.get("role") == "user" and isinstance(m.get("content"), str)
+                if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str)
             ]
             sample = " | ".join(
                 b for b in user_bits[-4:] if b and not _is_internal_gateway_turn(b)
@@ -1096,7 +1112,8 @@ class OracleMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **kwargs,
     ) -> None:
-        self._session_id = new_session_id or self._session_id
+        if isinstance(new_session_id, str) and new_session_id:
+            self._session_id = new_session_id
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(TOOL_SCHEMAS)

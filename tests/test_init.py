@@ -2,12 +2,8 @@ import unittest
 import sys
 from unittest.mock import MagicMock
 
-# Mock required dependencies before importing the module
-sys.modules['agent'] = MagicMock()
-sys.modules['agent.memory_provider'] = MagicMock()
-sys.modules['agent.secret_scope'] = MagicMock()
-sys.modules['tools'] = MagicMock()
-sys.modules['tools.registry'] = MagicMock()
+# Use conftest to mock dependencies properly
+import tests.conftest
 
 # Now we can import the function we want to test
 from __init__ import _is_internal_gateway_turn

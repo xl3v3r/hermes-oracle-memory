@@ -1,23 +1,13 @@
+import os
 import sys
-from unittest.mock import MagicMock
-
-module_agent = MagicMock()
-module_agent_memory_provider = MagicMock()
-module_agent_memory_provider.MemoryProvider = object
-module_agent_secret_scope = MagicMock()
-module_tools = MagicMock()
-module_tools_registry = MagicMock()
-
-sys.modules['agent'] = module_agent
-sys.modules['agent.memory_provider'] = module_agent_memory_provider
-sys.modules['agent.secret_scope'] = module_agent_secret_scope
-sys.modules['tools'] = module_tools
-sys.modules['tools.registry'] = module_tools_registry
-sys.modules['oracledb'] = MagicMock()
-sys.modules['oci'] = MagicMock()
-
-import __init__ as oracle_plugin
 import unittest
+
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
+import tests.conftest
+import __init__ as oracle_plugin
 
 class TestFormatPrefetch(unittest.TestCase):
     def test_empty(self):

@@ -3,5 +3,3 @@ version: 1.0.0
 description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking."
 pip_dependencies:
   - oracledb>=4.0.2
-hooks:
-  - on_session_end
