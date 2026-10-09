@@ -31,6 +31,7 @@ Then restart the gateway / start a new session.
 - Prefetch wait 0.5s
 - `DBMS_VECTOR.UTL_TO_CHUNKS` for long-document splits
 - Hybrid rank: 0.7 * (1 - cosine distance) + 0.3 * normalized text score
+- Optimized LOB fetching: `outputtypehandler` used to stream CLOBs directly as strings, avoiding N+1 roundtrips.
 
 ## Tools
 
