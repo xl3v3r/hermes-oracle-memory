@@ -51,6 +51,17 @@ class TestOraclePlugin(unittest.TestCase):
         # Test valid query
         self.assertEqual(provider._contains_query("test query"), "test ACCUM query")
 
+        # Test hyphen
+        self.assertEqual(provider._contains_query("top-secret info"), "top-secret ACCUM info")
+
+        # Test punctuation
+        self.assertEqual(provider._contains_query("hello, world! how's it going?"), "hello ACCUM world ACCUM how ACCUM going")
+
+        # Test max tokens
+        long_query = "one two three four five six seven eight nine ten"
+        expected = "one ACCUM two ACCUM three ACCUM four ACCUM five ACCUM six ACCUM seven ACCUM eight"
+        self.assertEqual(provider._contains_query(long_query), expected)
+
     def test_initialize_handles_magicmock_and_non_strings(self):
         provider = oracle_plugin.OracleMemoryProvider()
         # Mock get_secret to return MagicMock as happens when dependencies are mocked
