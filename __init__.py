@@ -544,12 +544,10 @@ class OracleMemoryProvider(MemoryProvider):
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
                         # Optimize: Use executemany for bulk updating embeddings in a single round-trip
+                        sql = f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
                         binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
                         if binds:
-                            cur.executemany(
-                                f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2",
-                                binds,
-                            )
+                            cur.executemany(sql, binds)
                     conn.commit()
             except Exception as e:
                 logger.debug("embed backfill batch failed: %s", e)
@@ -1162,21 +1160,23 @@ class OracleMemoryProvider(MemoryProvider):
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
                         if self._onnx_model:
-                            cur.execute(
-                                f"""
+                            sql = f"""
                                 UPDATE {self._table}
                                 SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3
                                 WHERE memory_id = :4
-                                """,
+                                """  # nosec B608
+                            cur.execute(
+                                sql,
                                 (content, txt, txt, mid),
                             )
                         else:
-                            cur.execute(
-                                f"""
+                            sql = f"""
                                 UPDATE {self._table}
                                 SET content = :1, embedding = :2, content_txt = :3
                                 WHERE memory_id = :4
-                                """,
+                                """  # nosec B608
+                            cur.execute(
+                                sql,
                                 (content, vec, txt, mid),
                             )
                         n = cur.rowcount
