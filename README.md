@@ -1,5 +1,7 @@
 # Oracle 26ai Memory Provider
 
+![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)
+
 ## About
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
