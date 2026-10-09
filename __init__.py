@@ -707,10 +707,18 @@ class OracleMemoryProvider(MemoryProvider):
     def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
         import oracledb
 
+        # ⚡ Bolt: Use outputtypehandler to fetch CLOBs directly as strings.
+        # This prevents the N+1 network round-trips caused by calling .read()
+        # on LOB locators.
+        def fetch_lobs_as_strings(cursor, metadata):
+            if metadata.type_code is oracledb.DB_TYPE_CLOB:
+                return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+
+        cur.outputtypehandler = fetch_lobs_as_strings
         cur.execute(sql, binds)
         out = []
         for row in cur.fetchall():
-            content = row[4].read() if isinstance(row[4], oracledb.LOB) else row[4]
+            content = row[4]
             dist = float(row[7]) if row[7] is not None else None
             txt = float(row[6] or 0)
             vec_score = max(0.0, min(1.0, 1.0 - dist)) if dist is not None else 0.0
@@ -1224,6 +1232,14 @@ class OracleMemoryProvider(MemoryProvider):
         with self._pool.acquire() as conn:
             with conn.cursor() as cur:
                 try:
+                    import oracledb
+
+                    # ⚡ Bolt: Use outputtypehandler to fetch CLOB chunks directly as strings
+                    def fetch_lobs_as_strings(cursor, metadata):
+                        if metadata.type_code is oracledb.DB_TYPE_CLOB:
+                            return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+                    cur.outputtypehandler = fetch_lobs_as_strings
+
                     cur.execute(
                         """
                         SELECT COLUMN_VALUE FROM TABLE(
@@ -1245,14 +1261,9 @@ class OracleMemoryProvider(MemoryProvider):
                             ),
                         ),
                     )
-                    import oracledb
 
                     for row in cur:
-                        val = (
-                            row[0].read()
-                            if isinstance(row[0], oracledb.LOB)
-                            else row[0]
-                        )
+                        val = row[0]
                         if not val:
                             continue
                         text = str(val)
