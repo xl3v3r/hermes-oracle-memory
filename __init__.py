@@ -921,9 +921,13 @@ class OracleMemoryProvider(MemoryProvider):
                 with self._pool.acquire() as conn:
                     with conn.cursor() as inner:
                         return self._rerank(query, rows, top_k, cur=inner)
+            import oracledb
+            # ⚡ Bolt: Optimize LOB fetch for DBMS_VECTOR.RERANK by using
+            # oracledb.DB_TYPE_LONG instead of str, preventing an extra N+1
+            # network round trip when `.read()` is otherwise called.
             out = cur.callfunc(
                 "DBMS_VECTOR.RERANK",
-                str,
+                oracledb.DB_TYPE_LONG,
                 [query[:2000], json.dumps(docs), None],
             )
             payload = json.loads(out.read() if hasattr(out, "read") else out)
