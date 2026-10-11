@@ -1,36 +1,40 @@
 ---
 name: oracle-import
+description: Import conversation archives and documents into Oracle Autonomous AI Database 26ai memory without hitting LLM rate limits.
 version: 1.0.4
-description: Import conversation archives (ShareGPT, ChatGPT, Claude) and large documents into Oracle Autonomous AI Database 26ai memory without hitting LLM rate limits.
-trigger: oracle import, import conversations, import to oracle, oracle adb import, oracle memory import, oracle chunk file
-tags:
-  - database
-  - memory
-  - oracle
-  - import
-  - sharegpt
+author: Hermes Community
+metadata:
+  hermes:
+    tags: [database, memory, oracle, import, sharegpt]
 ---
 
 # Oracle 26ai Conversation & Document Import
 
-This skill provides workflows, tools, and scripts to import conversation history archives (such as ShareGPT, ChatGPT, Claude exports) and large documents into **Oracle Autonomous AI Database (ADB) 26ai** vector memory without exhausting LLM context windows or triggering upstream API rate limits (e.g., NVIDIA NIM, OpenRouter, Anthropic HTTP 429).
+Import conversation history archives (ShareGPT, ChatGPT, Claude exports) and large documents into **Oracle Autonomous AI Database (ADB) 26ai** vector memory without exhausting LLM context windows or triggering upstream API rate limits (such as NVIDIA NIM HTTP 429).
 
----
-
-## 1. When to Use
+## When to Use
 
 - Importing historical conversations (`conversations.json`, `oracle_import.json`, ShareGPT format).
 - Ingesting large text archives, documentation, or log files into Oracle 26ai memory.
 - Bypassing LLM context limits and rate limits during bulk data migration.
 - Troubleshooting Oracle ADB mTLS wallet connections and driver configurations during import.
 
----
+## Prerequisites
 
-## 2. Workflows
+Ensure ADB credentials and wallet location are configured in `~/.hermes/.env` or active profile environment:
 
-### Method A: Ingest via `oracle_chunk` with `file_path` (Hermes Tool)
+- `OCI_DB_USER` — ADB username (e.g. `ADMIN`)
+- `OCI_DB_PASSWORD` — ADB password
+- `OCI_DB_DSN` — TNS alias or connect descriptor string (e.g. `dbname_high`)
+- `OCI_WALLET_LOCATION` (optional) — Path to the wallet directory containing `cwallet.sso` and `tnsnames.ora`. Auto-detected at `~/.oci/wallet` and `~/.hermes/oracle_wallet`.
+- `OCI_WALLET_PASSWORD` (optional) — Wallet password if encrypted.
+- `python-oracledb` >= 4.0.2 installed in the environment.
 
-Hermes agents can invoke `oracle_chunk` with a local `file_path` directly. Instead of loading multi-megabyte payloads into the LLM context prompt, the tool reads the file locally, parses conversation structures if present, and executes in-database chunking with `DBMS_VECTOR.UTL_TO_CHUNKS`:
+## How to Run
+
+### Option 1: Ingest via `oracle_chunk` with `file_path` (Hermes Tool)
+
+Hermes agents can invoke `oracle_chunk` with a local `file_path` directly. Instead of streaming multi-megabyte payloads through the LLM prompt, the tool reads the file locally, parses conversation structures if present, and executes in-database chunking with `DBMS_VECTOR.UTL_TO_CHUNKS`:
 
 ```json
 {
@@ -40,51 +44,51 @@ Hermes agents can invoke `oracle_chunk` with a local `file_path` directly. Inste
 }
 ```
 
-**Supported file formats:**
-- **ShareGPT JSON**: `{"conversations": [{"from": "human", "value": "..."}]}` or multi-session lists.
-- **Claude / ChatGPT JSON**: Arrays with `chat_messages` or session messages.
-- **Plain Text / Markdown**: Text and log files chunked recursively.
+### Option 2: Standalone Bulk Ingestion Script
 
-### Method B: Standalone Bulk Ingestion Script
-
-For large archives (e.g. hundreds of conversations or >10 MB), use the standalone import script included with this skill. It connects directly to Oracle 26ai ADB and inserts memory turns in configurable batches with zero LLM API consumption:
+For large archives (e.g. hundreds of conversations or >10 MB), run the standalone migration script included with this skill. It connects directly to Oracle 26ai ADB and inserts memory turns in configurable batches with zero LLM API consumption:
 
 ```bash
-# Basic usage
+# Ingest ShareGPT, Claude, or summary archive
 python3 skills/oracle-import/scripts/import_conversations.py /home/rocky/sharedconv/oracle_import.json
 
 # Specify batch size and session ID
-python3 skills/oracle-import/scripts/import_conversations.py /path/to/archive.json --batch-size 50 --session-id "archive-import-001"
+python3 skills/oracle-import/scripts/import_conversations.py /home/rocky/sharedconv/conversations.json --batch-size 50 --session-id "archive-2026-06"
 ```
 
----
+## Quick Reference
 
-## 3. Oracle ADB Connection & Wallet Troubleshooting
+| Format | Structure | Parsing Behavior |
+|---|---|---|
+| **ShareGPT** | `{"conversations": [{"from": "...", "value": "..."}]}` | Turns extracted and prefixed with `[ROLE]` |
+| **Claude Export** | `[{"name": "...", "summary": "...", "chat_messages": [...]}]` | Extracts titles, summaries, and user/assistant messages |
+| **Summary Export** | `{"conversations": [{"from": "system", "value": "..."}]}` | Extracted as system/session memory turns |
+| **Plain Text** | `.txt`, `.md`, logs | Split recursively via `UTL_TO_CHUNKS` |
+| **Truncated JSON** | Abrupt EOF / partial stream | Incremental recovery of complete leading JSON objects |
 
-### Environment Variables
-Ensure the following credentials are set in `~/.hermes/.env` or the active profile:
-- `OCI_DB_USER` — ADB username (e.g., `ADMIN`)
-- `OCI_DB_PASSWORD` — ADB password
-- `OCI_DB_DSN` — TNS alias or connect descriptor string (e.g. `dbname_high`)
-- `OCI_WALLET_LOCATION` (optional) — Path to the wallet directory containing `cwallet.sso` and `tnsnames.ora` (auto-detected in `~/.oci/wallet` and `~/.hermes/oracle_wallet`).
-- `OCI_WALLET_PASSWORD` (optional) — Wallet password if encrypted.
+## Procedure
 
-### Resolving Driver & Wallet Errors
-- **`DPY-6005: Listener refused connection`**:
-  - Wallet files are missing, unreadable, or TLS certificate expired.
-  - Verify wallet directory contains `cwallet.sso`, `ewallet.p12`, `tnsnames.ora`, and `sqlnet.ora`.
-  - Permissions should be `chmod 600` on wallet files.
-- **`DPY-6000: Connection timeout`**:
-  - OCI Console: Ensure Autonomous Database is in **Available** state (not paused/stopped).
-  - Verify TCP/1522 egress is allowed through network security lists / firewalls.
-- **`AUTH_TYPE_OCI` / Thin Mode Incompatibilities**:
-  - Use `oracledb` 4.0.2+ which supports mTLS wallets in thin mode with `wallet_location` and `config_dir`.
-  - If thick mode is required, call `oracledb.init_oracle_client(lib_dir="...")` with Oracle Instant Client libraries.
+1. **Verify Database Connectivity & Wallet**:
+   Ensure wallet files exist in `~/.oci/wallet/` or `~/.hermes/oracle_wallet/` (`cwallet.sso`, `tnsnames.ora`).
+2. **Choose Ingestion Method**:
+   - For single documents or prompt-driven chunking: call `oracle_chunk(file_path=...)`.
+   - For bulk multi-conversation imports (>1MB): run `python3 skills/oracle-import/scripts/import_conversations.py <path>`.
+3. **Verify Recall**:
+   Query Oracle memory using `oracle_search(query="...", top_k=5)` to verify turns and chunks are discoverable.
 
----
+## Pitfalls
 
-## 4. Performance & Batching Guidelines
+- **NIM HTTP 429 Rate Limits**: Avoid passing file contents directly into chat messages or `oracle_chunk(content=...)`. Always pass `file_path`.
+- **`DPY-6005: Listener refused connection`**: Wallet files missing, unreadable, or TLS certificate mismatch. Check permissions (`chmod 600`) and wallet files.
+- **`DPY-6000: Connection timeout`**: Verify Autonomous Database is in **Available** state in OCI Console and egress on port 1522 is open.
+- **`ORA-01460: unimplemented or unreasonable conversion requested`**: Occurs if large strings (>32KB) are bound to CLOB parameters without `cur.setinputsizes(oracledb.DB_TYPE_CLOB)`. The provider automatically sets CLOB input sizes.
 
-- **Vector Backfill**: Embeddings are generated in background batches of 32 (`_EMBED_BATCH`) to prevent network bottlenecks.
-- **Text Search Immediate**: Full-text search via Oracle Text `CONTAINS` is active immediately upon commit, even while vector embeddings are backfilling.
-- **Chunk Size**: For general conversation recall, `max_words=80` with `overlap=10` is optimal. For long session summaries, `max_words=500` to `1000` is recommended.
+## Verification
+
+Confirm imported items are indexed in Oracle ADB:
+```python
+provider = OracleMemoryProvider()
+provider.initialize(session_id="test")
+results = provider._search(query="ITAHM", top_k=3)
+assert len(results) > 0
+```

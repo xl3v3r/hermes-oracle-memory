@@ -166,6 +166,36 @@ def _is_internal_gateway_turn(text: str) -> bool:
     return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
 
 
+def _extract_turn_text(msg: Any) -> str:
+    """Extract clean string text from a message payload (string, dict, or structured content blocks)."""
+    if isinstance(msg, str):
+        return msg.strip()
+    if not isinstance(msg, dict):
+        return ""
+    text = msg.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    val = msg.get("value")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    content = msg.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+                    parts.append(block["text"].strip())
+                elif "text" in block and isinstance(block["text"], str) and block["text"].strip():
+                    parts.append(block["text"].strip())
+            elif isinstance(block, str) and block.strip():
+                parts.append(block.strip())
+        if parts:
+            return "\n\n".join(parts)
+    return ""
+
+
 class OracleMemoryProvider(MemoryProvider):
     """Oracle Autonomous AI Database 26ai VECTOR + Text + JSON memory."""
 
@@ -332,6 +362,7 @@ class OracleMemoryProvider(MemoryProvider):
                 try:
                     wpath = Path(wallet_dir)
                     if wpath.is_dir():
+                        os.environ.setdefault("TNS_ADMIN", str(wallet_dir))
                         pool_kwargs["config_dir"] = str(wallet_dir)
                         pool_kwargs["wallet_location"] = str(wallet_dir)
                         wallet_pwd = get_secret("OCI_WALLET_PASSWORD")
@@ -1260,49 +1291,60 @@ class OracleMemoryProvider(MemoryProvider):
                         extracted_text = ""
                         try:
                             parsed_json = json.loads(raw_data)
+                            turns = []
                             if isinstance(parsed_json, dict) and "conversations" in parsed_json:
-                                turns = []
                                 for item in parsed_json["conversations"]:
                                     if isinstance(item, dict):
-                                        val = item.get("value") or item.get("content") or item.get("text") or ""
+                                        val = _extract_turn_text(item)
                                         sender = item.get("from") or item.get("role") or ""
                                         if val:
                                             prefix = f"[{sender.upper()}]: " if sender else ""
                                             turns.append(f"{prefix}{val}")
-                                    elif isinstance(item, str) and item:
-                                        turns.append(item)
-                                if turns:
-                                    extracted_text = "\n\n".join(turns)
+                                    elif isinstance(item, str) and item.strip():
+                                        turns.append(item.strip())
                             elif isinstance(parsed_json, list):
-                                turns = []
                                 for item in parsed_json:
                                     if isinstance(item, dict):
+                                        title = item.get("name") or item.get("title") or ""
+                                        summary = item.get("summary") or ""
+                                        if title or summary:
+                                            header_parts = []
+                                            if title:
+                                                header_parts.append(f"Conversation: {title}")
+                                            if summary:
+                                                header_parts.append(f"Summary: {summary}")
+                                            turns.append("\n\n".join(header_parts))
+
                                         if "conversations" in item and isinstance(item["conversations"], list):
                                             for sub in item["conversations"]:
                                                 if isinstance(sub, dict):
-                                                    val = sub.get("value") or sub.get("content") or sub.get("text") or ""
+                                                    val = _extract_turn_text(sub)
                                                     sender = sub.get("from") or sub.get("role") or ""
                                                     if val:
                                                         prefix = f"[{sender.upper()}]: " if sender else ""
                                                         turns.append(f"{prefix}{val}")
+                                                elif isinstance(sub, str) and sub.strip():
+                                                    turns.append(sub.strip())
                                         elif "chat_messages" in item and isinstance(item["chat_messages"], list):
                                             for sub in item["chat_messages"]:
                                                 if isinstance(sub, dict):
-                                                    val = sub.get("text") or sub.get("content") or sub.get("value") or ""
+                                                    val = _extract_turn_text(sub)
                                                     sender = sub.get("sender") or sub.get("from") or sub.get("role") or ""
                                                     if val:
                                                         prefix = f"[{sender.upper()}]: " if sender else ""
                                                         turns.append(f"{prefix}{val}")
+                                                elif isinstance(sub, str) and sub.strip():
+                                                    turns.append(sub.strip())
                                         else:
-                                            val = item.get("value") or item.get("content") or item.get("text") or ""
+                                            val = _extract_turn_text(item)
                                             sender = item.get("from") or item.get("role") or ""
                                             if val:
                                                 prefix = f"[{sender.upper()}]: " if sender else ""
                                                 turns.append(f"{prefix}{val}")
-                                    elif isinstance(item, str) and item:
-                                        turns.append(item)
-                                if turns:
-                                    extracted_text = "\n\n".join(turns)
+                                    elif isinstance(item, str) and item.strip():
+                                        turns.append(item.strip())
+                            if turns:
+                                extracted_text = "\n\n".join(turns)
                         except Exception:
                             extracted_text = ""
 
@@ -1341,6 +1383,7 @@ class OracleMemoryProvider(MemoryProvider):
                         if metadata.type_code is oracledb.DB_TYPE_CLOB:
                             return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
                     cur.outputtypehandler = fetch_lobs_as_strings
+                    cur.setinputsizes(oracledb.DB_TYPE_CLOB)
 
                     cur.execute(
                         """

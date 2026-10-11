@@ -10,8 +10,13 @@ root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
+scripts_dir = os.path.join(root_dir, "skills", "oracle-import", "scripts")
+if scripts_dir not in sys.path:
+    sys.path.insert(0, scripts_dir)
+
 import tests.conftest
 import __init__ as oracle_plugin
+import import_conversations
 
 
 class TestOracleChunkAndImport(unittest.TestCase):
@@ -67,6 +72,28 @@ class TestOracleChunkAndImport(unittest.TestCase):
         finally:
             os.unlink(tf_path)
 
+    def test_oracle_chunk_with_oracle_import_json_format(self):
+        sample = {
+            "conversations": [
+                {
+                    "from": "system",
+                    "value": "Conversation: ITAHM acronym meaning\n\nSummary: Overview of abbreviations\n\nUUID: 6912",
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as tf:
+            json.dump(sample, tf)
+            tf_path = tf.name
+
+        try:
+            res = self.provider.handle_tool_call("oracle_chunk", {"file_path": tf_path})
+            parsed = json.loads(res)
+            self.assertEqual(parsed["result"], "chunked")
+            expected_text = "[SYSTEM]: Conversation: ITAHM acronym meaning\n\nSummary: Overview of abbreviations\n\nUUID: 6912"
+            self.provider._chunk_and_store.assert_called_once_with(expected_text, 80, 10)
+        finally:
+            os.unlink(tf_path)
+
     def test_oracle_chunk_with_multisession_sharegpt(self):
         sample = [
             {
@@ -89,13 +116,22 @@ class TestOracleChunkAndImport(unittest.TestCase):
         finally:
             os.unlink(tf_path)
 
-    def test_oracle_chunk_with_chat_messages_json(self):
+    def test_oracle_chunk_with_chat_messages_structured_content(self):
         sample = [
             {
+                "name": "Session Alpha",
+                "summary": "Alpha summary",
                 "chat_messages": [
                     {"sender": "human", "text": "What is 2+2?"},
-                    {"sender": "assistant", "text": "4"},
-                ]
+                    {
+                        "sender": "assistant",
+                        "text": "",
+                        "content": [
+                            {"type": "thinking", "thinking": "Internal thought"},
+                            {"type": "text", "text": "The answer is 4."},
+                        ],
+                    },
+                ],
             }
         ]
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as tf:
@@ -106,10 +142,33 @@ class TestOracleChunkAndImport(unittest.TestCase):
             res = self.provider.handle_tool_call("oracle_chunk", {"file_path": tf_path})
             parsed = json.loads(res)
             self.assertEqual(parsed["result"], "chunked")
-            expected_text = "[HUMAN]: What is 2+2?\n\n[ASSISTANT]: 4"
-            self.provider._chunk_and_store.assert_called_once_with(expected_text, 80, 10)
+            # Should include conversation header and clean assistant text
+            call_args = self.provider._chunk_and_store.call_args[0][0]
+            self.assertIn("Conversation: Session Alpha", call_args)
+            self.assertIn("Summary: Alpha summary", call_args)
+            self.assertIn("[HUMAN]: What is 2+2?", call_args)
+            self.assertIn("[ASSISTANT]: The answer is 4.", call_args)
+            self.assertNotIn("Internal thought", call_args)
         finally:
             os.unlink(tf_path)
+
+    def test_oracle_chunk_clob_binding(self):
+        # Un-mock _chunk_and_store to verify setinputsizes is called
+        provider = oracle_plugin.OracleMemoryProvider()
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_pool.acquire.return_value.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        provider._pool = mock_pool
+
+        # Table execute yields chunks
+        mock_cur.__iter__.return_value = [("Chunk 1",)]
+
+        provider._insert_many = MagicMock()
+        ids = provider._chunk_and_store("Short text", 80, 10)
+        self.assertEqual(len(ids), 1)
+        mock_cur.setinputsizes.assert_called_once()
 
     def test_oracle_chunk_nonexistent_file(self):
         res = self.provider.handle_tool_call("oracle_chunk", {"file_path": "/nonexistent/path/doc.txt"})
@@ -120,6 +179,56 @@ class TestOracleChunkAndImport(unittest.TestCase):
         res = self.provider.handle_tool_call("oracle_chunk", {"content": "Some text"})
         parsed = json.loads(res)
         self.assertIn("error", parsed)
+
+    def test_import_conversations_parses_oracle_import_json(self):
+        sample = {
+            "conversations": [
+                {
+                    "from": "system",
+                    "value": "Conversation: ITAHM\n\nSummary: Overview\n\nUUID: abc-123",
+                }
+            ]
+        }
+        turns = import_conversations.parse_conversations(sample)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["role"], "session")
+        self.assertEqual(turns[0]["sender"], "system")
+        self.assertIn("Conversation: ITAHM", turns[0]["content"])
+
+    def test_import_conversations_parses_claude_export(self):
+        sample = [
+            {
+                "name": "Title",
+                "summary": "Summary text",
+                "chat_messages": [
+                    {"sender": "human", "text": "Question"},
+                    {
+                        "sender": "assistant",
+                        "text": "",
+                        "content": [
+                            {"type": "thinking", "thinking": "scratchpad"},
+                            {"type": "text", "text": "Answer"},
+                        ],
+                    },
+                ],
+            }
+        ]
+        turns = import_conversations.parse_conversations(sample)
+        self.assertEqual(len(turns), 3)  # summary + question + answer
+        self.assertEqual(turns[0]["role"], "session")
+        self.assertIn("[CONVERSATION]: Title", turns[0]["content"])
+        self.assertEqual(turns[1]["role"], "user")
+        self.assertEqual(turns[2]["role"], "assistant")
+        self.assertEqual(turns[2]["content"], "[ASSISTANT]: Answer")
+
+    def test_import_conversations_safe_truncated_json_decode(self):
+        # A valid object followed by truncated text
+        raw = '[{"name": "Session 1", "summary": "Sum 1"}, {"name": "Session 2", "sum'
+        recovered = import_conversations.parse_json_safely(raw)
+        self.assertEqual(len(recovered), 1)
+        turns = import_conversations.parse_conversations(recovered[0])
+        self.assertEqual(len(turns), 1)
+        self.assertIn("Session 1", turns[0]["content"])
 
     def test_register_with_skill_support(self):
         mock_ctx = MagicMock()
@@ -136,7 +245,6 @@ class TestOracleChunkAndImport(unittest.TestCase):
                 self.provider = provider
 
         ctx = MinimalContext()
-        # Should not raise AttributeError: MinimalContext has no attribute 'register_skill'
         oracle_plugin.register(ctx)
         self.assertIsInstance(ctx.provider, oracle_plugin.OracleMemoryProvider)
 
