@@ -13,15 +13,92 @@
 - **Multi-Format & Truncated JSON Extraction**: Native turn extraction across ShareGPT, Claude, and overview structures with automatic recovery of complete leading JSON objects in truncated files.
 - **ADB Wallet Auto-Detection**: Automatic discovery of Oracle ADB mTLS wallet credentials in `~/.oci/wallet` and `~/.hermes/oracle_wallet` across thin and thick modes.
 
-## Requirements
+## Configuration Reference
 
-- `oracledb` (thin mode or thick mode with wallet)
-- Env in `$HERMES_HOME/.env`: `OCI_DB_USER`, `OCI_DB_PASSWORD`, `OCI_DB_DSN`
-- Optional wallet path: `OCI_WALLET_LOCATION` or `TNS_ADMIN` (auto-detected in `~/.oci/wallet` and `~/.hermes/oracle_wallet`)
-- Embeddings (1536-d FLOAT64, must match `HERMES_AGENT_MEMORY.EMBEDDING`):
-  1. OCI GenAI `cohere.embed-v4.0` via instance principal if enabled (`OCI_GENAI_REGION`, optional `OCI_COMPARTMENT_ID` / `OCI_EMBED_MODEL`)
-  2. Else OpenRouter `openai/text-embedding-3-small` (`OPENROUTER_API_KEY`)
-  First OCI 404/auth failure in a process skips OCI for the rest of that process.
+### 1. OCI CLI & SDK Configuration (`~/.oci/config`)
+
+Required for Oracle Cloud Infrastructure API authentication, OCI CLI tools, and OCI Generative AI inference.
+
+```ini
+[DEFAULT]
+user=ocid1.user.oc1..aaaaaaaaexampleuserocid
+fingerprint=xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx
+tenancy=ocid1.tenancy.oc1..aaaaaaaaexampletenancyocid
+region=us-ashburn-1
+key_file=~/.oci/oci_api_key.pem
+pass_phrase=YourKeyPassphraseHere
+```
+
+| Field | Requirement | Description |
+|-------|-------------|-------------|
+| `user` | **Required** | OCID of your OCI IAM user. |
+| `fingerprint` | **Required** | Fingerprint of the public RSA key uploaded to the OCI Console under API Keys. |
+| `tenancy` | **Required** | OCID of your tenancy. |
+| `region` | **Required** | OCI region identifier (e.g. `us-ashburn-1`). |
+| `key_file` | **Required** | Absolute path or `~` path to the private RSA signing key (`.pem`). |
+| `pass_phrase` | **Required if key is encrypted** | Passphrase for the encrypted private PEM key. <br>**Critical:** If the `.pem` key was generated with a passphrase and `pass_phrase` is omitted, the OCI SDK will prompt on `stdin` (`Enter PEM Passphrase:`), hanging non-interactive agent gateways and daemon services. |
+
+---
+
+### 2. Hermes Environment Variables (`~/.hermes/.env`)
+
+Configure database credentials, mTLS wallet authentication, and embedding providers in `$HERMES_HOME/.env` (default: `~/.hermes/.env`).
+
+#### Database Connection (Required)
+
+| Variable | Requirement | Description |
+|----------|-------------|-------------|
+| `OCI_DB_USER` | **Required** | Database username (defaults to `ADMIN` if omitted). |
+| `OCI_DB_PASSWORD` | **Required** | Password for the database user on Oracle ADB 26ai. |
+| `OCI_DB_DSN` | **Required** | Oracle Net Services connection descriptor or TNS alias (e.g. `(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=...))(CONNECT_DATA=(SERVICE_NAME=...))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))`). |
+
+#### Wallet & Passphrase Settings
+
+| Variable | Requirement | Description |
+|----------|-------------|-------------|
+| `OCI_WALLET_LOCATION` | Optional / Recommended | Directory path containing extracted mTLS client wallet files (`cwallet.sso`, `tnsnames.ora`, etc.). If omitted, auto-detected from `~/.oci/wallet` and `~/.hermes/oracle_wallet`, or uses `TNS_ADMIN`. |
+| `OCI_WALLET_PASSWORD` | Optional | Password for encrypted wallet containers (such as `ewallet.p12` / `ewallet.pem` when not using auto-login `cwallet.sso`). |
+| `OCI_CLI_PASSPHRASE` | Optional | Passphrase for encrypted `oci_api_key.pem` when running CLI invocations. |
+| `OCI_KEY_PASSPHRASE` | Optional | Passphrase for OCI SDK API key if provided via environment variables. |
+
+#### Embeddings (At least one provider required)
+
+Memories require 1536-dimensional FLOAT64 embeddings matching `HERMES_AGENT_MEMORY.EMBEDDING`:
+
+| Variable | Requirement | Description |
+|----------|-------------|-------------|
+| `OPENROUTER_API_KEY` | Recommended / Fallback | API key for OpenRouter to embed using `openai/text-embedding-3-small` (1536-d). |
+| `OCI_GENAI_REGION` | Optional | OCI region for OCI Generative AI inference (e.g., `us-chicago-1`, `us-ashburn-1`). Uses Instance Principal authentication. |
+| `OCI_COMPARTMENT_ID` | Optional | Compartment OCID where OCI Generative AI inference is permitted. |
+| `OCI_EMBED_MODEL` | Optional | Embedding model ID on OCI GenAI (defaults to `cohere.embed-v4.0`). |
+
+#### Table & Model Customizations (Optional)
+
+| Variable | Requirement | Description |
+|----------|-------------|-------------|
+| `HERMES_ORACLE_TABLE` | Optional | Custom table name for memory storage (defaults to `HERMES_AGENT_MEMORY`). |
+| `HERMES_ORACLE_ONNX_MODEL`| Optional | Local path to an in-database ONNX model if using native Oracle DB ONNX embeddings. |
+| `MEMORY_RETENTION_DAYS` | Optional | Number of days to retain active agent memories before auto-cleanup. |
+
+#### Example `~/.hermes/.env` Snippet
+
+```bash
+# Oracle ADB 26ai Connection
+OCI_DB_USER=ADMIN
+OCI_DB_PASSWORD="YourDatabasePasswordHere"
+OCI_DB_DSN="(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=adb.us-ashburn-1.oraclecloud.com))(CONNECT_DATA=(SERVICE_NAME=xxxx_high.adb.oraclecloud.com))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
+
+# Wallet & Passphrases
+OCI_WALLET_LOCATION=~/.oci/wallet
+OCI_WALLET_PASSWORD="YourPassphrase"
+OCI_CLI_PASSPHRASE="YourPassphrase"
+OCI_KEY_PASSPHRASE="YourPassphrase"
+
+# Embeddings
+OPENROUTER_API_KEY="sk-or-v1-..."
+```
+
+---
 
 ## Setup
 
