@@ -1,6 +1,7 @@
 # Hermes Agent Oracle 26ai Memory Provider
 
 ![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)
+![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 ## About
 
@@ -183,3 +184,22 @@ Located at [`skills/oracle-import/SKILL.md`](skills/oracle-import/SKILL.md), thi
    python3 skills/oracle-import/scripts/import_conversations.py /path/to/conversations.json --batch-size 50 --session-id "archive-2026-06"
    ```
 
+
+## Contributing
+
+Contributions to `hermes-oracle-memory` are welcome!
+
+To protect the project and ensure clean licensing for all users and contributors, this repository uses **[CLA Assistant](https://cla-assistant.io/)**. When opening a pull request for the first time, the automated bot will request that you agree to the [Contributor License Agreement (CLA)](./CLA.md). You can sign it directly by commenting:
+
+```text
+I have read the CLA Document and I hereby sign the CLA
+```
+
+## License
+
+This project is licensed under the **Business Source License 1.1 (BSL 1.1)**. See the [LICENSE](./LICENSE) file for complete terms.
+
+* **Free for Personal, Research, and Testing Use**: Anyone may use, study, and modify the code.
+* **Free for Organizations with < $1M Annual Revenue**: Small teams and early-stage startups may use the software in production free of charge.
+* **Commercial License Required**: Use within organizations with annual gross revenue exceeding $1,000,000 USD or offering the software as a commercial managed service requires a commercial license agreement. Contact Taylor Ripley (`xl3v3r`) for commercial licensing inquiries.
+* **Automatic Open Source Conversion**: On October 11, 2030 (the Change Date), the license automatically converts to the **Apache License, Version 2.0**.

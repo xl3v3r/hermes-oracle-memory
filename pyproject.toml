@@ -8,7 +8,7 @@ version = "1.0.4"
 description = "Oracle AI Database 26ai memory provider plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = {text = "BSL-1.1"}
 authors = [
     {name = "Taylor Ripley (xl3v3r)"}
 ]

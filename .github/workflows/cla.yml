@@ -1,0 +1,29 @@
+name: "CLA Assistant"
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla-assistant:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "CLA Assistant"
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: 'signatures/version1/cla.json'
+          path-to-document: 'https://github.com/${{ github.repository }}/blob/master/CLA.md'
+          branch: 'master'
+          allowlist: 'bot*|*bot|google-labs-jules[bot]|dependabot[bot]'
+          custom-notsigned-prcomment: 'Thank you for your pull request! Before we can accept your contribution, please read and agree to our [Contributor License Agreement](https://github.com/${{ github.repository }}/blob/master/CLA.md). You can sign it by commenting: <br><br><code>I have read the CLA Document and I hereby sign the CLA</code>'
