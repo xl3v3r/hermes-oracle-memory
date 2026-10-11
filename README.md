@@ -6,6 +6,13 @@
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
 
+## What's New in v1.0.4
+
+- **`oracle-import` Hermes Skill**: Import conversation history archives (ShareGPT, Claude, ChatGPT, and overview JSON files) and large documents directly into Oracle 26ai ADB memory without exhausting LLM context windows or triggering API rate limits (e.g. HTTP 429).
+- **Direct File Chunking via `oracle_chunk` (`file_path`)**: The `oracle_chunk` tool now supports reading files directly from disk via `file_path`, running in-database chunking with `DBMS_VECTOR.UTL_TO_CHUNKS` and avoiding multi-megabyte prompt token inflation.
+- **Multi-Format & Truncated JSON Extraction**: Native turn extraction across ShareGPT, Claude, and overview structures with automatic recovery of complete leading JSON objects in truncated files.
+- **ADB Wallet Auto-Detection**: Automatic discovery of Oracle ADB mTLS wallet credentials in `~/.oci/wallet` and `~/.hermes/oracle_wallet` across thin and thick modes.
+
 ## Requirements
 
 - `oracledb` (thin mode or thick mode with wallet)
@@ -45,9 +52,59 @@ Then restart the gateway / start a new session.
 | `oracle_delete` | delete by memory_id |
 | `oracle_chunk` | split text or disk file (`content` or `file_path`, supporting ShareGPT/JSON exports) with in-database UTL_TO_CHUNKS |
 
+### Enhanced `oracle_chunk` Tool
+
+The `oracle_chunk` tool supports direct file chunking via `file_path` in addition to inline `content`. When `file_path` is provided, the tool reads the file locally, automatically parses supported conversation export formats (ShareGPT, Claude, ChatGPT, or summary JSON) into structured turns, and executes in-database chunking using Oracle ADB's `DBMS_VECTOR.UTL_TO_CHUNKS`. This avoids piping large file payloads through the LLM prompt context.
+
+**Parameters:**
+- `file_path` *(string, optional)*: Absolute or relative path to a local text, markdown, or JSON file.
+- `content` *(string, optional)*: Inline text content to chunk.
+- `max_words` *(integer, default 80)*: Maximum words per chunk.
+- `overlap` *(integer, default 10)*: Number of overlapping words between consecutive chunks.
+
+**Tool Call Example:**
+```json
+{
+  "file_path": "/path/to/conversations.json",
+  "max_words": 1000,
+  "overlap": 10
+}
+```
+
 ## Skills
 
-- **`oracle-import`** (`skills/oracle-import/SKILL.md`): Import conversation history archives (ShareGPT, ChatGPT, Claude) and large documents into Oracle Autonomous AI Database 26ai memory without hitting LLM token or rate limits. Includes a standalone bulk ingestion script (`skills/oracle-import/scripts/import_conversations.py`).
+### `oracle-import`
+
+Located at [`skills/oracle-import/SKILL.md`](skills/oracle-import/SKILL.md), this skill enables bulk ingestion of historical conversation archives and large documents into Oracle Autonomous AI Database 26ai memory without hitting LLM token limits or upstream provider rate limits (such as NVIDIA NIM HTTP 429).
+
+#### Supported Formats
+
+| Format | Structure | Parsing Behavior |
+|--------|-----------|------------------|
+| **ShareGPT** | `{"conversations": [{"from": "...", "value": "..."}]}` | Turns extracted and prefixed with `[ROLE]` |
+| **Claude Export** | `[{"name": "...", "summary": "...", "chat_messages": [...]}]` | Extracts titles, summaries, and user/assistant messages |
+| **ChatGPT Export** | Standard ChatGPT multi-turn archive | Formats user and assistant turns with message roles |
+| **Summary / Overview JSON** | `{"conversations": [...]}` or conversation summaries | Ingested as system/session memory turns |
+| **Plain Text / Markdown** | `.txt`, `.md`, logs | Split recursively via in-database `UTL_TO_CHUNKS` |
+| **Truncated JSON Streams** | Partial or aborted downloads | Recovers valid leading JSON objects without failing |
+
+#### Ingestion Methods
+
+1. **Via Hermes Agent (`oracle_chunk`)**:
+   Agents can directly invoke the `oracle_chunk` tool passing `file_path`:
+   ```bash
+   oracle_chunk(file_path="/path/to/archive.json", max_words=500, overlap=20)
+   ```
+
+2. **Standalone Bulk Ingestion Script**:
+   For large exports (>10MB or hundreds of sessions), run the bundled CLI script to import batches directly into Oracle ADB with zero LLM API consumption:
+   ```bash
+   # Import an archive
+   python3 skills/oracle-import/scripts/import_conversations.py /path/to/oracle_import.json
+
+   # Specify custom batch size and session ID
+   python3 skills/oracle-import/scripts/import_conversations.py /path/to/conversations.json --batch-size 50 --session-id "archive-2026-06"
+   ```
 
 ## Testing & Verification
 
