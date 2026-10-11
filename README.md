@@ -1,6 +1,6 @@
 # Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)
 
 ## About
 
@@ -8,8 +8,9 @@
 
 ## Requirements
 
-- `oracledb` (thin mode)
+- `oracledb` (thin mode or thick mode with wallet)
 - Env in `$HERMES_HOME/.env`: `OCI_DB_USER`, `OCI_DB_PASSWORD`, `OCI_DB_DSN`
+- Optional wallet path: `OCI_WALLET_LOCATION` or `TNS_ADMIN` (auto-detected in `~/.oci/wallet` and `~/.hermes/oracle_wallet`)
 - Embeddings (1536-d FLOAT64, must match `HERMES_AGENT_MEMORY.EMBEDDING`):
   1. OCI GenAI `cohere.embed-v4.0` via instance principal if enabled (`OCI_GENAI_REGION`, optional `OCI_COMPARTMENT_ID` / `OCI_EMBED_MODEL`)
   2. Else OpenRouter `openai/text-embedding-3-small` (`OPENROUTER_API_KEY`)
@@ -31,7 +32,7 @@ Then restart the gateway / start a new session.
 - Writes insert text immediately; embeddings backfill in batches of 32
 - Query embedding LRU cache (256)
 - Prefetch wait 0.5s
-- `DBMS_VECTOR.UTL_TO_CHUNKS` for long-document splits
+- `DBMS_VECTOR.UTL_TO_CHUNKS` for long-document and file splits
 - Hybrid rank: 0.7 * (1 - cosine distance) + 0.3 * normalized text score
 
 ## Tools
@@ -42,7 +43,11 @@ Then restart the gateway / start a new session.
 | `oracle_add` | store a durable fact (embedded + indexed) |
 | `oracle_update` | replace content by memory_id |
 | `oracle_delete` | delete by memory_id |
-| `oracle_chunk` | split text with in-database UTL_TO_CHUNKS |
+| `oracle_chunk` | split text or disk file (`content` or `file_path`, supporting ShareGPT/JSON exports) with in-database UTL_TO_CHUNKS |
+
+## Skills
+
+- **`oracle-import`** (`skills/oracle-import/SKILL.md`): Import conversation history archives (ShareGPT, ChatGPT, Claude) and large documents into Oracle Autonomous AI Database 26ai memory without hitting LLM token or rate limits. Includes a standalone bulk ingestion script (`skills/oracle-import/scripts/import_conversations.py`).
 
 ## Testing & Verification
 

@@ -1,6 +1,7 @@
 include plugin.yaml
 include README.md
 include AGENTS.md
+recursive-include skills *
 exclude test_oracle.py
 exclude pytest.ini
 recursive-exclude tests *

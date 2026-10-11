@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
+from pathlib import Path
 from typing import Any
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 from agent.secret_scope import get_secret
@@ -121,9 +122,9 @@ TOOL_SCHEMAS = [
     {
         "name": "oracle_chunk",
         "description": (
-            "Split long text with in-database DBMS_VECTOR.UTL_TO_CHUNKS, then store "
-            "each chunk as its own VECTOR row. Use for documents, logs, or notes "
-            "too large for a single fact."
+            "Split long text or files with in-database DBMS_VECTOR.UTL_TO_CHUNKS, then store "
+            "each chunk as its own VECTOR row. Use for documents, logs, notes, or conversation "
+            "imports too large for a single fact. Provide 'content' or 'file_path'."
         ),
         "parameters": {
             "type": "object",
@@ -131,6 +132,10 @@ TOOL_SCHEMAS = [
                 "content": {
                     "type": "string",
                     "description": "Source text to chunk and store.",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to a text or JSON file on disk to chunk and store.",
                 },
                 "max_words": {
                     "type": "integer",
@@ -141,7 +146,6 @@ TOOL_SCHEMAS = [
                     "description": "Word overlap (default 10).",
                 },
             },
-            "required": ["content"],
         },
     },
 ]
@@ -293,18 +297,50 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             import oracledb
 
-            self._pool = oracledb.SessionPool(
-                user=self._user,
-                password=password,
-                dsn=self._dsn,
-                min=2,
-                max=8,
-                increment=1,
-                threaded=True,
-                getmode=oracledb.POOL_GETMODE_WAIT,
-                timeout=5,
-                wait_timeout=5,
+            pool_kwargs: dict[str, Any] = {
+                "user": self._user,
+                "password": password,
+                "dsn": self._dsn,
+                "min": 2,
+                "max": 8,
+                "increment": 1,
+                "threaded": True,
+                "getmode": oracledb.POOL_GETMODE_WAIT,
+                "timeout": 5,
+                "wait_timeout": 5,
+            }
+
+            raw_wallet = get_secret("OCI_WALLET_LOCATION")
+            wallet_dir = (
+                raw_wallet
+                if isinstance(raw_wallet, str) and raw_wallet
+                else (os.environ.get("TNS_ADMIN") or "")
             )
+            if not wallet_dir:
+                for candidate in (
+                    Path.home() / ".oci" / "wallet",
+                    Path.home() / ".hermes" / "oracle_wallet",
+                ):
+                    try:
+                        if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
+                            wallet_dir = str(candidate)
+                            break
+                    except Exception:
+                        pass
+
+            if wallet_dir and isinstance(wallet_dir, str):
+                try:
+                    wpath = Path(wallet_dir)
+                    if wpath.is_dir():
+                        pool_kwargs["config_dir"] = str(wallet_dir)
+                        pool_kwargs["wallet_location"] = str(wallet_dir)
+                        wallet_pwd = get_secret("OCI_WALLET_PASSWORD")
+                        if isinstance(wallet_pwd, str) and wallet_pwd:
+                            pool_kwargs["wallet_password"] = wallet_pwd
+                except Exception:
+                    pass
+
+            self._pool = oracledb.SessionPool(**pool_kwargs)
             self._ensure_schema()
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
         except Exception as e:
@@ -1212,8 +1248,74 @@ class OracleMemoryProvider(MemoryProvider):
                 return json.dumps({"result": "deleted", "memory_id": mid})
             if tool_name == "oracle_chunk":
                 content = (args.get("content") or "").strip()
+                file_path = (args.get("file_path") or args.get("path") or "").strip()
+                if not content and not file_path:
+                    return tool_error("Missing required parameter: content or file_path")
+                if file_path:
+                    try:
+                        p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
+                        if not p.is_file():
+                            return tool_error(f"File not found: {file_path}")
+                        raw_data = p.read_text(encoding="utf-8", errors="replace")
+                        extracted_text = ""
+                        try:
+                            parsed_json = json.loads(raw_data)
+                            if isinstance(parsed_json, dict) and "conversations" in parsed_json:
+                                turns = []
+                                for item in parsed_json["conversations"]:
+                                    if isinstance(item, dict):
+                                        val = item.get("value") or item.get("content") or item.get("text") or ""
+                                        sender = item.get("from") or item.get("role") or ""
+                                        if val:
+                                            prefix = f"[{sender.upper()}]: " if sender else ""
+                                            turns.append(f"{prefix}{val}")
+                                    elif isinstance(item, str) and item:
+                                        turns.append(item)
+                                if turns:
+                                    extracted_text = "\n\n".join(turns)
+                            elif isinstance(parsed_json, list):
+                                turns = []
+                                for item in parsed_json:
+                                    if isinstance(item, dict):
+                                        if "conversations" in item and isinstance(item["conversations"], list):
+                                            for sub in item["conversations"]:
+                                                if isinstance(sub, dict):
+                                                    val = sub.get("value") or sub.get("content") or sub.get("text") or ""
+                                                    sender = sub.get("from") or sub.get("role") or ""
+                                                    if val:
+                                                        prefix = f"[{sender.upper()}]: " if sender else ""
+                                                        turns.append(f"{prefix}{val}")
+                                        elif "chat_messages" in item and isinstance(item["chat_messages"], list):
+                                            for sub in item["chat_messages"]:
+                                                if isinstance(sub, dict):
+                                                    val = sub.get("text") or sub.get("content") or sub.get("value") or ""
+                                                    sender = sub.get("sender") or sub.get("from") or sub.get("role") or ""
+                                                    if val:
+                                                        prefix = f"[{sender.upper()}]: " if sender else ""
+                                                        turns.append(f"{prefix}{val}")
+                                        else:
+                                            val = item.get("value") or item.get("content") or item.get("text") or ""
+                                            sender = item.get("from") or item.get("role") or ""
+                                            if val:
+                                                prefix = f"[{sender.upper()}]: " if sender else ""
+                                                turns.append(f"{prefix}{val}")
+                                    elif isinstance(item, str) and item:
+                                        turns.append(item)
+                                if turns:
+                                    extracted_text = "\n\n".join(turns)
+                        except Exception:
+                            extracted_text = ""
+
+                        file_text = extracted_text if extracted_text else raw_data
+                        if not content:
+                            content = file_text.strip()
+                        else:
+                            content = f"{content}\n\n{file_text.strip()}"
+                    except Exception as e:
+                        return tool_error(f"Failed to read file {file_path}: {e}")
+
                 if not content:
-                    return tool_error("Missing required parameter: content")
+                    return tool_error("Content is empty")
                 max_words = int(args.get("max_words") or 80)
                 overlap = int(args.get("overlap") or 10)
                 ids = self._chunk_and_store(content, max_words, overlap)
@@ -1316,3 +1418,14 @@ class OracleMemoryProvider(MemoryProvider):
 
 def register(ctx) -> None:
     ctx.register_memory_provider(OracleMemoryProvider())
+    if hasattr(ctx, "register_skill"):
+        try:
+            skill_path = Path(__file__).parent / "skills" / "oracle-import" / "SKILL.md"
+            if skill_path.exists():
+                ctx.register_skill(
+                    "oracle-import",
+                    skill_path,
+                    "Import conversation archives and documents into Oracle 26ai ADB memory without LLM rate limits",
+                )
+        except Exception as exc:
+            logger.debug("Failed to register oracle-import skill: %s", exc)
