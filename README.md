@@ -1,4 +1,4 @@
-# Oracle 26ai Memory Provider
+# Hermes Agent Oracle 26ai Memory Provider
 
 ![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)
 
