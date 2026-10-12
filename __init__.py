@@ -1058,10 +1058,16 @@ class OracleMemoryProvider(MemoryProvider):
                             else:
                                 merged[r["memory_id"]] = r
                     except Exception as e2:
-                        logger.debug("Fallback hybrid failed (%s); falling back to vector-only", e2)
-                        v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
-                        for r in self._fetch_rows(cur, v_sql, v_binds):
-                            merged[r["memory_id"]] = r
+                        logger.debug("Fallback hybrid failed (%s); falling back to vector or text", e2)
+                        try:
+                            v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                            for r in self._fetch_rows(cur, v_sql, v_binds):
+                                merged[r["memory_id"]] = r
+                        except Exception as e3:
+                            logger.debug("Fallback vector also failed (%s); falling back to text-only", e3)
+                            t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                            for r in self._fetch_rows(cur, t_sql, t_binds):
+                                merged[r["memory_id"]] = r
                 else:
                     t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                     for r in self._fetch_rows(cur, t_sql, t_binds):
@@ -1071,9 +1077,15 @@ class OracleMemoryProvider(MemoryProvider):
                     "fused hybrid failed (%s); falling back to vector-only", e
                 )
                 if vec is not None:
-                    v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
-                    for r in self._fetch_rows(cur, v_sql, v_binds):
-                        merged[r["memory_id"]] = r
+                    try:
+                        v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                        for r in self._fetch_rows(cur, v_sql, v_binds):
+                            merged[r["memory_id"]] = r
+                    except Exception as e_vec:
+                        logger.debug("vector-only failed (%s); falling back to text", e_vec)
+                        t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                        for r in self._fetch_rows(cur, t_sql, t_binds):
+                            merged[r["memory_id"]] = r
                 else:
                     t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                     for r in self._fetch_rows(cur, t_sql, t_binds):
@@ -1118,15 +1130,31 @@ class OracleMemoryProvider(MemoryProvider):
                             if vec is None:
                                 vec = self._embed_many([query])[0]
                             if vec is not None:
-                                sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
-                                rows = self._fetch_rows(cur, sql, binds)
+                                try:
+                                    sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                                    rows = self._fetch_rows(cur, sql, binds)
+                                except Exception as e2:
+                                    logger.warning(
+                                        "Fallback vector search failed (%s); falling back to text search",
+                                        e2,
+                                    )
+                                    sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                                    rows = self._fetch_rows(cur, sql, binds)
                             else:
                                 sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                                 rows = self._fetch_rows(cur, sql, binds)
                     else:
                         if vec is not None:
-                            sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
-                            rows = self._fetch_rows(cur, sql, binds)
+                            try:
+                                sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                                rows = self._fetch_rows(cur, sql, binds)
+                            except Exception as e:
+                                logger.warning(
+                                    "Vector search failed (%s); falling back to text search",
+                                    e,
+                                )
+                                sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                                rows = self._fetch_rows(cur, sql, binds)
                         else:
                             sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                             rows = self._fetch_rows(cur, sql, binds)
