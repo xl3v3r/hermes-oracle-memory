@@ -127,7 +127,146 @@ class TestOraclePlugin(unittest.TestCase):
             with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, *args: secrets.get(k)):
                 self.assertTrue(provider.is_available())
 
+    def test_embed_openrouter_model_and_dimensions(self):
+        self.assertEqual(oracle_plugin._EMBED_MODEL, "qwen/qwen3-embedding-4b")
+        self.assertEqual(oracle_plugin._EMBED_DIM, 1536)
+
+        provider = oracle_plugin.OracleMemoryProvider()
+        captured_req = {}
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                import json
+                return json.dumps({
+                    "data": [{"index": 0, "embedding": [0.1] * 1536}]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=20):
+            import json
+            captured_req["url"] = req.full_url
+            captured_req["data"] = json.loads(req.data.decode("utf-8"))
+            captured_req["headers"] = dict(req.headers)
+            return DummyResponse()
+
+        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = provider._embed_openrouter(["sample text to embed"])
+            self.assertEqual(len(res), 1)
+            self.assertIsNotNone(res[0])
+            self.assertEqual(len(res[0]), 1536)
+            self.assertEqual(captured_req["data"]["model"], "qwen/qwen3-embedding-4b")
+            self.assertEqual(captured_req["data"]["dimensions"], 1536)
+            self.assertEqual(captured_req["data"]["input"], ["sample text to embed"])
+
+    def test_embed_openrouter_empty_none_and_whitespace(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        captured_req = {}
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                import json
+                return json.dumps({
+                    "data": [
+                        {"index": 0, "embedding": [0.1] * 1536},
+                        {"index": 1, "embedding": [0.2] * 1536},
+                    ]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=20):
+            import json
+            captured_req["data"] = json.loads(req.data.decode("utf-8"))
+            return DummyResponse()
+
+        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            inputs = ["valid one", "", "   ", None, "valid two"]
+            res = provider._embed_openrouter(inputs)
+            self.assertEqual(len(res), 5)
+            self.assertIsNotNone(res[0])
+            self.assertEqual(len(res[0]), 1536)
+            self.assertIsNone(res[1])
+            self.assertIsNone(res[2])
+            self.assertIsNone(res[3])
+            self.assertIsNotNone(res[4])
+            self.assertEqual(len(res[4]), 1536)
+            # Only valid, non-empty items sent to OpenRouter
+            self.assertEqual(captured_req["data"]["input"], ["valid one", "valid two"])
+
+    def test_embed_openrouter_all_empty(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
+             patch("urllib.request.urlopen") as mock_urlopen:
+            res = provider._embed_openrouter(["", "   ", None])
+            self.assertEqual(res, [None, None, None])
+            mock_urlopen.assert_not_called()
+
+    def test_embed_openrouter_dimension_mismatch(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                import json
+                return json.dumps({
+                    "data": [
+                        {"index": 0, "embedding": [0.1] * 512},  # wrong dim
+                        {"index": 1, "embedding": [0.2] * 1536}, # correct dim
+                    ]
+                }).encode("utf-8")
+
+        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
+             patch("urllib.request.urlopen", return_value=DummyResponse()):
+            res = provider._embed_openrouter(["doc1", "doc2"])
+            self.assertEqual(len(res), 2)
+            self.assertIsNone(res[0])  # Discarded due to 512 != 1536
+            self.assertIsNotNone(res[1])
+            self.assertEqual(len(res[1]), 1536)
+
+    def test_embed_openrouter_retry_on_transient_error(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        import urllib.error
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                import json
+                return json.dumps({
+                    "data": [{"index": 0, "embedding": [0.3] * 1536}]
+                }).encode("utf-8")
+
+        call_count = [0]
+        def fake_urlopen_with_retry(req, timeout=20):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                fp = MagicMock()
+                fp.read.return_value = b'{"error": "rate limit"}'
+                raise urllib.error.HTTPError("https://openrouter.ai/api/v1/embeddings", 429, "Too Many Requests", {}, fp)
+            return DummyResponse()
+
+        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen_with_retry), \
+             patch("time.sleep"):
+            res = provider._embed_openrouter(["retry text"])
+            self.assertEqual(call_count[0], 2)
+            self.assertIsNotNone(res[0])
+            self.assertEqual(len(res[0]), 1536)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

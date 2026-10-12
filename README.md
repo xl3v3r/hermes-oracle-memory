@@ -1,11 +1,18 @@
 # Hermes Agent Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.5-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 ## About
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
+
+## What's New in v1.0.5
+
+- **Embedding Model Migration to `qwen/qwen3-embedding-4b`**: Migrated default OpenRouter embedding provider to Qwen's embedding model (`qwen/qwen3-embedding-4b`) producing 1536-dimensional FLOAT64 vectors via Matryoshka dimension specification (`dimensions: 1536`).
+- **Resilient OpenRouter Embedding Pipeline**: Updated `_embed_openrouter()` with empty-string and whitespace filtering to prevent upstream HTTP 400 Bad Request errors, response vector dimension validation against `_EMBED_DIM` (1536), and exponential backoff retry logic for transient HTTP 429 and 5xx errors.
+- **Embedding Backfill & Migration Script (`scripts/backfill_embeddings.py`)**: Added CLI utility for batch backfilling and migrating database memory embeddings from older models to `qwen/qwen3-embedding-4b` with checkpoint resumption and database backup creation.
+- **Provider Verification Utility (`scripts/verify_provider.py`)**: Added end-to-end verification script to test Oracle DB connectivity, embedding generation, memory insertion, and recall.
 
 ## What's New in v1.0.4
 
@@ -68,7 +75,7 @@ Memories require 1536-dimensional FLOAT64 embeddings matching `HERMES_AGENT_MEMO
 
 | Variable | Requirement | Description |
 |----------|-------------|-------------|
-| `OPENROUTER_API_KEY` | Recommended / Fallback | API key for OpenRouter to embed using `openai/text-embedding-3-small` (1536-d). |
+| `OPENROUTER_API_KEY` | Recommended / Fallback | API key for OpenRouter to embed using `qwen/qwen3-embedding-4b` (1536-d). |
 | `OCI_GENAI_REGION` | Optional | OCI region for OCI Generative AI inference (e.g., `us-chicago-1`, `us-ashburn-1`). Uses Instance Principal authentication. |
 | `OCI_COMPARTMENT_ID` | Optional | Compartment OCID where OCI Generative AI inference is permitted. |
 | `OCI_EMBED_MODEL` | Optional | Embedding model ID on OCI GenAI (defaults to `cohere.embed-v4.0`). |

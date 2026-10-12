@@ -1,5 +1,4 @@
 __pycache__/
-<<<<<<< HEAD
 *.py[cod]
 *$py.class
 *.egg-info/
@@ -8,9 +7,10 @@ dist/
 .pytest_cache/
 .venv/
 uv.lock
-=======
 *.pyc
 agent/
 tools/
 .coverage
->>>>>>> origin/test/oracle-is-available-10762235352272350927
+backfills/
+backups/
+

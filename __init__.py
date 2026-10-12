@@ -2,7 +2,7 @@
 
 VECTOR IVF + Oracle Text + JSON search as the primary Hermes memory backend.
 Credentials: OCI_DB_USER / OCI_DB_PASSWORD / OCI_DB_DSN in $HERMES_HOME/.env.
-Embeddings: OpenRouter openai/text-embedding-3-small (1536-d FLOAT64) by default.
+Embeddings: OpenRouter qwen/qwen3-embedding-4b (1536-d FLOAT64) by default.
 OCI GenAI cohere.embed-v4.0 (1536-d) is tried first via instance principal; on
 404/auth failure this process falls back to OpenRouter and does not retry OCI.
 """
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 1536
-_EMBED_MODEL = "openai/text-embedding-3-small"
+_EMBED_MODEL = "qwen/qwen3-embedding-4b"
 _OCI_EMBED_MODEL = "cohere.embed-v4.0"
 _EMBED_CACHE_MAX = 256
 _EMBED_BATCH = 32
@@ -521,27 +521,69 @@ class OracleMemoryProvider(MemoryProvider):
             return out
         if not key or not isinstance(key, str):
             return out
+
+        # Filter and track non-empty texts to avoid OpenRouter 400 Bad Request on empty strings
+        # or TypeError on None.
+        valid_indices: list[int] = [
+            i
+            for i, t in enumerate(texts)
+            if t is not None and isinstance(t, str) and t.strip()
+        ]
+        if not valid_indices:
+            return out
+
+        input_payload = [texts[i][:8000] for i in valid_indices]
+
         try:
+            import urllib.error
             import urllib.request
 
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/embeddings",
-                data=json.dumps(
-                    {"model": _EMBED_MODEL, "input": [t[:8000] for t in texts]}
-                ).encode(),
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode())
-            for item in data.get("data") or []:
-                idx = int(item.get("index", 0))
-                vec = item.get("embedding") or []
-                if 0 <= idx < len(out) and len(vec) == _EMBED_DIM:
-                    out[idx] = array.array("d", vec)
+            req_data = json.dumps(
+                {
+                    "model": _EMBED_MODEL,
+                    "input": input_payload,
+                    "dimensions": _EMBED_DIM,
+                }
+            ).encode("utf-8")
+
+            max_retries = 3
+            backoff = 1.5
+            data = None
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    req = urllib.request.Request(
+                        "https://openrouter.ai/api/v1/embeddings",
+                        data=req_data,
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    break
+                except urllib.error.HTTPError as he:
+                    if (he.code == 429 or he.code >= 500) and attempt < max_retries:
+                        time.sleep(backoff)
+                        backoff *= 2.0
+                        continue
+                    raise
+                except Exception as ex:
+                    if attempt < max_retries:
+                        time.sleep(backoff)
+                        backoff *= 2.0
+                        continue
+                    raise
+
+            if data:
+                for item in data.get("data") or []:
+                    resp_idx = int(item.get("index", 0))
+                    vec = item.get("embedding") or []
+                    if 0 <= resp_idx < len(valid_indices) and len(vec) == _EMBED_DIM:
+                        orig_idx = valid_indices[resp_idx]
+                        out[orig_idx] = array.array("d", vec)
         except Exception as e:
             logger.warning("OpenRouter embed failed: %s", e)
         return out
