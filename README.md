@@ -1,11 +1,64 @@
 # Hermes Agent Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.5-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.5.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 ## About
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
+
+## What's New in v1.0.5.1
+
+- **Primary In-Database ONNX Engine (`BGE_BASE_EN_V1_5`)**:
+  - In-database vector inference powered by `BAAI/bge-base-en-v1.5` loaded directly into Oracle ADB kernel via `DBMS_VECTOR.LOAD_ONNX_MODEL`.
+  - Vectors generated and indexed natively in SQL as 768-dimensional `VECTOR(768, FLOAT32)`.
+  - Bounded with dynamic token slicing (`max 512 tokens`) to protect against sequence length broadcast errors (`ORA-54401`).
+- **Transparent OpenRouter Fallback**:
+  - Automated, zero-downtime fallback to `qwen/qwen3-embedding-4b` via OpenRouter configured at `dimensions: 768` (Matryoshka representation) whenever in-database ONNX inference is unavailable or disabled.
+  - Type-safe vector distance casting (`TO_VECTOR(:v, 768, FLOAT32)`) ensuring cross-engine vector query compatibility without format mismatches (`ORA-51812`).
+- **Parallel Backfill Engine**:
+  - Multithreaded session-pooled migration script (`scripts/backfill_embeddings.py`) supporting checkpoint resumption (`backfills/backfill_progress_768.json`) and automated vector index maintenance.
+- **In-Memory HNSW Neighbor Graph Indexing**:
+  - Native index creation with `CREATE VECTOR INDEX ... ORGANIZATION INMEMORY NEIGHBOR GRAPH` and automated statistics gathering via `DBMS_STATS.GATHER_TABLE_STATS`.
+
+### Upgrade & Installation Guide for BGE_BASE_EN_V1_5
+
+#### 1. Setup In-Database ONNX Engine (Option B — Primary)
+
+Export `BAAI/bge-base-en-v1.5` with token slicing, stage it into Oracle `DATA_PUMP_DIR`, and load the model into Oracle ADB Mining Models:
+
+```bash
+# Generate sliced pipeline and load into Oracle Autonomous Database
+python3 scripts/setup_onnx_model.py
+```
+
+Set the model identifier in your Hermes environment:
+
+```bash
+# Add or update in ~/.hermes/.env
+HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5
+```
+
+#### 2. Configure Transparent Fallback (Option C)
+
+Ensure your OpenRouter API key is set in `~/.hermes/.env`. The provider will automatically use `qwen/qwen3-embedding-4b` (768 dimensions) as fallback:
+
+```bash
+OPENROUTER_API_KEY="sk-or-v1-..."
+```
+
+If `BGE_BASE_EN_V1_5` is not set or encounters transient errors, vector search, hybrid search, and fact insertions seamlessly route to OpenRouter 768-d.
+
+#### 3. Backfill Legacy Memory Rows to 768-d
+
+If upgrading from an earlier version with 1536-d or null embeddings, execute the multithreaded backfill utility:
+
+```bash
+# Backfill with 4 parallel worker sessions against Oracle ADB
+python3 scripts/backfill_embeddings.py --workers 4 --batch-size 32
+```
+
+The script automatically resumes from existing checkpoints in `backfills/backfill_progress_768.json` and gathers table statistics upon completion.
 
 ## What's New in v1.0.5
 
