@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -146,6 +147,49 @@ def main() -> None:
     })
     print(f"Tool call output length: {len(tool_out)} characters")
     assert len(tool_out) > 0, "Empty tool call output"
+
+    # 8. Verify live add and update tool calls via ONNX
+    print("Testing handle_tool_call oracle_add with ONNX...")
+    import uuid
+    test_fact = f"Verification fact {uuid.uuid4().hex[:8]} for Oracle AI memory"
+    add_out = provider.handle_tool_call("oracle_add", {
+        "content": test_fact,
+        "target": "memory",
+    })
+    print(f"oracle_add response: {add_out}")
+    assert "Fact stored" in add_out or "memory_id" in add_out, "Failed to add fact"
+    add_data = json.loads(add_out)
+    new_mid = add_data.get("memory_id")
+
+    if new_mid:
+        print("Testing handle_tool_call oracle_update with ONNX...")
+        upd_fact = f"Updated verification fact for {new_mid}"
+        upd_out = provider.handle_tool_call("oracle_update", {
+            "memory_id": new_mid,
+            "content": upd_fact,
+        })
+        print(f"oracle_update response: {upd_out}")
+        assert "updated" in upd_out.lower(), "Failed to update fact"
+
+    # 9. Verify live fallback to OpenRouter when ONNX model is unavailable
+    print("Testing live fallback from broken ONNX to OpenRouter 768-d...")
+    orig_onnx = provider._onnx_model
+    try:
+        provider._onnx_model = "NONEXISTENT_ONNX_MODEL_TEST"
+        fallback_results = provider._search("database memory architecture", mode="vector", top_k=2)
+        print(f"Fallback vector search returned {len(fallback_results)} results")
+        fallback_hybrid = provider._search("database memory architecture", mode="hybrid", top_k=2)
+        print(f"Fallback hybrid search returned {len(fallback_hybrid)} results")
+        fallback_add = provider._insert(
+            memory_id=f"fallback_test_{uuid.uuid4().hex[:8]}",
+            session_id="fallback-session",
+            role="user",
+            content="Fallback content test for OpenRouter",
+            target="memory",
+        )
+        print("Fallback insert succeeded.")
+    finally:
+        provider._onnx_model = orig_onnx
 
     provider.shutdown()
     print("ALL VERIFICATION CHECKS PASSED!")

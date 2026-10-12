@@ -85,6 +85,44 @@ def get_db_connection() -> Any:
     return conn
 
 
+def get_db_pool(min_conns: int = 1, max_conns: int = 8) -> Any:
+    """Create a session pool for multithreaded backfilling."""
+    import oracledb
+
+    user = os.environ.get("OCI_DB_USER")
+    password = os.environ.get("OCI_DB_PASSWORD")
+    dsn = os.environ.get("OCI_DB_DSN")
+
+    if not user or not password or not dsn:
+        raise RuntimeError("Missing database credentials: OCI_DB_USER, OCI_DB_PASSWORD, or OCI_DB_DSN")
+
+    wallet_dir = os.environ.get("OCI_WALLET_LOCATION")
+    if not wallet_dir:
+        for candidate in (
+            Path.home() / ".oci" / "wallet",
+            Path.home() / ".hermes" / "oracle_wallet",
+        ):
+            if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
+                wallet_dir = str(candidate)
+                break
+
+    kwargs: dict[str, Any] = {
+        "user": user,
+        "password": password,
+        "dsn": dsn,
+        "min": min_conns,
+        "max": max_conns,
+    }
+    if wallet_dir:
+        kwargs["config_dir"] = wallet_dir
+        kwargs["wallet_location"] = wallet_dir
+        wallet_pwd = os.environ.get("OCI_WALLET_PASSWORD")
+        if wallet_pwd:
+            kwargs["wallet_password"] = wallet_pwd
+
+    return oracledb.create_pool(**kwargs)
+
+
 def embed_batch_openrouter(
     texts: list[str],
     api_key: str,
@@ -132,7 +170,7 @@ def embed_batch_openrouter(
                 vec = item.get("embedding") or []
                 if 0 <= resp_idx < len(valid_indices) and len(vec) == dimensions:
                     orig_idx = valid_indices[resp_idx]
-                    out[orig_idx] = array.array("d", vec)
+                    out[orig_idx] = array.array("f", vec)
             return out
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
@@ -162,6 +200,7 @@ def run_backfill(
     rebuild_index: bool,
     dimensions: int = _DEFAULT_DIM,
     onnx_model: str | None = None,
+    workers: int = 1,
 ) -> int:
     """Execute the backfill process."""
     load_env()
@@ -201,7 +240,7 @@ def run_backfill(
     logger.info("Total rows in %s: %d", clean_table, total_rows)
 
     logger.info("Fetching rows to embed...")
-    query = f"SELECT memory_id, content FROM {clean_table} ORDER BY created_at ASC, memory_id ASC"  # nosec B608
+    query = f"SELECT memory_id, content FROM {clean_table} WHERE embedding IS NULL ORDER BY created_at ASC, memory_id ASC"  # nosec B608
     cur.execute(query)
 
     rows_to_process: list[tuple[str, str]] = []
@@ -244,81 +283,87 @@ def run_backfill(
 
     processed_count = 0
     t_start = time.time()
+    pool = get_db_pool(min_conns=1, max_conns=max(4, workers + 1))
 
-    for i in range(0, len(rows_to_process), batch_size):
-        batch = rows_to_process[i : i + batch_size]
-        ids = [mid for mid, _ in batch]
-        texts = [content for _, content in batch]
-
-        # Option B: Attempt in-database ONNX embedding if configured
+    def process_batch(batch_items: list[tuple[str, str]]) -> tuple[list[str], bool, float]:
+        ids = [mid for mid, _ in batch_items]
+        texts = [content for _, content in batch_items]
+        t0 = time.time()
         if onnx_model:
             try:
-                t0 = time.time()
-                with conn.cursor() as update_cur:
+                with pool.acquire() as b_conn, b_conn.cursor() as update_cur:
                     sql = f"UPDATE {clean_table} SET embedding = VECTOR_EMBEDDING({onnx_model} USING :1 AS DATA) WHERE memory_id = :2"  # nosec B608
                     binds = [(txt[:4000], mid) for mid, txt in zip(ids, texts)]
                     update_cur.executemany(sql, binds)
-                conn.commit()
-                t_embed = time.time() - t0
-                for mid in ids:
+                    b_conn.commit()
+                return ids, True, time.time() - t0
+            except Exception as e:
+                logger.warning("In-database ONNX backfill failed for batch (%s); falling back to OpenRouter 768-d", e)
+
+        vecs = embed_batch_openrouter(texts, api_key, dimensions=dimensions)
+        binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
+        if binds:
+            with pool.acquire() as b_conn, b_conn.cursor() as update_cur:
+                sql = f"UPDATE {clean_table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
+                update_cur.executemany(sql, binds)
+                b_conn.commit()
+        success_ids = [mid for mid, vec in zip(ids, vecs) if vec is not None]
+        return success_ids, False, time.time() - t0
+
+    batches = [rows_to_process[i : i + batch_size] for i in range(0, len(rows_to_process), batch_size)]
+    total_batches = len(batches)
+
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {executor.submit(process_batch, b): idx for idx, b in enumerate(batches)}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                b_ids, was_onnx, t_embed = future.result()
+                for mid in b_ids:
                     completed_ids.add(mid)
-                processed_count += len(batch)
+                processed_count += len(b_ids)
                 elapsed = time.time() - t_start
                 rate = processed_count / elapsed if elapsed > 0 else 0
-                if (i // batch_size) % 5 == 0 or processed_count == len(rows_to_process):
-                    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(checkpoint_file, "w", encoding="utf-8") as f:
-                        json.dump(list(completed_ids), f)
+                checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(checkpoint_file, "w", encoding="utf-8") as f:
+                    json.dump(list(completed_ids), f)
                 logger.info(
-                    "Batch %d/%d (%d rows) done via ONNX in %.2fs (overall: %d/%d, %.1f rows/sec)",
-                    (i // batch_size) + 1,
-                    (len(rows_to_process) + batch_size - 1) // batch_size,
-                    len(batch),
+                    "Batch %d/%d (%d rows) done via %s in %.2fs (overall: %d/%d, %.1f rows/sec)",
+                    idx + 1,
+                    total_batches,
+                    len(b_ids),
+                    "ONNX" if was_onnx else "OpenRouter",
                     t_embed,
                     processed_count,
                     len(rows_to_process),
                     rate,
                 )
-                continue
-            except Exception as e:
-                logger.warning("In-database ONNX backfill failed (%s); falling back to OpenRouter 768-d", e)
-
-        # Option C: Fallback to OpenRouter 768-d
-        t0 = time.time()
-        vecs = embed_batch_openrouter(texts, api_key, dimensions=dimensions)
-        t_embed = time.time() - t0
-
-        binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
-        if binds:
-            with conn.cursor() as update_cur:
-                sql = f"UPDATE {clean_table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
-                update_cur.executemany(sql, binds)
-            conn.commit()
-
-        for mid, vec in zip(ids, vecs):
-            if vec is not None:
+    else:
+        for idx, batch in enumerate(batches):
+            b_ids, was_onnx, t_embed = process_batch(batch)
+            for mid in b_ids:
                 completed_ids.add(mid)
+            processed_count += len(b_ids)
+            elapsed = time.time() - t_start
+            rate = processed_count / elapsed if elapsed > 0 else 0
+            if (idx + 1) % 5 == 0 or processed_count == len(rows_to_process):
+                checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(checkpoint_file, "w", encoding="utf-8") as f:
+                    json.dump(list(completed_ids), f)
+            logger.info(
+                "Batch %d/%d (%d rows) done via %s in %.2fs (overall: %d/%d, %.1f rows/sec)",
+                idx + 1,
+                total_batches,
+                len(b_ids),
+                "ONNX" if was_onnx else "OpenRouter",
+                t_embed,
+                processed_count,
+                len(rows_to_process),
+                rate,
+            )
 
-        processed_count += len(batch)
-        elapsed = time.time() - t_start
-        rate = processed_count / elapsed if elapsed > 0 else 0
-
-        # Save checkpoint periodically
-        if (i // batch_size) % 5 == 0 or processed_count == len(rows_to_process):
-            checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(checkpoint_file, "w", encoding="utf-8") as f:
-                json.dump(list(completed_ids), f)
-
-        logger.info(
-            "Batch %d/%d (%d rows) done in %.2fs (overall: %d/%d, %.1f rows/sec)",
-            (i // batch_size) + 1,
-            (len(rows_to_process) + batch_size - 1) // batch_size,
-            len(batch),
-            t_embed,
-            processed_count,
-            len(rows_to_process),
-            rate,
-        )
+    pool.close()
 
     # Maintain vector index / statistics
     if rebuild_index:
@@ -336,7 +381,17 @@ def run_backfill(
         except Exception:
             pass
 
-        if idx_type == "VECTOR":
+        if idx_type is None:
+            logger.info("Vector index %s_VEC_IDX not found; creating...", clean_table)
+            try:
+                with conn.cursor() as idx_cur:
+                    idx_cur.execute(
+                        f"CREATE VECTOR INDEX {clean_table}_VEC_IDX ON {clean_table} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
+                    )
+                logger.info("Vector index %s_VEC_IDX created successfully.", clean_table)
+            except Exception as e:
+                logger.warning("Vector index create error: %s", e)
+        elif idx_type == "VECTOR":
             logger.info("Index %s_VEC_IDX is of type VECTOR. Vector index maintenance is handled by DBMS_STATS.", clean_table)
         else:
             logger.info("Rebuilding index %s_VEC_IDX...", clean_table)
@@ -401,14 +456,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--onnx-model",
-        default=os.environ.get("HERMES_ORACLE_ONNX_MODEL"),
-        help="Optional in-database ONNX model name (e.g., DOC_MODEL)",
+        default=os.environ.get("HERMES_ORACLE_ONNX_MODEL", "BGE_BASE_EN_V1_5"),
+        help="Optional in-database ONNX model name (e.g., BGE_BASE_EN_V1_5)",
     )
     parser.add_argument(
         "--rebuild-index",
         action="store_true",
         default=True,
         help="Rebuild vector index after backfill",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of concurrent worker threads (default: 4)",
     )
     args = parser.parse_args()
 
@@ -422,6 +483,7 @@ def main() -> None:
         rebuild_index=args.rebuild_index,
         dimensions=args.dimensions,
         onnx_model=args.onnx_model,
+        workers=args.workers,
     )
 
 

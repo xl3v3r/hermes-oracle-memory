@@ -310,8 +310,8 @@ class OracleMemoryProvider(MemoryProvider):
         table_str = raw_table if isinstance(raw_table, str) and raw_table else "hermes_agent_memory"
         self._table = _re.sub(r"[^a-zA-Z0-9_]", "", table_str) or "hermes_agent_memory"
 
-        raw_onnx = get_secret("HERMES_ORACLE_ONNX_MODEL")
-        onnx_str = raw_onnx if isinstance(raw_onnx, str) else ""
+        raw_onnx = get_secret("HERMES_ORACLE_ONNX_MODEL", "BGE_BASE_EN_V1_5")
+        onnx_str = raw_onnx if isinstance(raw_onnx, str) and raw_onnx else "BGE_BASE_EN_V1_5"
         self._onnx_model = _re.sub(r"[^a-zA-Z0-9_]", "", onnx_str)
 
         user_val = get_secret("OCI_DB_USER", "ADMIN")
@@ -393,7 +393,7 @@ class OracleMemoryProvider(MemoryProvider):
                     agent_id VARCHAR2(64),
                     role VARCHAR2(64),
                     content CLOB,
-                    embedding VECTOR,
+                    embedding VECTOR(768, FLOAT32),
                     created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
                     target VARCHAR2(32) DEFAULT ''memory'',
                     metadata JSON,
@@ -406,6 +406,7 @@ class OracleMemoryProvider(MemoryProvider):
                 EXECUTE IMMEDIATE 'CREATE SEARCH INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_TXT_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(content) FOR JSON';
             END;
             """,
+            "BEGIN EXECUTE IMMEDIATE 'CREATE VECTOR INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_VEC_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH'; EXCEPTION WHEN OTHERS THEN NULL; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP)'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (target VARCHAR2(32) DEFAULT ''memory'')'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (metadata JSON)'; END;",
@@ -496,7 +497,7 @@ class OracleMemoryProvider(MemoryProvider):
                 if vec is None or len(vec) != _EMBED_DIM:
                     out.append(None)
                 else:
-                    out.append(array.array("d", vec))
+                    out.append(array.array("f", vec))
             if len(out) != len(texts):
                 out.extend([None] * (len(texts) - len(out)))
             with self._embed_lock:
@@ -583,7 +584,7 @@ class OracleMemoryProvider(MemoryProvider):
                     vec = item.get("embedding") or []
                     if 0 <= resp_idx < len(valid_indices) and len(vec) == _EMBED_DIM:
                         orig_idx = valid_indices[resp_idx]
-                        out[orig_idx] = array.array("d", vec)
+                        out[orig_idx] = array.array("f", vec)
         except Exception as e:
             logger.warning("OpenRouter embed failed: %s", e)
         return out
@@ -744,7 +745,7 @@ class OracleMemoryProvider(MemoryProvider):
                     e,
                 )
                 if vec is None:
-                    vec = self._embed_many([content])[0]
+                    vec = self._embed_openrouter([content])[0] or self._embed_many([content])[0]
 
         sql = f"""
             INSERT INTO {self._table}
@@ -945,7 +946,7 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 SELECT memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
+                       VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}
@@ -998,7 +999,7 @@ class OracleMemoryProvider(MemoryProvider):
                 FROM (
                     SELECT memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, :v, COSINE) AS distance
+                           VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}
@@ -1045,7 +1046,7 @@ class OracleMemoryProvider(MemoryProvider):
                     e,
                 )
                 if vec is None:
-                    vec = self._embed_many([query])[0]
+                    vec = self._embed_openrouter([query])[0] or self._embed_many([query])[0]
                 if vec is not None:
                     try:
                         fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=False)
@@ -1128,7 +1129,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 e,
                             )
                             if vec is None:
-                                vec = self._embed_many([query])[0]
+                                vec = self._embed_openrouter([query])[0] or self._embed_many([query])[0]
                             if vec is not None:
                                 try:
                                     sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
@@ -1439,7 +1440,7 @@ class OracleMemoryProvider(MemoryProvider):
                                     e,
                                 )
                                 if vec is None:
-                                    vec = self._embed_many([content])[0]
+                                    vec = self._embed_openrouter([content])[0] or self._embed_many([content])[0]
                                 sql = f"""
                                     UPDATE {self._table}
                                     SET content = :1, embedding = :2, content_txt = :3
