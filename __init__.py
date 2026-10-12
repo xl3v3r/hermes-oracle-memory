@@ -1124,10 +1124,10 @@ class OracleMemoryProvider(MemoryProvider):
 
         t = threading.Thread(target=_sync, daemon=True, name="oracle-sync")
         with self._lock:
-            prev = self._sync_thread
+            # ⚡ Bolt: Fire and forget. We no longer join the previous thread
+            # (which blocked the main thread up to 2 seconds if DB was slow).
+            # Concurrent inserts are safe because _insert uses a thread-safe connection pool.
             self._sync_thread = t
-        if prev and prev.is_alive():
-            prev.join(timeout=2.0)
         t.start()
 
     def on_memory_write(
