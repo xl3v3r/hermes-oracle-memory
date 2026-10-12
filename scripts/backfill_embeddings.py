@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger("backfill_embeddings")
 
 _DEFAULT_MODEL = "qwen/qwen3-embedding-4b"
-_DEFAULT_DIM = 1536
+_DEFAULT_DIM = 768
 _DEFAULT_BATCH_SIZE = 64
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 
@@ -160,6 +160,8 @@ def run_backfill(
     dry_run: bool,
     checkpoint_file: Path,
     rebuild_index: bool,
+    dimensions: int = _DEFAULT_DIM,
+    onnx_model: str | None = None,
 ) -> int:
     """Execute the backfill process."""
     load_env()
@@ -233,7 +235,7 @@ def run_backfill(
         logger.info("[DRY-RUN] Simulating embedding for %d sample items...", len(sample))
         if sample:
             sample_texts = [c for _, c in sample]
-            vecs = embed_batch_openrouter(sample_texts, api_key)
+            vecs = embed_batch_openrouter(sample_texts, api_key, dimensions=dimensions)
             for (mid, _), vec in zip(sample, vecs):
                 logger.info("[DRY-RUN] memory_id=%s embedded successfully: dim=%d", mid, len(vec) if vec else 0)
         logger.info("[DRY-RUN] Finished simulation. No database updates made.")
@@ -248,8 +250,42 @@ def run_backfill(
         ids = [mid for mid, _ in batch]
         texts = [content for _, content in batch]
 
+        # Option B: Attempt in-database ONNX embedding if configured
+        if onnx_model:
+            try:
+                t0 = time.time()
+                with conn.cursor() as update_cur:
+                    sql = f"UPDATE {clean_table} SET embedding = VECTOR_EMBEDDING({onnx_model} USING :1 AS DATA) WHERE memory_id = :2"  # nosec B608
+                    binds = [(txt[:4000], mid) for mid, txt in zip(ids, texts)]
+                    update_cur.executemany(sql, binds)
+                conn.commit()
+                t_embed = time.time() - t0
+                for mid in ids:
+                    completed_ids.add(mid)
+                processed_count += len(batch)
+                elapsed = time.time() - t_start
+                rate = processed_count / elapsed if elapsed > 0 else 0
+                if (i // batch_size) % 5 == 0 or processed_count == len(rows_to_process):
+                    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(checkpoint_file, "w", encoding="utf-8") as f:
+                        json.dump(list(completed_ids), f)
+                logger.info(
+                    "Batch %d/%d (%d rows) done via ONNX in %.2fs (overall: %d/%d, %.1f rows/sec)",
+                    (i // batch_size) + 1,
+                    (len(rows_to_process) + batch_size - 1) // batch_size,
+                    len(batch),
+                    t_embed,
+                    processed_count,
+                    len(rows_to_process),
+                    rate,
+                )
+                continue
+            except Exception as e:
+                logger.warning("In-database ONNX backfill failed (%s); falling back to OpenRouter 768-d", e)
+
+        # Option C: Fallback to OpenRouter 768-d
         t0 = time.time()
-        vecs = embed_batch_openrouter(texts, api_key)
+        vecs = embed_batch_openrouter(texts, api_key, dimensions=dimensions)
         t_embed = time.time() - t0
 
         binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
@@ -354,8 +390,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--checkpoint",
-        default="backfills/backfill_progress.json",
-        help="Path to progress checkpoint file",
+        default="backfills/backfill_progress_768.json",
+        help="Path to progress checkpoint file (default: backfills/backfill_progress_768.json)",
+    )
+    parser.add_argument(
+        "--dimensions",
+        type=int,
+        default=_DEFAULT_DIM,
+        help="Embedding dimensions (default: 768)",
+    )
+    parser.add_argument(
+        "--onnx-model",
+        default=os.environ.get("HERMES_ORACLE_ONNX_MODEL"),
+        help="Optional in-database ONNX model name (e.g., DOC_MODEL)",
     )
     parser.add_argument(
         "--rebuild-index",
@@ -373,6 +420,8 @@ def main() -> None:
         dry_run=args.dry_run,
         checkpoint_file=checkpoint_path,
         rebuild_index=args.rebuild_index,
+        dimensions=args.dimensions,
+        onnx_model=args.onnx_model,
     )
 
 

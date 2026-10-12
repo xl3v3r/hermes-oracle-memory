@@ -2,9 +2,9 @@
 
 VECTOR IVF + Oracle Text + JSON search as the primary Hermes memory backend.
 Credentials: OCI_DB_USER / OCI_DB_PASSWORD / OCI_DB_DSN in $HERMES_HOME/.env.
-Embeddings: OpenRouter qwen/qwen3-embedding-4b (1536-d FLOAT64) by default.
-OCI GenAI cohere.embed-v4.0 (1536-d) is tried first via instance principal; on
-404/auth failure this process falls back to OpenRouter and does not retry OCI.
+Embeddings: Option B (768-d in-database ONNX model) as primary, with Option C
+(OpenRouter qwen/qwen3-embedding-4b at 768-d FLOAT64) as automatic graceful fallback.
+OCI GenAI cohere.embed-v4.0 is tried first if configured; on failure it falls back.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 _PREFETCH_WAIT_SECS = 0.5
-_EMBED_DIM = 1536
+_EMBED_DIM = 768
 _EMBED_MODEL = "qwen/qwen3-embedding-4b"
 _OCI_EMBED_MODEL = "cohere.embed-v4.0"
 _EMBED_CACHE_MAX = 256
@@ -598,9 +598,39 @@ class OracleMemoryProvider(MemoryProvider):
         if not miss_idx:
             return cached
         miss_texts = [texts[i] for i in miss_idx]
-        got = self._embed_oci(miss_texts)
+        got: list[array.array | None] | None = None
+
+        # Option B: Primary in-database ONNX model embedding
+        if self._onnx_model and self._pool:
+            try:
+                db_vecs: list[array.array | None] = []
+                with self._pool.acquire() as conn, conn.cursor() as cur:
+                    for t in miss_texts:
+                        cur.execute(
+                            f"SELECT VECTOR_EMBEDDING({self._onnx_model} USING :1 AS DATA) FROM DUAL",
+                            [t[:4000]],
+                        )
+                        row = cur.fetchone()
+                        vec = row[0] if row else None
+                        if vec is not None and len(vec) == _EMBED_DIM:
+                            db_vecs.append(vec)
+                        else:
+                            db_vecs.append(None)
+                if any(v is not None for v in db_vecs):
+                    got = db_vecs
+            except Exception as e:
+                logger.warning(
+                    "In-database ONNX embed_many failed (%s); falling back to OpenRouter",
+                    e,
+                )
+                got = None
+
+        # Option C: Fallback to OCI GenAI or OpenRouter
+        if got is None:
+            got = self._embed_oci(miss_texts)
         if got is None:
             got = self._embed_openrouter(miss_texts)
+
         for i, vec in zip(miss_idx, got):
             cached[i] = vec
             if vec is not None:
@@ -608,8 +638,6 @@ class OracleMemoryProvider(MemoryProvider):
         return cached
 
     def _embed(self, text: str) -> array.array | None:
-        if self._onnx_model:
-            return None
         if not text:
             return None
         return self._embed_many([text])[0]
@@ -705,30 +733,42 @@ class OracleMemoryProvider(MemoryProvider):
                 meta,
                 txt,
             )
-        else:
-            sql = f"""
-                INSERT INTO {self._table}
-                    (memory_id, session_id, agent_id, role, content, embedding,
-                     created_at, target, metadata, content_txt)
-                VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
-            """
-            binds = (
-                memory_id,
-                session_id or self._session_id or "none",
-                self._agent_id,
-                role,
-                content,
-                vec,
-                target,
-                meta,
-                txt,
-            )
+            try:
+                with self._pool.acquire() as conn, conn.cursor() as cur:
+                    cur.execute(sql, binds)
+                    conn.commit()
+                return
+            except Exception as e:
+                logger.warning(
+                    "In-database ONNX insert failed (%s); falling back to OpenRouter embedding",
+                    e,
+                )
+                if vec is None:
+                    vec = self._embed_many([content])[0]
+
+        sql = f"""
+            INSERT INTO {self._table}
+                (memory_id, session_id, agent_id, role, content, embedding,
+                 created_at, target, metadata, content_txt)
+            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
+        """
+        binds = (
+            memory_id,
+            session_id or self._session_id or "none",
+            self._agent_id,
+            role,
+            content,
+            vec,
+            target,
+            meta,
+            txt,
+        )
 
         with self._pool.acquire() as conn, conn.cursor() as cur:
             cur.execute(sql, binds)
             conn.commit()
 
-        if vec is None and not self._onnx_model:
+        if vec is None:
             self._queue_embed_backfill(memory_id, content)
 
     def _insert_many(
@@ -741,51 +781,6 @@ class OracleMemoryProvider(MemoryProvider):
         if not rows:
             return
 
-        binds_list = []
-        backfill_queue = []
-        for row in rows:
-            memory_id = row.get("memory_id")
-            session_id = row.get("session_id") or self._session_id or "none"
-            role = row.get("role")
-            content = row.get("content")
-            target = row.get("target")
-            metadata = row.get("metadata")
-            embedding = row.get("embedding")
-
-            vec = embedding if embedding is not None else None
-            meta = json.dumps(metadata or {})
-            txt = (content or "")[:4000]
-
-            if self._onnx_model:
-                binds = (
-                    memory_id,
-                    session_id,
-                    self._agent_id,
-                    role,
-                    content,
-                    txt,
-                    target,
-                    meta,
-                    txt,
-                )
-            else:
-                binds = (
-                    memory_id,
-                    session_id,
-                    self._agent_id,
-                    role,
-                    content,
-                    vec,
-                    target,
-                    meta,
-                    txt,
-                )
-
-            binds_list.append(binds)
-
-            if vec is None and not self._onnx_model:
-                backfill_queue.append((memory_id, content))
-
         if self._onnx_model:
             sql = f"""
                 INSERT INTO {self._table}
@@ -793,13 +788,82 @@ class OracleMemoryProvider(MemoryProvider):
                      created_at, target, metadata, content_txt)
                 VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9)
             """
-        else:
-            sql = f"""
-                INSERT INTO {self._table}
-                    (memory_id, session_id, agent_id, role, content, embedding,
-                     created_at, target, metadata, content_txt)
-                VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
-            """
+            binds_list = []
+            for row in rows:
+                memory_id = row.get("memory_id")
+                session_id = row.get("session_id") or self._session_id or "none"
+                role = row.get("role")
+                content = row.get("content")
+                target = row.get("target")
+                metadata = row.get("metadata")
+                meta = json.dumps(metadata or {})
+                txt = (content or "")[:4000]
+                binds = (
+                    memory_id,
+                    session_id,
+                    self._agent_id,
+                    role,
+                    content,
+                    txt,
+                    target,
+                    meta,
+                    txt,
+                )
+                binds_list.append(binds)
+            try:
+                with self._pool.acquire() as conn, conn.cursor() as cur:
+                    cur.executemany(sql, binds_list)
+                    conn.commit()
+                return
+            except Exception as e:
+                logger.warning(
+                    "In-database ONNX insert_many failed (%s); falling back to OpenRouter embedding",
+                    e,
+                )
+
+        binds_list = []
+        backfill_queue = []
+        contents = [(r.get("content") or "") for r in rows]
+        needed_indices = [i for i, r in enumerate(rows) if r.get("embedding") is None]
+        needed_texts = [contents[i] for i in needed_indices]
+        fetched_vecs = self._embed_many(needed_texts) if needed_texts else []
+        vec_map = {idx: fetched_vecs[j] for j, idx in enumerate(needed_indices)}
+
+        for i, row in enumerate(rows):
+            memory_id = row.get("memory_id")
+            session_id = row.get("session_id") or self._session_id or "none"
+            role = row.get("role")
+            content = row.get("content")
+            target = row.get("target")
+            metadata = row.get("metadata")
+            embedding = row.get("embedding") if row.get("embedding") is not None else vec_map.get(i)
+
+            vec = embedding if embedding is not None else None
+            meta = json.dumps(metadata or {})
+            txt = (content or "")[:4000]
+
+            binds = (
+                memory_id,
+                session_id,
+                self._agent_id,
+                role,
+                content,
+                vec,
+                target,
+                meta,
+                txt,
+            )
+            binds_list.append(binds)
+
+            if vec is None:
+                backfill_queue.append((memory_id, content))
+
+        sql = f"""
+            INSERT INTO {self._table}
+                (memory_id, session_id, agent_id, role, content, embedding,
+                 created_at, target, metadata, content_txt)
+            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
+        """
 
         with self._pool.acquire() as conn, conn.cursor() as cur:
             cur.executemany(sql, binds_list)
@@ -864,8 +928,8 @@ class OracleMemoryProvider(MemoryProvider):
             binds["tgt"] = tgt
         return sql, binds
 
-    def _build_vector_search_sql(self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
-        if self._onnx_model:
+    def _build_vector_search_sql(self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True) -> Tuple[str, dict]:
+        if use_onnx and self._onnx_model:
             sql = f"""
                 SELECT memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
@@ -894,8 +958,8 @@ class OracleMemoryProvider(MemoryProvider):
             binds["tgt"] = tgt
         return sql, binds
 
-    def _build_hybrid_search_sql(self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
-        if self._onnx_model:
+    def _build_hybrid_search_sql(self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True) -> Tuple[str, dict]:
+        if use_onnx and self._onnx_model:
             fused_sql = f"""
                 SELECT memory_id, session_id, agent_id, role, content, target,
                        txt_score, distance
@@ -962,9 +1026,10 @@ class OracleMemoryProvider(MemoryProvider):
     def _execute_hybrid_search(
         self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str
     ) -> list:
-        fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt)
         merged: dict = {}
+        use_onnx = bool(self._onnx_model)
         try:
+            fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx)
             for r in self._fetch_rows(cur, fused_sql, fused_binds):
                 prev = merged.get(r["memory_id"])
                 if prev:
@@ -974,12 +1039,45 @@ class OracleMemoryProvider(MemoryProvider):
                 else:
                     merged[r["memory_id"]] = r
         except Exception as e:
-            logger.debug(
-                "fused hybrid failed (%s); falling back to vector-only", e
-            )
-            v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt)
-            for r in self._fetch_rows(cur, v_sql, v_binds):
-                merged[r["memory_id"]] = r
+            if use_onnx:
+                logger.warning(
+                    "In-database ONNX hybrid search failed (%s); falling back to OpenRouter 768-d embedding",
+                    e,
+                )
+                if vec is None:
+                    vec = self._embed_many([query])[0]
+                if vec is not None:
+                    try:
+                        fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=False)
+                        for r in self._fetch_rows(cur, fused_sql, fused_binds):
+                            prev = merged.get(r["memory_id"])
+                            if prev:
+                                prev["score"] = round(
+                                    min(1.0, prev["score"] + r["score"] * 0.3), 4
+                                )
+                            else:
+                                merged[r["memory_id"]] = r
+                    except Exception as e2:
+                        logger.debug("Fallback hybrid failed (%s); falling back to vector-only", e2)
+                        v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                        for r in self._fetch_rows(cur, v_sql, v_binds):
+                            merged[r["memory_id"]] = r
+                else:
+                    t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                    for r in self._fetch_rows(cur, t_sql, t_binds):
+                        merged[r["memory_id"]] = r
+            else:
+                logger.debug(
+                    "fused hybrid failed (%s); falling back to vector-only", e
+                )
+                if vec is not None:
+                    v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                    for r in self._fetch_rows(cur, v_sql, v_binds):
+                        merged[r["memory_id"]] = r
+                else:
+                    t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                    for r in self._fetch_rows(cur, t_sql, t_binds):
+                        merged[r["memory_id"]] = r
         ranked = sorted(
             merged.values(), key=lambda x: x["score"], reverse=True
         )
@@ -996,11 +1094,7 @@ class OracleMemoryProvider(MemoryProvider):
         tgt_sql = "" if tgt in ("", "any") else " AND target = :tgt "
         contains_q = self._contains_query(query)
         vec = None if mode == "text" else self._embed(query)
-        # In ONNX mode, we always have a vector implicitly.
-        if self._onnx_model and mode != "text":
-            # We don't check `vec is None` because we embed in DB
-            pass
-        elif mode != "text" and vec is None:
+        if not self._onnx_model and mode != "text" and vec is None:
             mode = "text"
 
         fetch_k = top_k * 2 if mode == "hybrid" else top_k
@@ -1010,8 +1104,32 @@ class OracleMemoryProvider(MemoryProvider):
                     sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                     rows = self._fetch_rows(cur, sql, binds)
                 elif mode == "vector":
-                    sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt)
-                    rows = self._fetch_rows(cur, sql, binds)
+                    rows = []
+                    use_onnx = bool(self._onnx_model)
+                    if use_onnx:
+                        try:
+                            sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=True)
+                            rows = self._fetch_rows(cur, sql, binds)
+                        except Exception as e:
+                            logger.warning(
+                                "In-database ONNX vector search failed (%s); falling back to OpenRouter 768-d embedding",
+                                e,
+                            )
+                            if vec is None:
+                                vec = self._embed_many([query])[0]
+                            if vec is not None:
+                                sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                                rows = self._fetch_rows(cur, sql, binds)
+                            else:
+                                sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                                rows = self._fetch_rows(cur, sql, binds)
+                    else:
+                        if vec is not None:
+                            sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                            rows = self._fetch_rows(cur, sql, binds)
+                        else:
+                            sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                            rows = self._fetch_rows(cur, sql, binds)
                 else:
                     rows = self._execute_hybrid_search(cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt)
         return rows[:top_k]
@@ -1277,15 +1395,32 @@ class OracleMemoryProvider(MemoryProvider):
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
                         if self._onnx_model:
-                            sql = f"""
-                                UPDATE {self._table}
-                                SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3
-                                WHERE memory_id = :4
-                                """  # nosec B608
-                            cur.execute(
-                                sql,
-                                (content, txt, txt, mid),
-                            )
+                            try:
+                                sql = f"""
+                                    UPDATE {self._table}
+                                    SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3
+                                    WHERE memory_id = :4
+                                    """  # nosec B608
+                                cur.execute(
+                                    sql,
+                                    (content, txt, txt, mid),
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "In-database ONNX update failed (%s); falling back to OpenRouter embedding",
+                                    e,
+                                )
+                                if vec is None:
+                                    vec = self._embed_many([content])[0]
+                                sql = f"""
+                                    UPDATE {self._table}
+                                    SET content = :1, embedding = :2, content_txt = :3
+                                    WHERE memory_id = :4
+                                    """  # nosec B608
+                                cur.execute(
+                                    sql,
+                                    (content, vec, txt, mid),
+                                )
                         else:
                             sql = f"""
                                 UPDATE {self._table}
@@ -1300,7 +1435,7 @@ class OracleMemoryProvider(MemoryProvider):
                     conn.commit()
                 if not n:
                     return tool_error(f"Memory not found: {mid}")
-                if vec is None and not self._onnx_model:
+                if vec is None:
                     self._queue_embed_backfill(mid, content)
                 return json.dumps({"result": "updated", "memory_id": mid})
             if tool_name == "oracle_delete":

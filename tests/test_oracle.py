@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -129,7 +130,7 @@ class TestOraclePlugin(unittest.TestCase):
 
     def test_embed_openrouter_model_and_dimensions(self):
         self.assertEqual(oracle_plugin._EMBED_MODEL, "qwen/qwen3-embedding-4b")
-        self.assertEqual(oracle_plugin._EMBED_DIM, 1536)
+        self.assertEqual(oracle_plugin._EMBED_DIM, 768)
 
         provider = oracle_plugin.OracleMemoryProvider()
         captured_req = {}
@@ -142,11 +143,10 @@ class TestOraclePlugin(unittest.TestCase):
             def read(self):
                 import json
                 return json.dumps({
-                    "data": [{"index": 0, "embedding": [0.1] * 1536}]
+                    "data": [{"index": 0, "embedding": [0.1] * 768}]
                 }).encode("utf-8")
 
         def fake_urlopen(req, timeout=20):
-            import json
             captured_req["url"] = req.full_url
             captured_req["data"] = json.loads(req.data.decode("utf-8"))
             captured_req["headers"] = dict(req.headers)
@@ -157,9 +157,9 @@ class TestOraclePlugin(unittest.TestCase):
             res = provider._embed_openrouter(["sample text to embed"])
             self.assertEqual(len(res), 1)
             self.assertIsNotNone(res[0])
-            self.assertEqual(len(res[0]), 1536)
+            self.assertEqual(len(res[0]), 768)
             self.assertEqual(captured_req["data"]["model"], "qwen/qwen3-embedding-4b")
-            self.assertEqual(captured_req["data"]["dimensions"], 1536)
+            self.assertEqual(captured_req["data"]["dimensions"], 768)
             self.assertEqual(captured_req["data"]["input"], ["sample text to embed"])
 
     def test_embed_openrouter_empty_none_and_whitespace(self):
@@ -175,13 +175,12 @@ class TestOraclePlugin(unittest.TestCase):
                 import json
                 return json.dumps({
                     "data": [
-                        {"index": 0, "embedding": [0.1] * 1536},
-                        {"index": 1, "embedding": [0.2] * 1536},
+                        {"index": 0, "embedding": [0.1] * 768},
+                        {"index": 1, "embedding": [0.2] * 768},
                     ]
                 }).encode("utf-8")
 
         def fake_urlopen(req, timeout=20):
-            import json
             captured_req["data"] = json.loads(req.data.decode("utf-8"))
             return DummyResponse()
 
@@ -191,12 +190,12 @@ class TestOraclePlugin(unittest.TestCase):
             res = provider._embed_openrouter(inputs)
             self.assertEqual(len(res), 5)
             self.assertIsNotNone(res[0])
-            self.assertEqual(len(res[0]), 1536)
+            self.assertEqual(len(res[0]), 768)
             self.assertIsNone(res[1])
             self.assertIsNone(res[2])
             self.assertIsNone(res[3])
             self.assertIsNotNone(res[4])
-            self.assertEqual(len(res[4]), 1536)
+            self.assertEqual(len(res[4]), 768)
             # Only valid, non-empty items sent to OpenRouter
             self.assertEqual(captured_req["data"]["input"], ["valid one", "valid two"])
 
@@ -221,7 +220,7 @@ class TestOraclePlugin(unittest.TestCase):
                 return json.dumps({
                     "data": [
                         {"index": 0, "embedding": [0.1] * 512},  # wrong dim
-                        {"index": 1, "embedding": [0.2] * 1536}, # correct dim
+                        {"index": 1, "embedding": [0.2] * 768}, # correct dim
                     ]
                 }).encode("utf-8")
 
@@ -229,9 +228,9 @@ class TestOraclePlugin(unittest.TestCase):
              patch("urllib.request.urlopen", return_value=DummyResponse()):
             res = provider._embed_openrouter(["doc1", "doc2"])
             self.assertEqual(len(res), 2)
-            self.assertIsNone(res[0])  # Discarded due to 512 != 1536
+            self.assertIsNone(res[0])  # Discarded due to 512 != 768
             self.assertIsNotNone(res[1])
-            self.assertEqual(len(res[1]), 1536)
+            self.assertEqual(len(res[1]), 768)
 
     def test_embed_openrouter_retry_on_transient_error(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -245,7 +244,7 @@ class TestOraclePlugin(unittest.TestCase):
             def read(self):
                 import json
                 return json.dumps({
-                    "data": [{"index": 0, "embedding": [0.3] * 1536}]
+                    "data": [{"index": 0, "embedding": [0.3] * 768}]
                 }).encode("utf-8")
 
         call_count = [0]
@@ -263,7 +262,105 @@ class TestOraclePlugin(unittest.TestCase):
             res = provider._embed_openrouter(["retry text"])
             self.assertEqual(call_count[0], 2)
             self.assertIsNotNone(res[0])
-            self.assertEqual(len(res[0]), 1536)
+            self.assertEqual(len(res[0]), 768)
+
+    def test_onnx_search_fallback_to_openrouter(self):
+        import array
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        # Mock query failure on in-database ONNX call
+        fake_fallback_vec = array.array("d", [0.1] * 768)
+        provider._embed_many = MagicMock(return_value=[fake_fallback_vec])
+
+        # Cur.fetchall raises error on ONNX query, then succeeds on fallback
+        call_count = [0]
+        def side_effect_fetch(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise Exception("ORA-29532: Java or ONNX call failed")
+            return [("m1", "s1", "hermes", "user", "Memory text", "memory", 0.0, 0.2)]
+
+        mock_cur.fetchall.side_effect = side_effect_fetch
+
+        results = provider._search("database query", mode="vector")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["memory_id"], "m1")
+        provider._embed_many.assert_called_with(["database query"])
+
+    def test_onnx_insert_fallback_to_openrouter(self):
+        import array
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        fake_fallback_vec = array.array("d", [0.2] * 768)
+        provider._embed_many = MagicMock(return_value=[fake_fallback_vec])
+
+        # First cur.execute fails on ONNX INSERT, second succeeds
+        call_count = [0]
+        def side_effect_execute(sql, binds):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise Exception("ORA-40284: model does not exist")
+            return None
+
+        mock_cur.execute.side_effect = side_effect_execute
+
+        provider._insert(
+            memory_id="test_id",
+            session_id="s1",
+            role="user",
+            content="test content",
+            target="memory",
+        )
+        self.assertEqual(call_count[0], 2)
+        provider._embed_many.assert_called_with(["test content"])
+
+    def test_onnx_update_fallback_to_openrouter(self):
+        import array
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = 1
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        fake_fallback_vec = array.array("d", [0.3] * 768)
+        provider._embed_many = MagicMock(return_value=[fake_fallback_vec])
+
+        call_count = [0]
+        def side_effect_execute(sql, binds):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise Exception("ORA-40284: model does not exist")
+            return None
+
+        mock_cur.execute.side_effect = side_effect_execute
+
+        res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated content"})
+        self.assertIn('"result": "updated"', res)
+        self.assertEqual(call_count[0], 2)
 
 
 if __name__ == "__main__":

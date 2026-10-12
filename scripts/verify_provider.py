@@ -77,7 +77,7 @@ def main() -> None:
     print(f"Configured model: {_EMBED_MODEL}")
     print(f"Configured dimensions: {_EMBED_DIM}")
     assert _EMBED_MODEL == "qwen/qwen3-embedding-4b", f"Unexpected model: {_EMBED_MODEL}"
-    assert _EMBED_DIM == 1536, f"Unexpected dim: {_EMBED_DIM}"
+    assert _EMBED_DIM == 768, f"Unexpected dim: {_EMBED_DIM}"
 
     provider = OracleMemoryProvider()
     print("Provider initialized instance")
@@ -91,22 +91,24 @@ def main() -> None:
             print(f"Init error: {provider._init_error}")
         sys.exit(1)
 
+    print(f"Configured ONNX model: {provider._onnx_model or 'None (using OpenRouter 768-d fallback)'}")
+
     # 1. Verify single embedding generation
-    print("Testing _embed with OpenRouter...")
+    print("Testing _embed (Option B in-database ONNX or Option C OpenRouter fallback)...")
     vec = provider._embed("Oracle 26ai Autonomous Database vector search verification")
     assert vec is not None, "Failed to get vector embedding"
-    assert len(vec) == 1536, f"Expected 1536 dimensions, got {len(vec)}"
+    assert len(vec) == 768, f"Expected 768 dimensions, got {len(vec)}"
     print(f"Vector embedding verified: dim={len(vec)}, type={vec.typecode}")
 
     # 2. Verify batch embedding with edge cases (empty strings, whitespace, None)
     print("Testing _embed_openrouter with edge cases...")
     edge_vecs = provider._embed_openrouter(["valid query", "", "   ", None, "another query"])
     assert len(edge_vecs) == 5, f"Expected 5 results, got {len(edge_vecs)}"
-    assert edge_vecs[0] is not None and len(edge_vecs[0]) == 1536, "Failed valid query 1"
+    assert edge_vecs[0] is not None and len(edge_vecs[0]) == 768, "Failed valid query 1"
     assert edge_vecs[1] is None, "Empty string should yield None"
     assert edge_vecs[2] is None, "Whitespace string should yield None"
     assert edge_vecs[3] is None, "None should yield None"
-    assert edge_vecs[4] is not None and len(edge_vecs[4]) == 1536, "Failed valid query 2"
+    assert edge_vecs[4] is not None and len(edge_vecs[4]) == 768, "Failed valid query 2"
     print("Batch edge cases handled successfully.")
 
     # 3. Verify vector search
