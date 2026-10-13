@@ -232,6 +232,56 @@ class TestOraclePlugin(unittest.TestCase):
             self.assertIsNotNone(res[1])
             self.assertEqual(len(res[1]), 768)
 
+    def test_embed_many_deduplicates_embedding_misses(self):
+        import array
+
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = ""
+        first = array.array("f", [0.1] * 768)
+        second = array.array("f", [0.2] * 768)
+        provider._embed_oci = MagicMock(return_value=None)
+        provider._embed_openrouter = MagicMock(return_value=[first, second])
+
+        result = provider._embed_many(["duplicate", "duplicate", "unique"])
+
+        self.assertEqual(result, [first, first, second])
+        provider._embed_openrouter.assert_called_once_with(["duplicate", "unique"])
+
+    def test_embed_many_cools_down_after_onnx_failure(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        provider._pool.acquire.side_effect = Exception("model unavailable")
+        provider._embed_oci = MagicMock(return_value=None)
+        provider._embed_openrouter = MagicMock(return_value=[None])
+
+        provider._embed_many(["first"])
+        provider._embed_many(["second"])
+
+        self.assertEqual(provider._pool.acquire.call_count, 1)
+        self.assertEqual(provider._embed_openrouter.call_count, 2)
+
+    def test_sync_turn_queues_without_waiting_for_previous_write(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        with patch.object(provider, "_queue_background_insert") as queue:
+            provider.sync_turn("user message", "assistant reply", session_id="s1")
+
+        queue.assert_called_once()
+        self.assertEqual(queue.call_args.kwargs["session_id"], "s1")
+
+    def test_session_end_queues_background_write(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        messages = [
+            {"role": "user", "content": "A durable session detail worth retaining."},
+        ]
+        with patch.object(provider, "_queue_background_insert") as queue:
+            provider.on_session_end(messages)
+
+        queue.assert_called_once()
+        self.assertEqual(queue.call_args.kwargs["role"], "session")
+
     def test_embed_openrouter_retry_on_transient_error(self):
         provider = oracle_plugin.OracleMemoryProvider()
         import urllib.error
@@ -365,5 +415,3 @@ class TestOraclePlugin(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

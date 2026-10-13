@@ -33,6 +33,7 @@ _OCI_EMBED_MODEL = "cohere.embed-v4.0"
 _EMBED_CACHE_MAX = 256
 _EMBED_BATCH = 32
 _OCI_RETRY_AFTER_SECS = 300.0
+_ONNX_RETRY_AFTER_SECS = 300.0
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"^\s*(?:"
     r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
@@ -210,14 +211,17 @@ class OracleMemoryProvider(MemoryProvider):
         self._prefetch_done = False
         self._prefetch_count = 0
         self._prefetch_thread: threading.Thread | None = None
-        self._sync_thread: threading.Thread | None = None
         self._embed_lock = threading.Lock()
         self._embed_cache: OrderedDict[str, array.array] = OrderedDict()
         self._embed_cache_lock = threading.Lock()
         self._embed_pending: deque[tuple[str, str]] = deque()
         self._embed_worker: threading.Thread | None = None
         self._oci_embed_failed_at: float | None = None
+        self._oci_client: Any | None = None
+        self._oci_signer: Any | None = None
+        self._onnx_failed_at: float | None = None
         self._lock = threading.Lock()
+        self._sync_threads: set[threading.Thread] = set()
         self._init_error = ""
         self._agent_context = "primary"
 
@@ -467,16 +471,26 @@ class OracleMemoryProvider(MemoryProvider):
                 self._oci_embed_failed_at = now
             return None
         try:
-            signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+            with self._embed_lock:
+                signer = self._oci_signer
+                client = self._oci_client
+                if signer is None:
+                    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+                    self._oci_signer = signer
             region = (
                 os.environ.get("OCI_GENAI_REGION")
                 or getattr(signer, "region", None)
                 or "us-ashburn-1"
             )
             endpoint = f"https://inference.generativeai.{region}.oci.oraclecloud.com"
-            client = oci.generative_ai_inference.GenerativeAiInferenceClient(
-                config={}, signer=signer, service_endpoint=endpoint
-            )
+            if client is None:
+                with self._embed_lock:
+                    client = self._oci_client
+                    if client is None:
+                        client = oci.generative_ai_inference.GenerativeAiInferenceClient(
+                            config={}, signer=signer, service_endpoint=endpoint
+                        )
+                        self._oci_client = client
             details = oci.generative_ai_inference.models.EmbedTextDetails(
                 inputs=[t[:8000] for t in texts],
                 serving_mode=oci.generative_ai_inference.models.OnDemandServingMode(
@@ -598,11 +612,27 @@ class OracleMemoryProvider(MemoryProvider):
         miss_idx = [i for i, (t, v) in enumerate(zip(texts, cached)) if t and v is None]
         if not miss_idx:
             return cached
-        miss_texts = [texts[i] for i in miss_idx]
+        unique_miss_texts: list[str] = []
+        unique_indices: dict[str, list[int]] = {}
+        for i in miss_idx:
+            text = texts[i]
+            if text not in unique_indices:
+                unique_indices[text] = []
+                unique_miss_texts.append(text)
+            unique_indices[text].append(i)
+        miss_texts = unique_miss_texts
         got: list[array.array | None] | None = None
 
         # Option B: Primary in-database ONNX model embedding
-        if self._onnx_model and self._pool:
+        onnx_enabled = bool(
+            self._onnx_model
+            and self._pool
+            and (
+                self._onnx_failed_at is None
+                or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
+            )
+        )
+        if onnx_enabled:
             try:
                 db_vecs: list[array.array | None] = []
                 with self._pool.acquire() as conn, conn.cursor() as cur:
@@ -619,11 +649,13 @@ class OracleMemoryProvider(MemoryProvider):
                             db_vecs.append(None)
                 if any(v is not None for v in db_vecs):
                     got = db_vecs
+                self._onnx_failed_at = None
             except Exception as e:
                 logger.warning(
                     "In-database ONNX embed_many failed (%s); falling back to OpenRouter",
                     e,
                 )
+                self._onnx_failed_at = time.monotonic()
                 got = None
 
         # Option C: Fallback to OCI GenAI or OpenRouter
@@ -632,10 +664,11 @@ class OracleMemoryProvider(MemoryProvider):
         if got is None:
             got = self._embed_openrouter(miss_texts)
 
-        for i, vec in zip(miss_idx, got):
-            cached[i] = vec
+        for text, vec in zip(miss_texts, got):
             if vec is not None:
-                self._cache_put(texts[i], vec)
+                self._cache_put(text, vec)
+            for i in unique_indices[text]:
+                cached[i] = vec
         return cached
 
     def _embed(self, text: str) -> array.array | None:
@@ -665,6 +698,37 @@ class OracleMemoryProvider(MemoryProvider):
             with self._embed_lock:
                 self._embed_worker = t
             t.start()
+
+    def _queue_background_insert(
+        self,
+        *,
+        memory_id: str,
+        session_id: str,
+        role: str,
+        content: str,
+        target: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        def run() -> None:
+            try:
+                self._insert(
+                    memory_id=memory_id,
+                    session_id=session_id,
+                    role=role,
+                    content=content,
+                    target=target,
+                    metadata=metadata,
+                )
+            except Exception as e:
+                logger.warning("oracle background insert failed: %s", e)
+            finally:
+                with self._lock:
+                    self._sync_threads.discard(thread)
+
+        thread = threading.Thread(target=run, daemon=True, name="oracle-sync")
+        with self._lock:
+            self._sync_threads.add(thread)
+        thread.start()
 
     def _embed_worker_loop(self) -> None:
         while True:
@@ -1296,28 +1360,15 @@ class OracleMemoryProvider(MemoryProvider):
         if not isinstance(user_content, str) or _is_internal_gateway_turn(user_content) or is_trivial_prompt(user_content):
             return
         sid = session_id or self._session_id
-
-        def _sync():
-            try:
-                blob = f"USER: {user_content[:1500]}\nASSISTANT: {(assistant_content or '')[:1500]}"
-                self._insert(
-                    memory_id=f"turn_{uuid.uuid4().hex[:16]}",
-                    session_id=sid,
-                    role="turn",
-                    content=blob,
-                    target="memory",
-                    metadata={"kind": "turn"},
-                )
-            except Exception as e:
-                logger.warning("oracle sync_turn failed: %s", e)
-
-        t = threading.Thread(target=_sync, daemon=True, name="oracle-sync")
-        with self._lock:
-            prev = self._sync_thread
-            self._sync_thread = t
-        if prev and prev.is_alive():
-            prev.join(timeout=2.0)
-        t.start()
+        blob = f"USER: {user_content[:1500]}\nASSISTANT: {(assistant_content or '')[:1500]}"
+        self._queue_background_insert(
+            memory_id=f"turn_{uuid.uuid4().hex[:16]}",
+            session_id=sid,
+            role="turn",
+            content=blob,
+            target="memory",
+            metadata={"kind": "turn"},
+        )
 
     def on_memory_write(
         self,
@@ -1354,7 +1405,7 @@ class OracleMemoryProvider(MemoryProvider):
             )
             if len(sample) < 20:
                 return
-            self._insert(
+            self._queue_background_insert(
                 memory_id=f"sess_{uuid.uuid4().hex[:16]}",
                 session_id=self._session_id,
                 role="session",
@@ -1654,7 +1705,9 @@ class OracleMemoryProvider(MemoryProvider):
         return ids
 
     def shutdown(self) -> None:
-        for t in (self._prefetch_thread, self._sync_thread, self._embed_worker):
+        with self._lock:
+            sync_threads = list(self._sync_threads)
+        for t in (self._prefetch_thread, self._embed_worker, *sync_threads):
             if t and t.is_alive():
                 t.join(timeout=3.0)
         if self._pool is not None:
