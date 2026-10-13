@@ -261,6 +261,46 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._pool.acquire.call_count, 1)
         self.assertEqual(provider._embed_openrouter.call_count, 2)
 
+    def test_search_does_not_client_embed_when_onnx_is_configured(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        provider._embed = MagicMock(side_effect=AssertionError("unexpected client embedding"))
+        provider._execute_hybrid_search = MagicMock(return_value=[])
+
+        self.assertEqual(provider._search("known query"), [])
+        provider._embed.assert_not_called()
+        provider._execute_hybrid_search.assert_called_once()
+
+    def test_single_result_skips_rerank(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = ""
+        provider._fetch_rows = MagicMock(
+            return_value=[{"memory_id": "m1", "score": 1.0}]
+        )
+        provider._rerank = MagicMock(side_effect=AssertionError("unexpected rerank"))
+        row = {"memory_id": "m1", "score": 1.0}
+
+        result = provider._execute_hybrid_search(
+            MagicMock(), "q", [0.1] * 768, "q", 1, 1, "", "any"
+        )
+
+        self.assertEqual(result, [row])
+        provider._rerank.assert_not_called()
+
+    def test_fetch_rows_tunes_oracle_fetch_buffers(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        cursor = MagicMock()
+        cursor.arraysize = 1
+        cursor.fetchall.return_value = []
+
+        with patch.dict(sys.modules, {"oracledb": MagicMock(DB_TYPE_CLOB=object(), DB_TYPE_LONG=object())}):
+            provider._fetch_rows(cursor, "SELECT 1", {"k": 8})
+
+        self.assertEqual(cursor.arraysize, oracle_plugin._FETCH_ARRAYSIZE)
+        self.assertEqual(cursor.prefetchrows, oracle_plugin._FETCH_ARRAYSIZE)
+
     def test_sync_turn_queues_without_waiting_for_previous_write(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
@@ -329,7 +369,7 @@ class TestOraclePlugin(unittest.TestCase):
 
         # Mock query failure on in-database ONNX call
         fake_fallback_vec = array.array("d", [0.1] * 768)
-        provider._embed_many = MagicMock(return_value=[fake_fallback_vec])
+        provider._embed_external = MagicMock(return_value=[fake_fallback_vec])
 
         # Cur.fetchall raises error on ONNX query, then succeeds on fallback
         call_count = [0]
@@ -344,7 +384,7 @@ class TestOraclePlugin(unittest.TestCase):
         results = provider._search("database query", mode="vector")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["memory_id"], "m1")
-        provider._embed_many.assert_called_with(["database query"])
+        provider._embed_external.assert_called_with(["database query"])
 
     def test_onnx_insert_fallback_to_openrouter(self):
         import array
@@ -360,7 +400,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
 
         fake_fallback_vec = array.array("d", [0.2] * 768)
-        provider._embed_many = MagicMock(return_value=[fake_fallback_vec])
+        provider._embed_external = MagicMock(return_value=[fake_fallback_vec])
 
         # First cur.execute fails on ONNX INSERT, second succeeds
         call_count = [0]
@@ -380,7 +420,7 @@ class TestOraclePlugin(unittest.TestCase):
             target="memory",
         )
         self.assertEqual(call_count[0], 2)
-        provider._embed_many.assert_called_with(["test content"])
+        provider._embed_external.assert_called_with(["test content"])
 
     def test_onnx_update_fallback_to_openrouter(self):
         import array
@@ -397,7 +437,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
 
         fake_fallback_vec = array.array("d", [0.3] * 768)
-        provider._embed_many = MagicMock(return_value=[fake_fallback_vec])
+        provider._embed_external = MagicMock(return_value=[fake_fallback_vec])
 
         call_count = [0]
         def side_effect_execute(sql, binds):
@@ -411,6 +451,21 @@ class TestOraclePlugin(unittest.TestCase):
         res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated content"})
         self.assertIn('"result": "updated"', res)
         self.assertEqual(call_count[0], 2)
+
+    def test_onnx_update_does_not_client_embed_before_sql_attempt(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value.rowcount = 1
+        provider._embed = MagicMock(side_effect=AssertionError("unexpected client embedding"))
+
+        result = provider.handle_tool_call(
+            "oracle_update", {"memory_id": "m1", "content": "updated content"}
+        )
+
+        self.assertIn('"result": "updated"', result)
+        provider._embed.assert_not_called()
 
 
 if __name__ == "__main__":

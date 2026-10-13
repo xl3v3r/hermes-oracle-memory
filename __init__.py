@@ -34,6 +34,8 @@ _EMBED_CACHE_MAX = 256
 _EMBED_BATCH = 32
 _OCI_RETRY_AFTER_SECS = 300.0
 _ONNX_RETRY_AFTER_SECS = 300.0
+_FETCH_ARRAYSIZE = 64
+_CONTAINS_CLEAN_RE = re.compile(r"[^\w\s-]")
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"^\s*(?:"
     r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
@@ -660,9 +662,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         # Option C: Fallback to OCI GenAI or OpenRouter
         if got is None:
-            got = self._embed_oci(miss_texts)
-        if got is None:
-            got = self._embed_openrouter(miss_texts)
+            got = self._embed_external(miss_texts)
 
         for text, vec in zip(miss_texts, got):
             if vec is not None:
@@ -670,6 +670,11 @@ class OracleMemoryProvider(MemoryProvider):
             for i in unique_indices[text]:
                 cached[i] = vec
         return cached
+
+    def _embed_external(self, texts: list[str]) -> list[array.array | None]:
+        """Embed through remote providers without retrying the in-database model."""
+        got = self._embed_oci(texts)
+        return got if got is not None else self._embed_openrouter(texts)
 
     def _embed(self, text: str) -> array.array | None:
         if not text:
@@ -755,7 +760,7 @@ class OracleMemoryProvider(MemoryProvider):
                 logger.debug("embed backfill batch failed: %s", e)
 
     def _contains_query(self, query: str) -> str:
-        cleaned = re.sub(r"[^\w\s-]", " ", query or "")
+        cleaned = _CONTAINS_CLEAN_RE.sub(" ", query or "")
         tokens = [t for t in cleaned.split() if len(t) > 2][:8]
         if not tokens:
             return "memory"
@@ -780,7 +785,14 @@ class OracleMemoryProvider(MemoryProvider):
         vec = embedding if embedding is not None else None
         meta = json.dumps(metadata or {})
         txt = (content or "")[:4000]
-        if self._onnx_model:
+        onnx_enabled = bool(
+            self._onnx_model
+            and (
+                self._onnx_failed_at is None
+                or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
+            )
+        )
+        if onnx_enabled:
             sql = f"""
                 INSERT INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
@@ -808,8 +820,9 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert failed (%s); falling back to OpenRouter embedding",
                     e,
                 )
+                self._onnx_failed_at = time.monotonic()
                 if vec is None:
-                    vec = self._embed_openrouter([content])[0] or self._embed_many([content])[0]
+                    vec = self._embed_external([content])[0]
 
         sql = f"""
             INSERT INTO {self._table}
@@ -846,7 +859,14 @@ class OracleMemoryProvider(MemoryProvider):
         if not rows:
             return
 
-        if self._onnx_model:
+        onnx_enabled = bool(
+            self._onnx_model
+            and (
+                self._onnx_failed_at is None
+                or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
+            )
+        )
+        if onnx_enabled:
             sql = f"""
                 INSERT INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
@@ -885,6 +905,7 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert_many failed (%s); falling back to OpenRouter embedding",
                     e,
                 )
+                self._onnx_failed_at = time.monotonic()
 
         binds_list = []
         backfill_queue = []
@@ -952,6 +973,9 @@ class OracleMemoryProvider(MemoryProvider):
             if metadata.type_code is oracledb.DB_TYPE_CLOB:
                 return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
 
+        fetch_k = binds.get("k", _FETCH_ARRAYSIZE)
+        cur.arraysize = max(_FETCH_ARRAYSIZE, int(fetch_k or 0))
+        cur.prefetchrows = cur.arraysize
         cur.outputtypehandler = fetch_lobs_as_strings
         cur.execute(sql, binds)
         out = []
@@ -1110,7 +1134,7 @@ class OracleMemoryProvider(MemoryProvider):
                     e,
                 )
                 if vec is None:
-                    vec = self._embed_openrouter([query])[0] or self._embed_many([query])[0]
+                    vec = self._embed_external([query])[0]
                 if vec is not None:
                     try:
                         fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=False)
@@ -1158,6 +1182,8 @@ class OracleMemoryProvider(MemoryProvider):
         ranked = sorted(
             merged.values(), key=lambda x: x["score"], reverse=True
         )
+        if len(ranked) <= 1:
+            return ranked[:top_k]
         return self._rerank(query, ranked, top_k, cur=cur)
 
     def _search(
@@ -1170,7 +1196,9 @@ class OracleMemoryProvider(MemoryProvider):
         tgt = (target or "any").lower()
         tgt_sql = "" if tgt in ("", "any") else " AND target = :tgt "
         contains_q = self._contains_query(query)
-        vec = None if mode == "text" else self._embed(query)
+        # Oracle can generate the query vector in SQL; avoid a redundant client
+        # embedding request while the configured ONNX model is available.
+        vec = None if mode == "text" or self._onnx_model else self._embed(query)
         if not self._onnx_model and mode != "text" and vec is None:
             mode = "text"
 
@@ -1193,7 +1221,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 e,
                             )
                             if vec is None:
-                                vec = self._embed_openrouter([query])[0] or self._embed_many([query])[0]
+                                vec = self._embed_external([query])[0]
                             if vec is not None:
                                 try:
                                     sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
@@ -1470,11 +1498,18 @@ class OracleMemoryProvider(MemoryProvider):
                 content = (args.get("content") or "").strip()
                 if not mid or not content:
                     return tool_error("memory_id and content required")
-                vec = self._embed(content)
+                vec = None if self._onnx_model else self._embed(content)
+                onnx_enabled = bool(
+                    self._onnx_model
+                    and (
+                        self._onnx_failed_at is None
+                        or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
+                    )
+                )
                 txt = content[:4000]
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        if self._onnx_model:
+                        if onnx_enabled:
                             try:
                                 sql = f"""
                                     UPDATE {self._table}
@@ -1490,8 +1525,9 @@ class OracleMemoryProvider(MemoryProvider):
                                     "In-database ONNX update failed (%s); falling back to OpenRouter embedding",
                                     e,
                                 )
+                                self._onnx_failed_at = time.monotonic()
                                 if vec is None:
-                                    vec = self._embed_openrouter([content])[0] or self._embed_many([content])[0]
+                                    vec = self._embed_external([content])[0]
                                 sql = f"""
                                     UPDATE {self._table}
                                     SET content = :1, embedding = :2, content_txt = :3
