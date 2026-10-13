@@ -1,11 +1,46 @@
 # Hermes Agent Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.5.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.5.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 ## About
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
+
+> 📖 **Installation & Setup**: For a complete step-by-step walkthrough, see the [Installation Guide (INSTALL.md)](INSTALL.md).
+
+## What's New in v1.0.5.2
+
+### 💰 Token & API Cost Reduction
+- **Zero External Embedding Costs via In-Database ONNX Inference**:
+  - Leverages in-database ONNX inference (`VECTOR_EMBEDDING` in Oracle 26ai with `BGE_BASE_EN_V1_5`), completely eliminating recurring paid third-party embedding API calls and token expenses.
+- **In-Memory Embedding Deduplication**:
+  - Implemented in-memory deduplication in `_embed_many` batch requests to ensure identical text fragments across turns and conversation sessions are embedded once, preventing redundant embedding API token spend.
+- **Accurate Hybrid Retrieval (Oracle Text + Vector)**:
+  - Fuses dense vector similarity with exact lexical Oracle Text scoring to return high-precision context, avoiding dumping excessive irrelevant context into LLM prompt windows and saving prompt tokens.
+
+### ☁️ Native Oracle Cloud (OCI) Architecture Integration
+- **Direct OCI Autonomous AI Database 26ai Vector Capabilities**:
+  - Direct integration with Oracle ADB 26ai native vector functions, `VECTOR(768, FLOAT32)` indexing, and in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`.
+- **Native OCI GenAI Service Fallback**:
+  - Seamless fallback to OCI Generative AI inference (`cohere.embed-v4.0`) utilizing native OCI Instance Principals and API signing for secure, keyless execution on OCI compute instances.
+- **Connection & Signer Caching Across Agent Sessions**:
+  - Caches and reuses OCI GenAI inference clients and Instance Principals security signers across agent sessions, eliminating client reconstruction overhead and token renewal delays.
+
+### ⚡ Performance & Reliability Optimizations
+- **Zero-Latency In-Database ONNX Hot Paths**:
+  - Eliminated redundant client-side embedding generation during vector and hybrid search when Oracle ADB in-database ONNX inference (`VECTOR_EMBEDDING`) is enabled.
+  - Avoided client-side embedding computation on `oracle_update` calls prior to database execution.
+- **Fail-Fast ONNX Cooldown & Isolated Fallback**:
+  - Added a 5-minute (300s) cooldown window upon in-database ONNX inference errors across embed, insert, and update operations to prevent repeatedly querying a broken model.
+  - Centralized remote embedding fallback (`_embed_external`) ensuring failed ONNX operations fall back directly to remote providers (OCI GenAI / OpenRouter) without recursive attempts.
+- **Asynchronous Non-Blocking Lifecycle Persistence**:
+  - Converted turn persistence (`sync_turn`) and session closure (`on_session_end`) to non-blocking background queueing (`_queue_background_insert`), eliminating the previous 2-second per-turn join penalty while guaranteeing orderly thread cleanup on shutdown.
+- **Database Fetch & Query Performance Optimization**:
+  - Tuned Oracle cursor buffer sizing (`arraysize` and `prefetchrows`) up to fetch limits (`max(64, k)`), reducing ADB round-trips for result sets.
+  - Compiled Oracle Text query sanitation regular expression (`_CONTAINS_CLEAN_RE`) at module load time.
+  - Added fast-path short-circuit in hybrid search to bypass reranking when candidate count is ≤ 1.
+
 
 ## What's New in v1.0.5.1
 
@@ -163,6 +198,10 @@ OPENROUTER_API_KEY="sk-or-v1-..."
 
 ## Setup
 
+For detailed pre-requisites, in-database ONNX model installation, OCI credential setup, and migration instructions, see the complete **[Installation Guide (INSTALL.md)](INSTALL.md)**.
+
+Quick setup in Hermes Agent:
+
 ```bash
 hermes config set memory.provider oracle
 ```
@@ -171,14 +210,17 @@ Then restart the gateway / start a new session.
 
 ## What it uses on ADB
 
-- `VECTOR(1536, FLOAT64)` + IVF neighbor-partition index (`HERMES_AGENT_MEMORY_VEC_IDX`)
+- Native 768-d vector embeddings (`VECTOR(768, FLOAT32)` with `BGE_BASE_EN_V1_5` or Matryoshka fallback; backwards compatible with `VECTOR(1536, FLOAT64)`)
+- HNSW In-Memory Neighbor Graph / IVF vector index (`HERMES_AGENT_MEMORY_VEC_IDX`)
 - Oracle Text `SEARCH INDEX` on `CONTENT` (`CONTAINS` / `SCORE`)
-- Hybrid recall: VECTOR + Text `UNION ALL` in one SQL round-trip (no native HVI on this ADB)
-- Writes insert text immediately; embeddings backfill in batches of 32
+- Hybrid recall: VECTOR + Text `UNION ALL` in one SQL round-trip with reciprocal score fusion
+- In-memory embedding deduplication across batch requests
+- Writes insert text immediately; embeddings processed with background queueing
 - Query embedding LRU cache (256)
 - Prefetch wait 0.5s
-- `DBMS_VECTOR.UTL_TO_CHUNKS` for long-document and file splits
+- `DBMS_VECTOR.UTL_TO_CHUNKS` for in-database long-document and file splits
 - Hybrid rank: 0.7 * (1 - cosine distance) + 0.3 * normalized text score
+
 
 ## Tools
 
