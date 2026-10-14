@@ -467,6 +467,30 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn('"result": "updated"', result)
         provider._embed.assert_not_called()
 
+    def test_embed_many_batches_onnx_in_single_query(self):
+        import array
+
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        provider._pool.acquire.return_value.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+        vec = array.array("f", [0.1] * 768)
+        mock_cur.fetchall.return_value = [(0, vec), (1, vec), (2, vec)]
+
+        result = provider._embed_many(["alpha", "beta", "gamma"])
+
+        self.assertEqual(len(result), 3)
+        self.assertTrue(all(v is not None for v in result))
+        # A single UNION ALL query, not one round-trip per text (N+1).
+        self.assertEqual(mock_cur.execute.call_count, 1)
+        self.assertIn("UNION ALL", mock_cur.execute.call_args[0][0])
+        self.assertEqual(mock_cur.fetchall.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

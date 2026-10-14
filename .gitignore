@@ -14,3 +14,15 @@ tools/
 backfills/
 backups/
 
+# Secrets & credentials — never commit
+.env
+*.env
+*.pem
+*.key
+*.sso
+*.p12
+cwallet.sso
+ewallet.pem
+ewallet.p12
+tnsnames.ora
+
