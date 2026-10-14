@@ -1045,9 +1045,10 @@ class OracleMemoryProvider(MemoryProvider):
     )
 
     def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
-        # oracledb thin mode fetches CLOB values as Python str by default; a
+        # oracledb thin mode returns CLOB columns as LOB objects; a
         # DB_TYPE_LONG outputtypehandler would silently truncate content over
-        # 32,760 bytes, so do not install one.
+        # 32,760 bytes, so do not install one. Instead _fetch_rows reads any
+        # LOB value to str below.
         fetch_k = binds.get("k", _FETCH_ARRAYSIZE)
         cur.arraysize = max(_FETCH_ARRAYSIZE, int(fetch_k or 0))
         cur.prefetchrows = cur.arraysize
@@ -1055,6 +1056,11 @@ class OracleMemoryProvider(MemoryProvider):
         out = []
         for row in cur.fetchall():
             content = row[4]
+            if content is not None and not isinstance(content, str):
+                # oracledb thin mode returns CLOB columns as LOB objects, not str;
+                # read them out fully (LOB.read() preserves the whole value, unlike a
+                # DB_TYPE_LONG outputtypehandler which truncates at ~32 KB).
+                content = content.read() if hasattr(content, "read") else str(content)
             dist = float(row[7]) if row[7] is not None else None
             txt = float(row[6] or 0)
             vec_score = max(0.0, min(1.0, 1.0 - dist)) if dist is not None else 0.0

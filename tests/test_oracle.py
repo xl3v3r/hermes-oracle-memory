@@ -301,6 +301,30 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(cursor.arraysize, oracle_plugin._FETCH_ARRAYSIZE)
         self.assertEqual(cursor.prefetchrows, oracle_plugin._FETCH_ARRAYSIZE)
 
+    def test_fetch_rows_converts_clob_lob_to_str(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+
+        class FakeLob:
+            def read(self):
+                return "lob content here"
+
+        cursor = MagicMock()
+        cursor.arraysize = 1
+        # row: memory_id, session_id, agent_id, role, content, target, txt_score, distance
+        cursor.fetchall.return_value = [
+            ("m1", "s1", "a1", "user", FakeLob(), "memory", 1.0, 0.25),
+            ("m2", "s2", "a2", "assistant", "already str", "user", 2.0, None),
+            ("m3", "s3", "a3", "user", None, "memory", 0.0, 0.9),
+        ]
+
+        rows = provider._fetch_rows(cursor, "SELECT 1", {"k": 8})
+
+        self.assertEqual(rows[0]["content"], "lob content here")
+        self.assertIsInstance(rows[0]["content"], str)
+        self.assertEqual(rows[1]["content"], "already str")
+        self.assertIsNone(rows[2]["content"])
+        self.assertAlmostEqual(rows[0]["score"], 0.7 * (1.0 - 0.25) + 0.3 * 0.1, places=4)
+
     def test_sync_turn_queues_without_waiting_for_previous_write(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
