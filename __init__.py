@@ -638,17 +638,22 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 db_vecs: list[array.array | None] = []
                 with self._pool.acquire() as conn, conn.cursor() as cur:
-                    for t in miss_texts:
-                        cur.execute(
-                            f"SELECT VECTOR_EMBEDDING({self._onnx_model} USING :1 AS DATA) FROM DUAL",
-                            [t[:4000]],
-                        )
-                        row = cur.fetchone()
-                        vec = row[0] if row else None
-                        if vec is not None and len(vec) == _EMBED_DIM:
-                            db_vecs.append(vec)
-                        else:
-                            db_vecs.append(None)
+                    # ⚡ Bolt: Batch ONNX embedding generation using UNION ALL to avoid N+1 queries
+                    for i in range(0, len(miss_texts), _EMBED_BATCH):
+                        batch_texts = miss_texts[i : i + _EMBED_BATCH]
+                        sql_parts = []
+                        binds = []
+                        for j, t in enumerate(batch_texts):
+                            sql_parts.append(f"SELECT {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j+1} AS DATA) FROM DUAL")
+                            binds.append(t[:4000])
+                        sql = " UNION ALL ".join(sql_parts) + " ORDER BY id"
+                        cur.execute(sql, binds)
+                        for row in cur.fetchall():
+                            vec = row[1] if row else None
+                            if vec is not None and len(vec) == _EMBED_DIM:
+                                db_vecs.append(vec)
+                            else:
+                                db_vecs.append(None)
                 if any(v is not None for v in db_vecs):
                     got = db_vecs
                 self._onnx_failed_at = None

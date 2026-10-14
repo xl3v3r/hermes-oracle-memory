@@ -4,3 +4,6 @@
 ## 2024-10-09 - Optimize Oracle LOB fetching
 **Learning:** Fetching Oracle CLOB/LOB columns returns LOB locators by default, requiring an additional network round-trip per row when `.read()` is called (the N+1 queries problem).
 **Action:** Use an `outputtypehandler` on the `cursor` to map `oracledb.DB_TYPE_CLOB` to `oracledb.DB_TYPE_LONG`. This safely fetches CLOB contents directly as strings for specific cursors without mutating global state, eliminating the N+1 network round-trips.
+## 2026-10-14 - Batch ONNX vector embeddings in Oracle using UNION ALL
+**Learning:** Using `VECTOR_EMBEDDING` in a loop for multiple texts in `_embed_many` creates an N+1 query overhead. Although Oracle doesn't support bulk embedding in a single row via returning, we can use `UNION ALL` across DUAL queries to fetch multiple embeddings in one network round-trip.
+**Action:** When querying the database for multiple independent outputs (like embeddings) that cannot use `executemany`, chunk the requests using `UNION ALL` and explicitly return an `id` or index to preserve the original order.
