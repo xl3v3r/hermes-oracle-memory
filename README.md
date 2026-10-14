@@ -1,297 +1,79 @@
-# Hermes Agent Oracle 26ai Memory Provider
+# Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.5.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.6-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-## About
+A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
-`hermes-oracle-memory` is a high-performance external memory provider plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai. It provides hybrid vector and full-text memory retrieval across conversations, enabling low-latency, scalable, and durable long-term memory for AI agents without relying on local SQLite or legacy memory systems like Mnemosyne.
+## Install
 
-> 📖 **Installation & Setup**: For a complete step-by-step walkthrough, see the [Installation Guide (INSTALL.md)](INSTALL.md).
-
-## What's New in v1.0.5.2
-
-### 💰 Token & API Cost Reduction
-- **Zero External Embedding Costs via In-Database ONNX Inference**:
-  - Leverages in-database ONNX inference (`VECTOR_EMBEDDING` in Oracle 26ai with `BGE_BASE_EN_V1_5`), completely eliminating recurring paid third-party embedding API calls and token expenses.
-- **In-Memory Embedding Deduplication**:
-  - Implemented in-memory deduplication in `_embed_many` batch requests to ensure identical text fragments across turns and conversation sessions are embedded once, preventing redundant embedding API token spend.
-- **Accurate Hybrid Retrieval (Oracle Text + Vector)**:
-  - Fuses dense vector similarity with exact lexical Oracle Text scoring to return high-precision context, avoiding dumping excessive irrelevant context into LLM prompt windows and saving prompt tokens.
-
-### ☁️ Native Oracle Cloud (OCI) Architecture Integration
-- **Direct OCI Autonomous AI Database 26ai Vector Capabilities**:
-  - Direct integration with Oracle ADB 26ai native vector functions, `VECTOR(768, FLOAT32)` indexing, and in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`.
-- **Native OCI GenAI Service Fallback**:
-  - Seamless fallback to OCI Generative AI inference (`cohere.embed-v4.0`) utilizing native OCI Instance Principals and API signing for secure, keyless execution on OCI compute instances.
-- **Connection & Signer Caching Across Agent Sessions**:
-  - Caches and reuses OCI GenAI inference clients and Instance Principals security signers across agent sessions, eliminating client reconstruction overhead and token renewal delays.
-
-### ⚡ Performance & Reliability Optimizations
-- **Zero-Latency In-Database ONNX Hot Paths**:
-  - Eliminated redundant client-side embedding generation during vector and hybrid search when Oracle ADB in-database ONNX inference (`VECTOR_EMBEDDING`) is enabled.
-  - Avoided client-side embedding computation on `oracle_update` calls prior to database execution.
-- **Fail-Fast ONNX Cooldown & Isolated Fallback**:
-  - Added a 5-minute (300s) cooldown window upon in-database ONNX inference errors across embed, insert, and update operations to prevent repeatedly querying a broken model.
-  - Centralized remote embedding fallback (`_embed_external`) ensuring failed ONNX operations fall back directly to remote providers (OCI GenAI / OpenRouter) without recursive attempts.
-- **Asynchronous Non-Blocking Lifecycle Persistence**:
-  - Converted turn persistence (`sync_turn`) and session closure (`on_session_end`) to non-blocking background queueing (`_queue_background_insert`), eliminating the previous 2-second per-turn join penalty while guaranteeing orderly thread cleanup on shutdown.
-- **Database Fetch & Query Performance Optimization**:
-  - Tuned Oracle cursor buffer sizing (`arraysize` and `prefetchrows`) up to fetch limits (`max(64, k)`), reducing ADB round-trips for result sets.
-  - Compiled Oracle Text query sanitation regular expression (`_CONTAINS_CLEAN_RE`) at module load time.
-  - Added fast-path short-circuit in hybrid search to bypass reranking when candidate count is ≤ 1.
-
-
-## What's New in v1.0.5.1
-
-- **Primary In-Database ONNX Engine (`BGE_BASE_EN_V1_5`)**:
-  - In-database vector inference powered by `BAAI/bge-base-en-v1.5` loaded directly into Oracle ADB kernel via `DBMS_VECTOR.LOAD_ONNX_MODEL`.
-  - Vectors generated and indexed natively in SQL as 768-dimensional `VECTOR(768, FLOAT32)`.
-  - Bounded with dynamic token slicing (`max 512 tokens`) to protect against sequence length broadcast errors (`ORA-54401`).
-- **Transparent OpenRouter Fallback**:
-  - Automated, zero-downtime fallback to `qwen/qwen3-embedding-4b` via OpenRouter configured at `dimensions: 768` (Matryoshka representation) whenever in-database ONNX inference is unavailable or disabled.
-  - Type-safe vector distance casting (`TO_VECTOR(:v, 768, FLOAT32)`) ensuring cross-engine vector query compatibility without format mismatches (`ORA-51812`).
-- **Parallel Backfill Engine**:
-  - Multithreaded session-pooled migration script (`scripts/backfill_embeddings.py`) supporting checkpoint resumption (`backfills/backfill_progress_768.json`) and automated vector index maintenance.
-- **In-Memory HNSW Neighbor Graph Indexing**:
-  - Native index creation with `CREATE VECTOR INDEX ... ORGANIZATION INMEMORY NEIGHBOR GRAPH` and automated statistics gathering via `DBMS_STATS.GATHER_TABLE_STATS`.
-
-### Upgrade & Installation Guide for BGE_BASE_EN_V1_5
-
-#### 1. Setup In-Database ONNX Engine (Option B — Primary)
-
-Export `BAAI/bge-base-en-v1.5` with token slicing, stage it into Oracle `DATA_PUMP_DIR`, and load the model into Oracle ADB Mining Models:
+### Recommended — Hermes plugin manager
 
 ```bash
-# Generate sliced pipeline and load into Oracle Autonomous Database
-python3 scripts/setup_onnx_model.py
+hermes plugins install xl3v3r/hermes-oracle-memory
+hermes memory setup              # pick "oracle" from the list
 ```
 
-Set the model identifier in your Hermes environment:
+### Manual — clone into the plugins directory
 
 ```bash
-# Add or update in ~/.hermes/.env
-HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5
-```
-
-#### 2. Configure Transparent Fallback (Option C)
-
-Ensure your OpenRouter API key is set in `~/.hermes/.env`. The provider will automatically use `qwen/qwen3-embedding-4b` (768 dimensions) as fallback:
-
-```bash
-OPENROUTER_API_KEY="sk-or-v1-..."
-```
-
-If `BGE_BASE_EN_V1_5` is not set or encounters transient errors, vector search, hybrid search, and fact insertions seamlessly route to OpenRouter 768-d.
-
-#### 3. Backfill Legacy Memory Rows to 768-d
-
-If upgrading from an earlier version with 1536-d or null embeddings, execute the multithreaded backfill utility:
-
-```bash
-# Backfill with 4 parallel worker sessions against Oracle ADB
-python3 scripts/backfill_embeddings.py --workers 4 --batch-size 32
-```
-
-The script automatically resumes from existing checkpoints in `backfills/backfill_progress_768.json` and gathers table statistics upon completion.
-
-## What's New in v1.0.5
-
-- **Embedding Model Migration to `qwen/qwen3-embedding-4b`**: Migrated default OpenRouter embedding provider to Qwen's embedding model (`qwen/qwen3-embedding-4b`) producing 1536-dimensional FLOAT64 vectors via Matryoshka dimension specification (`dimensions: 1536`).
-- **Resilient OpenRouter Embedding Pipeline**: Updated `_embed_openrouter()` with empty-string and whitespace filtering to prevent upstream HTTP 400 Bad Request errors, response vector dimension validation against `_EMBED_DIM` (1536), and exponential backoff retry logic for transient HTTP 429 and 5xx errors.
-- **Embedding Backfill & Migration Script (`scripts/backfill_embeddings.py`)**: Added CLI utility for batch backfilling and migrating database memory embeddings from older models to `qwen/qwen3-embedding-4b` with checkpoint resumption and database backup creation.
-- **Provider Verification Utility (`scripts/verify_provider.py`)**: Added end-to-end verification script to test Oracle DB connectivity, embedding generation, memory insertion, and recall.
-
-## What's New in v1.0.4
-
-- **`oracle-import` Hermes Skill**: Import conversation history archives (ShareGPT, Claude, ChatGPT, and overview JSON files) and large documents directly into Oracle 26ai ADB memory without exhausting LLM context windows or triggering API rate limits (e.g. HTTP 429).
-- **Direct File Chunking via `oracle_chunk` (`file_path`)**: The `oracle_chunk` tool now supports reading files directly from disk via `file_path`, running in-database chunking with `DBMS_VECTOR.UTL_TO_CHUNKS` and avoiding multi-megabyte prompt token inflation.
-- **Multi-Format & Truncated JSON Extraction**: Native turn extraction across ShareGPT, Claude, and overview structures with automatic recovery of complete leading JSON objects in truncated files.
-- **ADB Wallet Auto-Detection**: Automatic discovery of Oracle ADB mTLS wallet credentials in `~/.oci/wallet` and `~/.hermes/oracle_wallet` across thin and thick modes.
-
-## Configuration Reference
-
-### 1. OCI CLI & SDK Configuration (`~/.oci/config`)
-
-Required for Oracle Cloud Infrastructure API authentication, OCI CLI tools, and OCI Generative AI inference.
-
-```ini
-[DEFAULT]
-user=ocid1.user.oc1..aaaaaaaaexampleuserocid
-fingerprint=xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx
-tenancy=ocid1.tenancy.oc1..aaaaaaaaexampletenancyocid
-region=us-ashburn-1
-key_file=~/.oci/oci_api_key.pem
-pass_phrase=YourKeyPassphraseHere
-```
-
-| Field | Requirement | Description |
-|-------|-------------|-------------|
-| `user` | **Required** | OCID of your OCI IAM user. |
-| `fingerprint` | **Required** | Fingerprint of the public RSA key uploaded to the OCI Console under API Keys. |
-| `tenancy` | **Required** | OCID of your tenancy. |
-| `region` | **Required** | OCI region identifier (e.g. `us-ashburn-1`). |
-| `key_file` | **Required** | Absolute path or `~` path to the private RSA signing key (`.pem`). |
-| `pass_phrase` | **Required if key is encrypted** | Passphrase for the encrypted private PEM key. <br>**Critical:** If the `.pem` key was generated with a passphrase and `pass_phrase` is omitted, the OCI SDK will prompt on `stdin` (`Enter PEM Passphrase:`), hanging non-interactive agent gateways and daemon services. |
-
----
-
-### 2. Hermes Environment Variables (`~/.hermes/.env`)
-
-Configure database credentials, mTLS wallet authentication, and embedding providers in `$HERMES_HOME/.env` (default: `~/.hermes/.env`).
-
-#### Database Connection (Required)
-
-| Variable | Requirement | Description |
-|----------|-------------|-------------|
-| `OCI_DB_USER` | **Required** | Database username (defaults to `ADMIN` if omitted). |
-| `OCI_DB_PASSWORD` | **Required** | Password for the database user on Oracle ADB 26ai. |
-| `OCI_DB_DSN` | **Required** | Oracle Net Services connection descriptor or TNS alias (e.g. `(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=...))(CONNECT_DATA=(SERVICE_NAME=...))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))`). |
-
-#### Wallet & Passphrase Settings
-
-| Variable | Requirement | Description |
-|----------|-------------|-------------|
-| `OCI_WALLET_LOCATION` | Optional / Recommended | Directory path containing extracted mTLS client wallet files (`cwallet.sso`, `tnsnames.ora`, etc.). If omitted, auto-detected from `~/.oci/wallet` and `~/.hermes/oracle_wallet`, or uses `TNS_ADMIN`. |
-| `OCI_WALLET_PASSWORD` | Optional | Password for encrypted wallet containers (such as `ewallet.p12` / `ewallet.pem` when not using auto-login `cwallet.sso`). |
-| `OCI_CLI_PASSPHRASE` | Optional | Passphrase for encrypted `oci_api_key.pem` when running CLI invocations. |
-| `OCI_KEY_PASSPHRASE` | Optional | Passphrase for OCI SDK API key if provided via environment variables. |
-
-#### Embeddings (At least one provider required)
-
-Memories require 1536-dimensional FLOAT64 embeddings matching `HERMES_AGENT_MEMORY.EMBEDDING`:
-
-| Variable | Requirement | Description |
-|----------|-------------|-------------|
-| `OPENROUTER_API_KEY` | Recommended / Fallback | API key for OpenRouter to embed using `qwen/qwen3-embedding-4b` (1536-d). |
-| `OCI_GENAI_REGION` | Optional | OCI region for OCI Generative AI inference (e.g., `us-chicago-1`, `us-ashburn-1`). Uses Instance Principal authentication. |
-| `OCI_COMPARTMENT_ID` | Optional | Compartment OCID where OCI Generative AI inference is permitted. |
-| `OCI_EMBED_MODEL` | Optional | Embedding model ID on OCI GenAI (defaults to `cohere.embed-v4.0`). |
-
-#### Table & Model Customizations (Optional)
-
-| Variable | Requirement | Description |
-|----------|-------------|-------------|
-| `HERMES_ORACLE_TABLE` | Optional | Custom table name for memory storage (defaults to `HERMES_AGENT_MEMORY`). |
-| `HERMES_ORACLE_ONNX_MODEL`| Optional | Local path to an in-database ONNX model if using native Oracle DB ONNX embeddings. |
-| `MEMORY_RETENTION_DAYS` | Optional | Number of days to retain active agent memories before auto-cleanup. |
-
-#### Example `~/.hermes/.env` Snippet
-
-```bash
-# Oracle ADB 26ai Connection
-OCI_DB_USER=ADMIN
-OCI_DB_PASSWORD="YourDatabasePasswordHere"
-OCI_DB_DSN="(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=adb.us-ashburn-1.oraclecloud.com))(CONNECT_DATA=(SERVICE_NAME=xxxx_high.adb.oraclecloud.com))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
-
-# Wallet & Passphrases
-OCI_WALLET_LOCATION=~/.oci/wallet
-OCI_WALLET_PASSWORD="YourPassphrase"
-OCI_CLI_PASSPHRASE="YourPassphrase"
-OCI_KEY_PASSPHRASE="YourPassphrase"
-
-# Embeddings
-OPENROUTER_API_KEY="sk-or-v1-..."
-```
-
----
-
-## Setup
-
-For detailed pre-requisites, in-database ONNX model installation, OCI credential setup, and migration instructions, see the complete **[Installation Guide (INSTALL.md)](INSTALL.md)**.
-
-Quick setup in Hermes Agent:
-
-```bash
+git clone https://github.com/xl3v3r/hermes-oracle-memory.git ~/.hermes/plugins/oracle
+pip install "oracledb>=4.0.2"    # `oci` only needed for the OCI GenAI fallback
 hermes config set memory.provider oracle
 ```
 
-Then restart the gateway / start a new session.
+> Restart Hermes (or start a new session) after installing and selecting the provider.
 
-## What it uses on ADB
+### Verify
 
-- Native 768-d vector embeddings (`VECTOR(768, FLOAT32)` with `BGE_BASE_EN_V1_5` or Matryoshka fallback; backwards compatible with `VECTOR(1536, FLOAT64)`)
-- HNSW In-Memory Neighbor Graph / IVF vector index (`HERMES_AGENT_MEMORY_VEC_IDX`)
-- Oracle Text `SEARCH INDEX` on `CONTENT` (`CONTAINS` / `SCORE`)
-- Hybrid recall: VECTOR + Text `UNION ALL` in one SQL round-trip with reciprocal score fusion
-- In-memory embedding deduplication across batch requests
-- Writes insert text immediately; embeddings processed with background queueing
-- Query embedding LRU cache (256)
-- Prefetch wait 0.5s
-- `DBMS_VECTOR.UTL_TO_CHUNKS` for in-database long-document and file splits
-- Hybrid rank: 0.7 * (1 - cosine distance) + 0.3 * normalized text score
+```bash
+hermes memory status             # confirm "oracle" is active
+python3 scripts/verify_provider.py
+```
 
+## Configure
+
+Connection secrets go in `~/.hermes/.env` — see the [installation guide](INSTALL.md) for the full walkthrough. Minimum required:
+
+```bash
+OCI_DB_USER=ADMIN
+OCI_DB_PASSWORD="..."
+OCI_DB_DSN="(DESCRIPTION=(...))"        # Oracle Net descriptor or TNS alias
+OCI_WALLET_LOCATION=~/.oci/wallet        # mTLS wallet dir (optional)
+```
+
+Embeddings resolve in this order, in-database first:
+
+1. **In-database ONNX** (`HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5`) — zero external API cost
+2. **OCI GenAI** (`OCI_GENAI_REGION`, instance-principal auth) — optional
+3. **OpenRouter** (`OPENROUTER_API_KEY`) — fallback
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
+| Tool | Purpose |
+|------|---------|
 | `oracle_search` | hybrid / vector / text recall |
-| `oracle_add` | store a durable fact (embedded + indexed) |
-| `oracle_update` | replace content by memory_id |
-| `oracle_delete` | delete by memory_id |
-| `oracle_chunk` | split text or disk file (`content` or `file_path`, supporting ShareGPT/JSON exports) with in-database UTL_TO_CHUNKS |
-
-### Enhanced `oracle_chunk` Tool
-
-The `oracle_chunk` tool supports direct file chunking via `file_path` in addition to inline `content`. When `file_path` is provided, the tool reads the file locally, automatically parses supported conversation export formats (ShareGPT, Claude, ChatGPT, or summary JSON) into structured turns, and executes in-database chunking using Oracle ADB's `DBMS_VECTOR.UTL_TO_CHUNKS`. This avoids piping large file payloads through the LLM prompt context.
-
-**Parameters:**
-- `file_path` *(string, optional)*: Absolute or relative path to a local text, markdown, or JSON file.
-- `content` *(string, optional)*: Inline text content to chunk.
-- `max_words` *(integer, default 80)*: Maximum words per chunk.
-- `overlap` *(integer, default 10)*: Number of overlapping words between consecutive chunks.
-
-**Tool Call Example:**
-```json
-{
-  "file_path": "/path/to/conversations.json",
-  "max_words": 1000,
-  "overlap": 10
-}
-```
+| `oracle_add`    | store a durable fact (embedded + indexed) |
+| `oracle_update` | replace a fact by `memory_id` |
+| `oracle_delete` | delete by `memory_id` |
+| `oracle_chunk`  | split inline text or a disk file in-database |
 
 ## Skills
 
-### `oracle-import`
+- **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
 
-Located at [`skills/oracle-import/SKILL.md`](skills/oracle-import/SKILL.md), this skill enables bulk ingestion of historical conversation archives and large documents into Oracle Autonomous AI Database 26ai memory without hitting LLM token limits or upstream provider rate limits (such as NVIDIA NIM HTTP 429).
+## What's new in v1.0.6
 
-#### Supported Formats
-
-| Format | Structure | Parsing Behavior |
-|--------|-----------|------------------|
-| **ShareGPT** | `{"conversations": [{"from": "...", "value": "..."}]}` | Turns extracted and prefixed with `[ROLE]` |
-| **Claude Export** | `[{"name": "...", "summary": "...", "chat_messages": [...]}]` | Extracts titles, summaries, and user/assistant messages |
-| **ChatGPT Export** | Standard ChatGPT multi-turn archive | Formats user and assistant turns with message roles |
-| **Summary / Overview JSON** | `{"conversations": [...]}` or conversation summaries | Ingested as system/session memory turns |
-| **Plain Text / Markdown** | `.txt`, `.md`, logs | Split recursively via in-database `UTL_TO_CHUNKS` |
-| **Truncated JSON Streams** | Partial or aborted downloads | Recovers valid leading JSON objects without failing |
-
-#### Ingestion Methods
-
-1. **Via Hermes Agent (`oracle_chunk`)**:
-   Agents can directly invoke the `oracle_chunk` tool passing `file_path`:
-   ```bash
-   oracle_chunk(file_path="/path/to/archive.json", max_words=500, overlap=20)
-   ```
-
-2. **Standalone Bulk Ingestion Script**:
-   For large exports (>10MB or hundreds of sessions), run the bundled CLI script to import batches directly into Oracle ADB with zero LLM API consumption:
-   ```bash
-   # Import an archive
-   python3 skills/oracle-import/scripts/import_conversations.py /path/to/oracle_import.json
-
-   # Specify custom batch size and session ID
-   python3 skills/oracle-import/scripts/import_conversations.py /path/to/conversations.json --batch-size 50 --session-id "archive-2026-06"
-   ```
-
+- Batched in-database ONNX embeddings via a single `UNION ALL` query (no N+1 round-trips).
+- Single background writer thread replaces thread-per-turn persistence.
+- `DBMS_VECTOR.RERANK` is opt-in (`HERMES_ORACLE_DISABLE_RERANK=1`) and capped; prefetch skips rerank.
+- Embed backfill re-queues failed batches instead of silently dropping rows; `shutdown()` drains pending writes before closing the pool.
+- Removed the `DB_TYPE_LONG` output handler that truncated CLOB content over 32 KB.
+- Sanitized the ONNX model identifier in the backfill script; added an external-embed kill-switch (`HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1`); `.gitignore` covers wallets/keys; `oracle_chunk` caps input at 64 MB; CLA action pinned by SHA and scoped.
 
 ## Contributing
 
-Contributions to `hermes-oracle-memory` are welcome!
-
-To protect the project and ensure clean licensing for all users and contributors, this repository uses **[CLA Assistant](https://cla-assistant.io/)**. When opening a pull request for the first time, the automated bot will request that you agree to the [Contributor License Agreement (CLA)](./CLA.md). You can sign it directly by commenting:
+Pull requests welcome. First-time contributors sign the [CLA](CLA.md) by commenting on the PR:
 
 ```text
 I have read the CLA Document and I hereby sign the CLA
@@ -299,9 +81,4 @@ I have read the CLA Document and I hereby sign the CLA
 
 ## License
 
-This project is licensed under the **Business Source License 1.1 (BSL 1.1)**. See the [LICENSE](./LICENSE) file for complete terms.
-
-* **Free for Personal, Research, and Testing Use**: Anyone may use, study, and modify the code.
-* **Free for Organizations with < $1M Annual Revenue**: Small teams and early-stage startups may use the software in production free of charge.
-* **Commercial License Required**: Use within organizations with annual gross revenue exceeding $1,000,000 USD or offering the software as a commercial managed service requires a commercial license agreement. Contact Taylor Ripley (`xl3v3r`) for commercial licensing inquiries.
-* **Automatic Open Source Conversion**: On October 11, 2030 (the Change Date), the license automatically converts to the **Apache License, Version 2.0**.
+[Business Source License 1.1](LICENSE) — free for personal, research, and organizations under $1M annual revenue; converts to Apache-2.0 on 2030-10-11.
