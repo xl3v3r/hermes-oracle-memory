@@ -208,6 +208,12 @@ def run_backfill(
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not found in environment or ~/.hermes/.env")
 
+    # Sanitize the ONNX model identifier before it is interpolated into SQL in
+    # process_batch(). It originates from a CLI flag / environment variable and
+    # is otherwise an injection vector (the table name is validated separately).
+    clean_onnx = re.sub(r"[^A-Za-z0-9_]", "", onnx_model or "")
+    onnx_model = clean_onnx or None
+
     completed_ids: set[str] = set()
     if checkpoint_file.exists():
         try:

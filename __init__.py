@@ -13,6 +13,7 @@ import array
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -35,6 +36,18 @@ _EMBED_BATCH = 32
 _OCI_RETRY_AFTER_SECS = 300.0
 _ONNX_RETRY_AFTER_SECS = 300.0
 _FETCH_ARRAYSIZE = 64
+_EMBED_TIMEOUT_SECS = 10.0
+_EMBED_MAX_RETRIES = 2
+_RERANK_MAX_DOCS = 8
+_RERANK_ENABLED = (
+    os.environ.get("HERMES_ORACLE_DISABLE_RERANK", "").strip().lower()
+    not in ("1", "true", "yes")
+)
+_EXTERNAL_EMBED_KILLSWITCH = (
+    os.environ.get("HERMES_ORACLE_DISABLE_EXTERNAL_EMBED", "").strip().lower()
+    in ("1", "true", "yes")
+)
+_MAX_CHUNK_FILE_BYTES = 64 * 1024 * 1024
 _CONTAINS_CLEAN_RE = re.compile(r"[^\w\s-]")
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"^\s*(?:"
@@ -223,7 +236,11 @@ class OracleMemoryProvider(MemoryProvider):
         self._oci_signer: Any | None = None
         self._onnx_failed_at: float | None = None
         self._lock = threading.Lock()
-        self._sync_threads: set[threading.Thread] = set()
+        self._write_queue: queue.Queue = queue.Queue()
+        self._write_worker: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+        self._write_stop = threading.Event()
+        self._external_embed_warned = False
         self._init_error = ""
         self._agent_context = "primary"
 
@@ -425,6 +442,14 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception as e:
                     if "ORA-01430" not in str(e):  # column already exists
                         logger.debug("schema stmt skipped: %s", e)
+        self._verify_schema()
+
+    def _verify_schema(self) -> None:
+        """Raise if the memory table is not queryable, so `initialize` surfaces
+        the failure instead of reporting the provider as active while broken."""
+        with self._pool.acquire() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {self._table}")  # nosec B608
+            cur.fetchone()
 
     def system_prompt_block(self) -> str:
         if not self._pool:
@@ -453,6 +478,21 @@ class OracleMemoryProvider(MemoryProvider):
             self._embed_cache.move_to_end(key)
             while len(self._embed_cache) > _EMBED_CACHE_MAX:
                 self._embed_cache.popitem(last=False)
+
+    def _onnx_in_cooldown(self) -> bool:
+        with self._embed_lock:
+            failed_at = self._onnx_failed_at
+        return failed_at is not None and (
+            time.monotonic() - failed_at < _ONNX_RETRY_AFTER_SECS
+        )
+
+    def _onnx_mark_failed(self) -> None:
+        with self._embed_lock:
+            self._onnx_failed_at = time.monotonic()
+
+    def _onnx_mark_ok(self) -> None:
+        with self._embed_lock:
+            self._onnx_failed_at = None
 
     def _embed_oci(self, texts: list[str]) -> list[array.array | None] | None:
         """OCI GenAI cohere.embed-v4.0 via instance principal. None = skip OCI this attempt.
@@ -563,8 +603,8 @@ class OracleMemoryProvider(MemoryProvider):
                 }
             ).encode("utf-8")
 
-            max_retries = 3
-            backoff = 1.5
+            max_retries = _EMBED_MAX_RETRIES
+            backoff = 1.0
             data = None
 
             for attempt in range(1, max_retries + 1):
@@ -578,7 +618,7 @@ class OracleMemoryProvider(MemoryProvider):
                         },
                         method="POST",
                     )
-                    with urllib.request.urlopen(req, timeout=20) as resp:
+                    with urllib.request.urlopen(req, timeout=_EMBED_TIMEOUT_SECS) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                     break
                 except urllib.error.HTTPError as he:
@@ -627,37 +667,38 @@ class OracleMemoryProvider(MemoryProvider):
 
         # Option B: Primary in-database ONNX model embedding
         onnx_enabled = bool(
-            self._onnx_model
-            and self._pool
-            and (
-                self._onnx_failed_at is None
-                or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
-            )
+            self._onnx_model and self._pool and not self._onnx_in_cooldown()
         )
         if onnx_enabled:
             try:
-                db_vecs: list[array.array | None] = []
+                db_vecs: list[array.array | None] = [None] * len(miss_texts)
                 with self._pool.acquire() as conn, conn.cursor() as cur:
-                    for t in miss_texts:
-                        cur.execute(
-                            f"SELECT VECTOR_EMBEDDING({self._onnx_model} USING :1 AS DATA) FROM DUAL",
-                            [t[:4000]],
-                        )
-                        row = cur.fetchone()
-                        vec = row[0] if row else None
-                        if vec is not None and len(vec) == _EMBED_DIM:
-                            db_vecs.append(vec)
-                        else:
-                            db_vecs.append(None)
+                    # Batch all texts in a single UNION ALL round-trip instead of
+                    # one VECTOR_EMBEDDING query per text (the N+1 problem).
+                    for i in range(0, len(miss_texts), _EMBED_BATCH):
+                        batch_texts = miss_texts[i : i + _EMBED_BATCH]
+                        parts = []
+                        binds = []
+                        for j, t in enumerate(batch_texts):
+                            parts.append(
+                                f"SELECT {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
+                            )
+                            binds.append(t[:4000])
+                        cur.execute(" UNION ALL ".join(parts) + " ORDER BY id", binds)
+                        for row in cur.fetchall():
+                            idx = int(row[0])
+                            vec = row[1] if len(row) > 1 else None
+                            if vec is not None and len(vec) == _EMBED_DIM:
+                                db_vecs[i + idx] = vec
                 if any(v is not None for v in db_vecs):
                     got = db_vecs
-                self._onnx_failed_at = None
+                self._onnx_mark_ok()
             except Exception as e:
                 logger.warning(
-                    "In-database ONNX embed_many failed (%s); falling back to OpenRouter",
+                    "In-database ONNX embed_many failed (%s); falling back to external embedding",
                     e,
                 )
-                self._onnx_failed_at = time.monotonic()
+                self._onnx_mark_failed()
                 got = None
 
         # Option C: Fallback to OCI GenAI or OpenRouter
@@ -672,7 +713,24 @@ class OracleMemoryProvider(MemoryProvider):
         return cached
 
     def _embed_external(self, texts: list[str]) -> list[array.array | None]:
-        """Embed through remote providers without retrying the in-database model."""
+        """Embed through remote providers without retrying the in-database model.
+
+        Remote providers receive raw memory content, so this path is guarded:
+        HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1 disables it entirely, and a
+        one-time warning is emitted so operators know when data leaves the DB.
+        """
+        if _EXTERNAL_EMBED_KILLSWITCH:
+            return [None] * len(texts)
+        if not self._external_embed_warned:
+            with self._embed_lock:
+                if not self._external_embed_warned:
+                    self._external_embed_warned = True
+                    logger.warning(
+                        "external embedding provider in use: %d memory text(s) "
+                        "will be sent outside the database (set "
+                        "HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1 to forbid this)",
+                        len(texts),
+                    )
         got = self._embed_oci(texts)
         return got if got is not None else self._embed_openrouter(texts)
 
@@ -714,26 +772,49 @@ class OracleMemoryProvider(MemoryProvider):
         target: str,
         metadata: dict[str, Any],
     ) -> None:
-        def run() -> None:
+        """Enqueue a write for the single background writer thread.
+
+        Replaces the previous thread-per-write approach, which spawned a new
+        daemon thread (and a new pooled connection) for every turn and
+        contended on a small session pool.
+        """
+        self._write_queue.put(
+            {
+                "memory_id": memory_id,
+                "session_id": session_id,
+                "role": role,
+                "content": content,
+                "target": target,
+                "metadata": metadata,
+            }
+        )
+        self._ensure_write_worker()
+
+    def _ensure_write_worker(self) -> None:
+        with self._write_lock:
+            if self._write_worker is not None and self._write_worker.is_alive():
+                return
+            self._write_worker = threading.Thread(
+                target=self._write_worker_loop,
+                daemon=True,
+                name="oracle-write-worker",
+            )
+            self._write_worker.start()
+
+    def _write_worker_loop(self) -> None:
+        while True:
             try:
-                self._insert(
-                    memory_id=memory_id,
-                    session_id=session_id,
-                    role=role,
-                    content=content,
-                    target=target,
-                    metadata=metadata,
-                )
+                item = self._write_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._write_stop.is_set():
+                    return
+                continue
+            try:
+                self._insert(**item)
             except Exception as e:
                 logger.warning("oracle background insert failed: %s", e)
             finally:
-                with self._lock:
-                    self._sync_threads.discard(thread)
-
-        thread = threading.Thread(target=run, daemon=True, name="oracle-sync")
-        with self._lock:
-            self._sync_threads.add(thread)
-        thread.start()
+                self._write_queue.task_done()
 
     def _embed_worker_loop(self) -> None:
         while True:
@@ -742,22 +823,34 @@ class OracleMemoryProvider(MemoryProvider):
                     self._embed_worker = None
                     return
                 batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
-            ids = [m for m, _ in batch]
-            texts = [c for _, c in batch]
+            if not self._pool:
+                # Provider torn down while a batch was pending; stop cleanly.
+                self._embed_worker = None
+                return
+            done: set[str] = set()
             try:
-                vecs = self._embed_many(texts)
-                if not self._pool:
-                    continue
-                with self._pool.acquire() as conn:
-                    with conn.cursor() as cur:
-                        # Optimize: Use executemany for bulk updating embeddings in a single round-trip
-                        sql = f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
-                        binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
-                        if binds:
+                vecs = self._embed_many([c for _, c in batch])
+                binds = [(vec, mid) for (mid, _), vec in zip(batch, vecs) if vec is not None]
+                if binds:
+                    with self._pool.acquire() as conn:
+                        with conn.cursor() as cur:
+                            # Bulk update embeddings in a single round-trip.
+                            sql = f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
                             cur.executemany(sql, binds)
-                    conn.commit()
+                        conn.commit()
+                done = {mid for _, mid in binds}
             except Exception as e:
-                logger.debug("embed backfill batch failed: %s", e)
+                logger.warning("embed backfill batch failed: %s", e)
+            remaining = [item for item in batch if item[0] not in done]
+            if remaining and not self._write_stop.is_set():
+                logger.warning(
+                    "embed backfill: %d/%d rows still missing embeddings; re-queueing",
+                    len(remaining),
+                    len(batch),
+                )
+                time.sleep(2.0)
+                with self._embed_lock:
+                    self._embed_pending.extendleft(reversed(remaining))
 
     def _contains_query(self, query: str) -> str:
         cleaned = _CONTAINS_CLEAN_RE.sub(" ", query or "")
@@ -785,13 +878,7 @@ class OracleMemoryProvider(MemoryProvider):
         vec = embedding if embedding is not None else None
         meta = json.dumps(metadata or {})
         txt = (content or "")[:4000]
-        onnx_enabled = bool(
-            self._onnx_model
-            and (
-                self._onnx_failed_at is None
-                or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
-            )
-        )
+        onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
             sql = f"""
                 INSERT INTO {self._table}
@@ -820,7 +907,7 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert failed (%s); falling back to OpenRouter embedding",
                     e,
                 )
-                self._onnx_failed_at = time.monotonic()
+                self._onnx_mark_failed()
                 if vec is None:
                     vec = self._embed_external([content])[0]
 
@@ -859,13 +946,7 @@ class OracleMemoryProvider(MemoryProvider):
         if not rows:
             return
 
-        onnx_enabled = bool(
-            self._onnx_model
-            and (
-                self._onnx_failed_at is None
-                or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
-            )
-        )
+        onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
             sql = f"""
                 INSERT INTO {self._table}
@@ -905,7 +986,7 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert_many failed (%s); falling back to OpenRouter embedding",
                     e,
                 )
-                self._onnx_failed_at = time.monotonic()
+                self._onnx_mark_failed()
 
         binds_list = []
         backfill_queue = []
@@ -964,19 +1045,12 @@ class OracleMemoryProvider(MemoryProvider):
     )
 
     def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
-        import oracledb
-
-        # ⚡ Bolt: Use outputtypehandler to fetch CLOBs directly as strings.
-        # This prevents the N+1 network round-trips caused by calling .read()
-        # on LOB locators.
-        def fetch_lobs_as_strings(cursor, metadata):
-            if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
-
+        # oracledb thin mode fetches CLOB values as Python str by default; a
+        # DB_TYPE_LONG outputtypehandler would silently truncate content over
+        # 32,760 bytes, so do not install one.
         fetch_k = binds.get("k", _FETCH_ARRAYSIZE)
         cur.arraysize = max(_FETCH_ARRAYSIZE, int(fetch_k or 0))
         cur.prefetchrows = cur.arraysize
-        cur.outputtypehandler = fetch_lobs_as_strings
         cur.execute(sql, binds)
         out = []
         for row in cur.fetchall():
@@ -1113,7 +1187,7 @@ class OracleMemoryProvider(MemoryProvider):
         return fused_sql, fused_binds
 
     def _execute_hybrid_search(
-        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True
     ) -> list:
         merged: dict = {}
         use_onnx = bool(self._onnx_model)
@@ -1182,12 +1256,17 @@ class OracleMemoryProvider(MemoryProvider):
         ranked = sorted(
             merged.values(), key=lambda x: x["score"], reverse=True
         )
-        if len(ranked) <= 1:
+        if not rerank or len(ranked) <= 1:
             return ranked[:top_k]
         return self._rerank(query, ranked, top_k, cur=cur)
 
     def _search(
-        self, query: str, top_k: int = 8, mode: str = "hybrid", target: str = "any"
+        self,
+        query: str,
+        top_k: int = 8,
+        mode: str = "hybrid",
+        target: str = "any",
+        rerank: bool = True,
     ) -> list:
         if not self._pool or not query:
             return []
@@ -1252,15 +1331,19 @@ class OracleMemoryProvider(MemoryProvider):
                             sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
                             rows = self._fetch_rows(cur, sql, binds)
                 else:
-                    rows = self._execute_hybrid_search(cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt)
+                    rows = self._execute_hybrid_search(
+                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank
+                    )
         return rows[:top_k]
 
     def _rerank(self, query: str, rows: list, top_k: int, cur=None) -> list:
         """Best-effort DBMS_VECTOR.RERANK; identity if the call is unavailable."""
         if not rows:
             return rows
+        if not _RERANK_ENABLED:
+            return rows
         docs = []
-        for r in rows[: min(20, len(rows))]:
+        for r in rows[: min(_RERANK_MAX_DOCS, len(rows))]:
             docs.append({"id": r["memory_id"], "text": (r.get("content") or "")[:2000]})
         try:
             if cur is None:
@@ -1314,7 +1397,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                rows = self._search(query, top_k=6, mode="hybrid")
+                rows = self._search(query, top_k=6, mode="hybrid", rerank=False)
                 body = self._format_prefetch(rows)
             except Exception as e:
                 logger.debug("oracle prefetch failed: %s", e)
@@ -1499,13 +1582,7 @@ class OracleMemoryProvider(MemoryProvider):
                 if not mid or not content:
                     return tool_error("memory_id and content required")
                 vec = None if self._onnx_model else self._embed(content)
-                onnx_enabled = bool(
-                    self._onnx_model
-                    and (
-                        self._onnx_failed_at is None
-                        or time.monotonic() - self._onnx_failed_at >= _ONNX_RETRY_AFTER_SECS
-                    )
-                )
+                onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
                 txt = content[:4000]
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
@@ -1525,7 +1602,7 @@ class OracleMemoryProvider(MemoryProvider):
                                     "In-database ONNX update failed (%s); falling back to OpenRouter embedding",
                                     e,
                                 )
-                                self._onnx_failed_at = time.monotonic()
+                                self._onnx_mark_failed()
                                 if vec is None:
                                     vec = self._embed_external([content])[0]
                                 sql = f"""
@@ -1580,6 +1657,11 @@ class OracleMemoryProvider(MemoryProvider):
                         p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
                         if not p.is_file():
                             return tool_error(f"File not found: {file_path}")
+                        if p.stat().st_size > _MAX_CHUNK_FILE_BYTES:
+                            return tool_error(
+                                f"File too large to chunk ({p.stat().st_size} bytes; "
+                                f"limit {_MAX_CHUNK_FILE_BYTES})"
+                            )
                         raw_data = p.read_text(encoding="utf-8", errors="replace")
                         extracted_text = ""
                         try:
@@ -1671,11 +1753,8 @@ class OracleMemoryProvider(MemoryProvider):
                 try:
                     import oracledb
 
-                    # ⚡ Bolt: Use outputtypehandler to fetch CLOB chunks directly as strings
-                    def fetch_lobs_as_strings(cursor, metadata):
-                        if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                            return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
-                    cur.outputtypehandler = fetch_lobs_as_strings
+                    # oracledb thin mode returns CLOB chunks as str natively;
+                    # do not map to DB_TYPE_LONG (silent 32,760-byte truncation).
                     cur.setinputsizes(oracledb.DB_TYPE_CLOB)
 
                     cur.execute(
@@ -1741,11 +1820,13 @@ class OracleMemoryProvider(MemoryProvider):
         return ids
 
     def shutdown(self) -> None:
-        with self._lock:
-            sync_threads = list(self._sync_threads)
-        for t in (self._prefetch_thread, self._embed_worker, *sync_threads):
+        # Stop accepting new background writes, then drain in-flight and
+        # pending work before closing the pool so no turn is lost to a
+        # connection closed underneath a running writer.
+        self._write_stop.set()
+        for t in (self._write_worker, self._embed_worker, self._prefetch_thread):
             if t and t.is_alive():
-                t.join(timeout=3.0)
+                t.join(timeout=10.0)
         if self._pool is not None:
             try:
                 self._pool.close()
