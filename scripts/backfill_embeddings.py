@@ -477,7 +477,30 @@ def main() -> None:
         default=4,
         help="Number of concurrent worker threads (default: 4)",
     )
+    parser.add_argument(
+        "--i-know-this-uses-external-embeddings",
+        action="store_true",
+        help=(
+            "REQUIRED to run. This script embeds via OpenRouter "
+            "(qwen/qwen3-embedding-4b), which sends memory content to an "
+            "external provider and produces vectors incompatible with the "
+            "in-database ONNX model. Use scripts/reembed_embeddings.py "
+            "instead - it is ONNX-only, serial-safe, and resumable."
+        ),
+    )
     args = parser.parse_args()
+
+    if not args.i_know_this_uses_external_embeddings:
+        parser.error(
+            "refusing to run: this backfill embeds through the EXTERNAL "
+            "OpenRouter model (qwen/qwen3-embedding-4b), which sends memory "
+            "content outside the database and writes vectors that do not "
+            "match the in-database ONNX model, silently splitting the table "
+            "across two embedding spaces.\n"
+            "For consistency work use:  scripts/reembed_embeddings.py --mode stale\n"
+            "For a genuine NULL-embedding backfill that must use the external "
+            "model, pass --i-know-this-uses-external-embeddings explicitly."
+        )
 
     checkpoint_path = Path(args.checkpoint).resolve()
     run_backfill(
