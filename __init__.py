@@ -227,7 +227,7 @@ class OracleMemoryProvider(MemoryProvider):
         self._prefetch_count = 0
         self._prefetch_thread: threading.Thread | None = None
         self._embed_lock = threading.Lock()
-        self._embed_cache: OrderedDict[str, array.array] = OrderedDict()
+        self._embed_cache: OrderedDict[str, tuple[array.array, str | None]] = OrderedDict()
         self._embed_cache_lock = threading.Lock()
         self._embed_pending: deque[tuple[str, str]] = deque()
         self._embed_worker: threading.Thread | None = None
@@ -434,6 +434,8 @@ class OracleMemoryProvider(MemoryProvider):
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (target VARCHAR2(32) DEFAULT ''memory'')'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (metadata JSON)'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (content_txt VARCHAR2(4000))'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (embedding_model VARCHAR2(64))'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (embedding_updated_at TIMESTAMP(6))'; END;",
         ]
         with self._pool.acquire() as conn, conn.cursor() as cur:
             for sql in stmts:
@@ -463,18 +465,20 @@ class OracleMemoryProvider(MemoryProvider):
 
     # -- embeddings ----------------------------------------------------------
 
-    def _cache_get(self, text: str) -> array.array | None:
+    def _cache_get(self, text: str) -> tuple[array.array, str | None] | None:
         key = text[:8000]
         with self._embed_cache_lock:
-            vec = self._embed_cache.get(key)
-            if vec is not None:
+            entry = self._embed_cache.get(key)
+            if entry is not None:
                 self._embed_cache.move_to_end(key)
-            return vec
+            return entry
 
-    def _cache_put(self, text: str, vec: array.array) -> None:
+    def _cache_put(self, text: str, vec: array.array, model: str | None) -> None:
+        # model records which embedding backend produced vec, so cached writes
+        # carry the same provenance as freshly computed ones.
         key = text[:8000]
         with self._embed_cache_lock:
-            self._embed_cache[key] = vec
+            self._embed_cache[key] = (vec, model)
             self._embed_cache.move_to_end(key)
             while len(self._embed_cache) > _EMBED_CACHE_MAX:
                 self._embed_cache.popitem(last=False)
@@ -645,15 +649,21 @@ class OracleMemoryProvider(MemoryProvider):
             logger.warning("OpenRouter embed failed: %s", e)
         return out
 
-    def _embed_many(self, texts: list[str]) -> list[array.array | None]:
+    def _embed_many_tagged(self, texts: list[str]) -> list[tuple[array.array | None, str | None]]:
+        """Embed texts and report which backend produced each vector.
+
+        Returns (vec, model) pairs where model is the provenance stamp stored in
+        embedding_model. Write paths use this so every stored vector records its
+        origin; search paths use _embed_many and ignore the tag.
+        """
         if not texts:
             return []
-        cached: list[array.array | None] = [
+        cached: list[tuple[array.array | None, str | None] | None] = [
             self._cache_get(t) if t else None for t in texts
         ]
         miss_idx = [i for i, (t, v) in enumerate(zip(texts, cached)) if t and v is None]
         if not miss_idx:
-            return cached
+            return [c if c is not None else (None, None) for c in cached]
         unique_miss_texts: list[str] = []
         unique_indices: dict[str, list[int]] = {}
         for i in miss_idx:
@@ -664,6 +674,7 @@ class OracleMemoryProvider(MemoryProvider):
             unique_indices[text].append(i)
         miss_texts = unique_miss_texts
         got: list[array.array | None] | None = None
+        got_tags: list[str | None] = [None] * len(miss_texts)
 
         # Option B: Primary in-database ONNX model embedding
         onnx_enabled = bool(
@@ -692,6 +703,9 @@ class OracleMemoryProvider(MemoryProvider):
                                 db_vecs[i + idx] = vec
                 if any(v is not None for v in db_vecs):
                     got = db_vecs
+                    got_tags = [
+                        self._onnx_model if v is not None else None for v in got
+                    ]
                 self._onnx_mark_ok()
             except Exception as e:
                 logger.warning(
@@ -703,24 +717,30 @@ class OracleMemoryProvider(MemoryProvider):
 
         # Option C: Fallback to OCI GenAI or OpenRouter
         if got is None:
-            got = self._embed_external(miss_texts)
+            got, ext_tag = self._embed_external_tagged(miss_texts)
+            got_tags = [ext_tag if v is not None else None for v in got]
 
-        for text, vec in zip(miss_texts, got):
+        for text, vec, model in zip(miss_texts, got, got_tags):
             if vec is not None:
-                self._cache_put(text, vec)
+                self._cache_put(text, vec, model)
             for i in unique_indices[text]:
-                cached[i] = vec
-        return cached
+                cached[i] = (vec, model)
+        return [c if c is not None else (None, None) for c in cached]
 
-    def _embed_external(self, texts: list[str]) -> list[array.array | None]:
-        """Embed through remote providers without retrying the in-database model.
+    def _embed_many(self, texts: list[str]) -> list[array.array | None]:
+        """Untagged view for search paths, which never store the vectors."""
+        return [v for v, _m in self._embed_many_tagged(texts)]
+
+    def _embed_external_tagged(self, texts: list[str]) -> tuple[list[array.array | None], str | None]:
+        """Embed through remote providers without retrying the in-database model,
+        reporting which provider produced the vectors.
 
         Remote providers receive raw memory content, so this path is guarded:
         HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1 disables it entirely, and a
         one-time warning is emitted so operators know when data leaves the DB.
         """
         if _EXTERNAL_EMBED_KILLSWITCH:
-            return [None] * len(texts)
+            return [None] * len(texts), None
         if not self._external_embed_warned:
             with self._embed_lock:
                 if not self._external_embed_warned:
@@ -732,7 +752,14 @@ class OracleMemoryProvider(MemoryProvider):
                         len(texts),
                     )
         got = self._embed_oci(texts)
-        return got if got is not None else self._embed_openrouter(texts)
+        if got is not None:
+            return got, f"oci:{os.environ.get('OCI_EMBED_MODEL', _OCI_EMBED_MODEL)}"
+        got = self._embed_openrouter(texts)
+        return got, f"openrouter:{_EMBED_MODEL}"
+
+    def _embed_external(self, texts: list[str]) -> list[array.array | None]:
+        vecs, _model = self._embed_external_tagged(texts)
+        return vecs
 
     def _embed(self, text: str) -> array.array | None:
         if not text:
@@ -829,16 +856,25 @@ class OracleMemoryProvider(MemoryProvider):
                 return
             done: set[str] = set()
             try:
-                vecs = self._embed_many([c for _, c in batch])
-                binds = [(vec, mid) for (mid, _), vec in zip(batch, vecs) if vec is not None]
+                tagged = self._embed_many_tagged([c for _, c in batch])
+                binds = [
+                    (vec, model, mid)
+                    for (mid, _), (vec, model) in zip(batch, tagged)
+                    if vec is not None
+                ]
                 if binds:
                     with self._pool.acquire() as conn:
                         with conn.cursor() as cur:
-                            # Bulk update embeddings in a single round-trip.
-                            sql = f"UPDATE {self._table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
+                            # Bulk update embeddings in a single round-trip,
+                            # stamping provenance alongside the vector.
+                            sql = (
+                                f"UPDATE {self._table} SET embedding = :1, "
+                                "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
+                                "WHERE memory_id = :3"
+                            )  # nosec B608
                             cur.executemany(sql, binds)
                         conn.commit()
-                done = {mid for _, mid in binds}
+                done = {mid for _, _, mid in binds}
             except Exception as e:
                 logger.warning("embed backfill batch failed: %s", e)
             remaining = [item for item in batch if item[0] not in done]
@@ -876,6 +912,7 @@ class OracleMemoryProvider(MemoryProvider):
         if not self._pool:
             raise RuntimeError(self._init_error or "pool not initialized")
         vec = embedding if embedding is not None else None
+        vec_model = None  # provenance stamp; None means "unknown origin"
         meta = json.dumps(metadata or {})
         txt = (content or "")[:4000]
         onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
@@ -883,8 +920,10 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 INSERT INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
-                     created_at, target, metadata, content_txt)
-                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9)
+                     created_at, target, metadata, content_txt,
+                     embedding_model, embedding_updated_at)
+                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9,
+                     :10, SYSTIMESTAMP)
             """
             binds = (
                 memory_id,
@@ -896,6 +935,7 @@ class OracleMemoryProvider(MemoryProvider):
                 target,
                 meta,
                 txt,
+                self._onnx_model,
             )
             try:
                 with self._pool.acquire() as conn, conn.cursor() as cur:
@@ -909,13 +949,16 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 self._onnx_mark_failed()
                 if vec is None:
-                    vec = self._embed_external([content])[0]
+                    ext_vecs, vec_model = self._embed_external_tagged([content])
+                    vec = ext_vecs[0]
 
         sql = f"""
             INSERT INTO {self._table}
                 (memory_id, session_id, agent_id, role, content, embedding,
-                 created_at, target, metadata, content_txt)
-            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
+                 created_at, target, metadata, content_txt,
+                 embedding_model, embedding_updated_at)
+            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9,
+                 :10, SYSTIMESTAMP)
         """
         binds = (
             memory_id,
@@ -927,6 +970,7 @@ class OracleMemoryProvider(MemoryProvider):
             target,
             meta,
             txt,
+            vec_model,
         )
 
         with self._pool.acquire() as conn, conn.cursor() as cur:
@@ -951,8 +995,10 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 INSERT INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
-                     created_at, target, metadata, content_txt)
-                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9)
+                     created_at, target, metadata, content_txt,
+                     embedding_model, embedding_updated_at)
+                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9,
+                     :10, SYSTIMESTAMP)
             """
             binds_list = []
             for row in rows:
@@ -974,6 +1020,7 @@ class OracleMemoryProvider(MemoryProvider):
                     target,
                     meta,
                     txt,
+                    self._onnx_model,
                 )
                 binds_list.append(binds)
             try:
@@ -993,8 +1040,9 @@ class OracleMemoryProvider(MemoryProvider):
         contents = [(r.get("content") or "") for r in rows]
         needed_indices = [i for i, r in enumerate(rows) if r.get("embedding") is None]
         needed_texts = [contents[i] for i in needed_indices]
-        fetched_vecs = self._embed_many(needed_texts) if needed_texts else []
-        vec_map = {idx: fetched_vecs[j] for j, idx in enumerate(needed_indices)}
+        fetched = self._embed_many_tagged(needed_texts) if needed_texts else []
+        vec_map = {idx: fetched[j][0] for j, idx in enumerate(needed_indices)}
+        model_map = {idx: fetched[j][1] for j, idx in enumerate(needed_indices)}
 
         for i, row in enumerate(rows):
             memory_id = row.get("memory_id")
@@ -1004,6 +1052,9 @@ class OracleMemoryProvider(MemoryProvider):
             target = row.get("target")
             metadata = row.get("metadata")
             embedding = row.get("embedding") if row.get("embedding") is not None else vec_map.get(i)
+            # An embedding supplied by the caller has unknown provenance; one
+            # computed here carries the tag of the backend that produced it.
+            model = None if row.get("embedding") is not None else model_map.get(i)
 
             vec = embedding if embedding is not None else None
             meta = json.dumps(metadata or {})
@@ -1019,6 +1070,7 @@ class OracleMemoryProvider(MemoryProvider):
                 target,
                 meta,
                 txt,
+                model,
             )
             binds_list.append(binds)
 
@@ -1028,8 +1080,10 @@ class OracleMemoryProvider(MemoryProvider):
         sql = f"""
             INSERT INTO {self._table}
                 (memory_id, session_id, agent_id, role, content, embedding,
-                 created_at, target, metadata, content_txt)
-            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9)
+                 created_at, target, metadata, content_txt,
+                 embedding_model, embedding_updated_at)
+            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9,
+                 :10, SYSTIMESTAMP)
         """
 
         with self._pool.acquire() as conn, conn.cursor() as cur:
@@ -1587,7 +1641,12 @@ class OracleMemoryProvider(MemoryProvider):
                 content = (args.get("content") or "").strip()
                 if not mid or not content:
                     return tool_error("memory_id and content required")
-                vec = None if self._onnx_model else self._embed(content)
+                vec = None
+                vec_model = None
+                if not self._onnx_model:
+                    # No in-database model: embed client-side and keep its origin.
+                    _tagged = self._embed_many_tagged([content])
+                    vec, vec_model = _tagged[0]
                 onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
                 txt = content[:4000]
                 with self._pool.acquire() as conn:
@@ -1596,12 +1655,13 @@ class OracleMemoryProvider(MemoryProvider):
                             try:
                                 sql = f"""
                                     UPDATE {self._table}
-                                    SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3
-                                    WHERE memory_id = :4
+                                    SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3,
+                                        embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
+                                    WHERE memory_id = :5
                                     """  # nosec B608
                                 cur.execute(
                                     sql,
-                                    (content, txt, txt, mid),
+                                    (content, txt, txt, self._onnx_model, mid),
                                 )
                             except Exception as e:
                                 logger.warning(
@@ -1610,25 +1670,28 @@ class OracleMemoryProvider(MemoryProvider):
                                 )
                                 self._onnx_mark_failed()
                                 if vec is None:
-                                    vec = self._embed_external([content])[0]
+                                    ext_vecs, vec_model = self._embed_external_tagged([content])
+                                    vec = ext_vecs[0]
                                 sql = f"""
                                     UPDATE {self._table}
-                                    SET content = :1, embedding = :2, content_txt = :3
-                                    WHERE memory_id = :4
+                                    SET content = :1, embedding = :2, content_txt = :3,
+                                        embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
+                                    WHERE memory_id = :5
                                     """  # nosec B608
                                 cur.execute(
                                     sql,
-                                    (content, vec, txt, mid),
+                                    (content, vec, txt, vec_model, mid),
                                 )
                         else:
                             sql = f"""
                                 UPDATE {self._table}
-                                SET content = :1, embedding = :2, content_txt = :3
-                                WHERE memory_id = :4
+                                SET content = :1, embedding = :2, content_txt = :3,
+                                    embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
+                                WHERE memory_id = :5
                                 """  # nosec B608
                             cur.execute(
                                 sql,
-                                (content, vec, txt, mid),
+                                (content, vec, txt, vec_model, mid),
                             )
                         n = cur.rowcount
                     conn.commit()

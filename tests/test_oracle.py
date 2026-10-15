@@ -424,7 +424,9 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
 
         fake_fallback_vec = array.array("d", [0.2] * 768)
-        provider._embed_external = MagicMock(return_value=[fake_fallback_vec])
+        provider._embed_external_tagged = MagicMock(
+            return_value=([fake_fallback_vec], "openrouter:test-model")
+        )
 
         # First cur.execute fails on ONNX INSERT, second succeeds
         call_count = [0]
@@ -444,7 +446,11 @@ class TestOraclePlugin(unittest.TestCase):
             target="memory",
         )
         self.assertEqual(call_count[0], 2)
-        provider._embed_external.assert_called_with(["test content"])
+        provider._embed_external_tagged.assert_called_with(["test content"])
+        # the fallback INSERT must stamp the external model, not leave it NULL
+        fallback_sql, fallback_binds = mock_cur.execute.call_args[0]
+        self.assertIn("embedding_model", fallback_sql)
+        self.assertIn("openrouter:test-model", fallback_binds)
 
     def test_onnx_update_fallback_to_openrouter(self):
         import array
@@ -461,7 +467,9 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
 
         fake_fallback_vec = array.array("d", [0.3] * 768)
-        provider._embed_external = MagicMock(return_value=[fake_fallback_vec])
+        provider._embed_external_tagged = MagicMock(
+            return_value=([fake_fallback_vec], "openrouter:test-model")
+        )
 
         call_count = [0]
         def side_effect_execute(sql, binds):
@@ -475,6 +483,10 @@ class TestOraclePlugin(unittest.TestCase):
         res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated content"})
         self.assertIn('"result": "updated"', res)
         self.assertEqual(call_count[0], 2)
+        # the fallback UPDATE stamps the external model it actually used
+        fallback_sql, fallback_binds = mock_cur.execute.call_args[0]
+        self.assertIn("embedding_model", fallback_sql)
+        self.assertIn("openrouter:test-model", fallback_binds)
 
     def test_onnx_update_does_not_client_embed_before_sql_attempt(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -514,6 +526,121 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(mock_cur.execute.call_count, 1)
         self.assertIn("UNION ALL", mock_cur.execute.call_args[0][0])
         self.assertEqual(mock_cur.fetchall.call_count, 1)
+
+    # -- embedding provenance (embedding_model / embedding_updated_at) ----------
+
+    def _mocked_conn(self, rowcount=1):
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.__enter__.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_cur.rowcount = rowcount
+        return mock_conn, mock_cur
+
+    def test_insert_stamps_onnx_provenance(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        provider._insert(
+            memory_id="m1", session_id="s1", role="fact",
+            content="provenance content", target="memory",
+        )
+        sql, binds = mock_cur.execute.call_args[0]
+        self.assertIn("embedding_model", sql)
+        self.assertIn("embedding_updated_at", sql)
+        self.assertIn("BGE_BASE_EN_V1_5", binds)
+
+    def test_insert_many_stamps_onnx_provenance(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        provider._insert_many([
+            {"memory_id": "m1", "session_id": "s1", "role": "chunk", "content": "a", "target": "memory"},
+            {"memory_id": "m2", "session_id": "s1", "role": "chunk", "content": "b", "target": "memory"},
+        ])
+        sql, binds_list = mock_cur.executemany.call_args[0]
+        self.assertIn("embedding_model", sql)
+        for binds in binds_list:
+            self.assertEqual(binds[-1], "BGE_BASE_EN_V1_5")
+
+    def test_embed_backfill_update_stamps_provenance(self):
+        import array
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = ""
+        provider._pool = MagicMock()
+        provider._embed_external_tagged = MagicMock(
+            return_value=([array.array("d", [0.1] * 768)], "openrouter:test-model")
+        )
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool.acquire.return_value = mock_conn
+        provider._embed_pending.append(("m1", "queued content"))
+
+        provider._embed_worker_loop()
+
+        sql, binds_list = mock_cur.executemany.call_args[0]
+        self.assertIn("embedding_model", sql)
+        self.assertEqual(binds_list[0][1], "openrouter:test-model")
+
+    def test_embed_many_tagged_reports_backend(self):
+        import array
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = ""  # force the client-side external path
+        provider._pool = MagicMock()
+        fake_vec = array.array("d", [0.1] * 768)
+        provider._embed_external_tagged = MagicMock(
+            return_value=([fake_vec], "openrouter:test-model")
+        )
+
+        result = provider._embed_many_tagged(["hello", "hello"])
+        self.assertEqual([v for v, _m in result], [fake_vec, fake_vec])
+        self.assertEqual([m for _v, m in result], ["openrouter:test-model"] * 2)
+        # the untagged view stays compatible with search-only callers
+        self.assertEqual(provider._embed_many(["hello"]), [fake_vec])
+
+    def test_embed_cache_preserves_provenance(self):
+        import array
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = ""
+        provider._pool = MagicMock()
+        fake_vec = array.array("d", [0.1] * 768)
+        tagged_mock = MagicMock(return_value=([fake_vec], "openrouter:test-model"))
+        provider._embed_external_tagged = tagged_mock
+
+        provider._embed_many_tagged(["same text"])
+        provider._embed_many_tagged(["same text"])
+        self.assertEqual(tagged_mock.call_count, 1)  # second served from cache
+        result = provider._embed_many_tagged(["same text"])
+        self.assertEqual(result[0][1], "openrouter:test-model")
+
+    def test_onnx_update_stamps_provenance(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        result = provider.handle_tool_call(
+            "oracle_update", {"memory_id": "m1", "content": "updated content"}
+        )
+        self.assertIn('"result": "updated"', result)
+        sql, binds = mock_cur.execute.call_args[0]
+        self.assertIn("embedding_model", sql)
+        # binds are positional by order of appearance: model is :4, memory_id :5
+        self.assertEqual(binds[3], "BGE_BASE_EN_V1_5")
+        self.assertEqual(binds[4], "m1")
 
 
 if __name__ == "__main__":
