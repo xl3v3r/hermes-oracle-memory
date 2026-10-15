@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.6.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.7-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
@@ -61,6 +61,12 @@ Embeddings resolve in this order, in-database first:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.7
+
+- Ordered conversation chunking: `_chunk_and_store` chunks each turn independently and stamps `turn_index`, `chunk_index`, `turn_id`, `conv_ref` so history recalls in order (`ORDER BY turn_index, chunk_index` per `conv_ref`). New `scripts/import_conversations_ordered.py` imports ChatGPT/ShareGPT archives in native message order.
+- Embedding provenance: `embedding_model` / `embedding_updated_at` stamped on every write path; external-embed kill-switch enforced on `_embed_external_tagged`.
+- Merged upstream v1.0.6.1 (CLOB LOB normalization fix in `_fetch_rows`, ONNX batching test).
 
 ## What's new in v1.0.6.1
 
