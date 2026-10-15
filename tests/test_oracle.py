@@ -569,7 +569,9 @@ class TestOraclePlugin(unittest.TestCase):
         sql, binds_list = mock_cur.executemany.call_args[0]
         self.assertIn("embedding_model", sql)
         for binds in binds_list:
-            self.assertEqual(binds[-1], "BGE_BASE_EN_V1_5")
+            # model tag sits 5th-from-end: ..., model, turn_index, chunk_index,
+            # turn_id, conv_ref
+            self.assertEqual(binds[-5], "BGE_BASE_EN_V1_5")
 
     def test_embed_backfill_update_stamps_provenance(self):
         import array

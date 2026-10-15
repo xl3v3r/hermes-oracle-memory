@@ -436,6 +436,10 @@ class OracleMemoryProvider(MemoryProvider):
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (content_txt VARCHAR2(4000))'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (embedding_model VARCHAR2(64))'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (embedding_updated_at TIMESTAMP(6))'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (turn_index NUMBER)'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (chunk_index NUMBER)'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (turn_id VARCHAR2(64))'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (conv_ref VARCHAR2(512))'; END;",
         ]
         with self._pool.acquire() as conn, conn.cursor() as cur:
             for sql in stmts:
@@ -996,9 +1000,10 @@ class OracleMemoryProvider(MemoryProvider):
                 INSERT INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
                      created_at, target, metadata, content_txt,
-                     embedding_model, embedding_updated_at)
+                     embedding_model, embedding_updated_at,
+                     turn_index, chunk_index, turn_id, conv_ref)
                 VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9,
-                     :10, SYSTIMESTAMP)
+                     :10, SYSTIMESTAMP, :11, :12, :13, :14)
             """
             binds_list = []
             for row in rows:
@@ -1021,6 +1026,10 @@ class OracleMemoryProvider(MemoryProvider):
                     meta,
                     txt,
                     self._onnx_model,
+                    row.get("turn_index"),
+                    row.get("chunk_index"),
+                    row.get("turn_id"),
+                    row.get("conv_ref"),
                 )
                 binds_list.append(binds)
             try:
@@ -1071,6 +1080,10 @@ class OracleMemoryProvider(MemoryProvider):
                 meta,
                 txt,
                 model,
+                row.get("turn_index"),
+                row.get("chunk_index"),
+                row.get("turn_id"),
+                row.get("conv_ref"),
             )
             binds_list.append(binds)
 
@@ -1081,9 +1094,10 @@ class OracleMemoryProvider(MemoryProvider):
             INSERT INTO {self._table}
                 (memory_id, session_id, agent_id, role, content, embedding,
                  created_at, target, metadata, content_txt,
-                 embedding_model, embedding_updated_at)
+                 embedding_model, embedding_updated_at,
+                 turn_index, chunk_index, turn_id, conv_ref)
             VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9,
-                 :10, SYSTIMESTAMP)
+                 :10, SYSTIMESTAMP, :11, :12, :13, :14)
         """
 
         with self._pool.acquire() as conn, conn.cursor() as cur:
@@ -1732,20 +1746,24 @@ class OracleMemoryProvider(MemoryProvider):
                                 f"limit {_MAX_CHUNK_FILE_BYTES})"
                             )
                         raw_data = p.read_text(encoding="utf-8", errors="replace")
-                        extracted_text = ""
+                        structured_turns: list[dict[str, str]] = []
                         try:
                             parsed_json = json.loads(raw_data)
-                            turns = []
+
+                            def _add_turn(sender: str, val: str, conv_ref: str = "") -> None:
+                                if val:
+                                    structured_turns.append(
+                                        {"sender": sender, "text": val, "conv_ref": conv_ref}
+                                    )
+
                             if isinstance(parsed_json, dict) and "conversations" in parsed_json:
                                 for item in parsed_json["conversations"]:
                                     if isinstance(item, dict):
                                         val = _extract_turn_text(item)
                                         sender = item.get("from") or item.get("role") or ""
-                                        if val:
-                                            prefix = f"[{sender.upper()}]: " if sender else ""
-                                            turns.append(f"{prefix}{val}")
+                                        _add_turn(sender, val)
                                     elif isinstance(item, str) and item.strip():
-                                        turns.append(item.strip())
+                                        _add_turn("", item.strip())
                             elif isinstance(parsed_json, list):
                                 for item in parsed_json:
                                     if isinstance(item, dict):
@@ -1757,41 +1775,42 @@ class OracleMemoryProvider(MemoryProvider):
                                                 header_parts.append(f"Conversation: {title}")
                                             if summary:
                                                 header_parts.append(f"Summary: {summary}")
-                                            turns.append("\n\n".join(header_parts))
+                                            _add_turn("", "\n\n".join(header_parts), title)
 
                                         if "conversations" in item and isinstance(item["conversations"], list):
                                             for sub in item["conversations"]:
                                                 if isinstance(sub, dict):
                                                     val = _extract_turn_text(sub)
                                                     sender = sub.get("from") or sub.get("role") or ""
-                                                    if val:
-                                                        prefix = f"[{sender.upper()}]: " if sender else ""
-                                                        turns.append(f"{prefix}{val}")
+                                                    _add_turn(sender, val, title)
                                                 elif isinstance(sub, str) and sub.strip():
-                                                    turns.append(sub.strip())
+                                                    _add_turn("", sub.strip(), title)
                                         elif "chat_messages" in item and isinstance(item["chat_messages"], list):
                                             for sub in item["chat_messages"]:
                                                 if isinstance(sub, dict):
                                                     val = _extract_turn_text(sub)
                                                     sender = sub.get("sender") or sub.get("from") or sub.get("role") or ""
-                                                    if val:
-                                                        prefix = f"[{sender.upper()}]: " if sender else ""
-                                                        turns.append(f"{prefix}{val}")
+                                                    _add_turn(sender, val, title)
                                                 elif isinstance(sub, str) and sub.strip():
-                                                    turns.append(sub.strip())
+                                                    _add_turn("", sub.strip(), title)
                                         else:
                                             val = _extract_turn_text(item)
                                             sender = item.get("from") or item.get("role") or ""
-                                            if val:
-                                                prefix = f"[{sender.upper()}]: " if sender else ""
-                                                turns.append(f"{prefix}{val}")
+                                            _add_turn(sender, val, title)
                                     elif isinstance(item, str) and item.strip():
-                                        turns.append(item.strip())
-                            if turns:
-                                extracted_text = "\n\n".join(turns)
+                                        _add_turn("", item.strip())
                         except Exception:
-                            extracted_text = ""
+                            structured_turns = []
 
+                        if structured_turns and not content:
+                            mw = int(args.get("max_words") or 80)
+                            ov = int(args.get("overlap") or 10)
+                            ids = self._chunk_and_store("", mw, ov, turns=structured_turns)
+                            return json.dumps(
+                                {"result": "chunked", "count": len(ids), "memory_ids": ids}
+                            )
+
+                        extracted_text = "\n\n".join(t["text"] for t in structured_turns)
                         file_text = extracted_text if extracted_text else raw_data
                         if not content:
                             content = file_text.strip()
@@ -1813,79 +1832,119 @@ class OracleMemoryProvider(MemoryProvider):
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
 
-    def _chunk_and_store(self, content: str, max_words: int, overlap: int) -> list:
-        if not self._pool:
-            raise RuntimeError(self._init_error or "pool not initialized")
+    def _chunk_text(self, text: str, max_words: int, overlap: int) -> list:
+        """Split one text unit into chunks (UTL_TO_CHUNKS in-DB, local fallback)."""
         chunks: list[str] = []
-        with self._pool.acquire() as conn:
-            with conn.cursor() as cur:
-                try:
-                    import oracledb
+        if self._pool:
+            with self._pool.acquire() as conn:
+                with conn.cursor() as cur:
+                    try:
+                        import oracledb
 
-                    # oracledb thin mode returns CLOB chunks as str natively;
-                    # do not map to DB_TYPE_LONG (silent 32,760-byte truncation).
-                    cur.setinputsizes(oracledb.DB_TYPE_CLOB)
+                        # oracledb thin mode returns CLOB chunks as str natively;
+                        # do not map to DB_TYPE_LONG (silent 32,760-byte truncation).
+                        cur.setinputsizes(oracledb.DB_TYPE_CLOB)
 
-                    cur.execute(
-                        """
-                        SELECT COLUMN_VALUE FROM TABLE(
-                          DBMS_VECTOR.UTL_TO_CHUNKS(
-                            TO_CLOB(:1),
-                            JSON(:2)
-                          )
-                        )
-                        """,
-                        (
-                            content,
-                            json.dumps(
-                                {
-                                    "by": "words",
-                                    "max": max_words,
-                                    "overlap": overlap,
-                                    "split": "recursively",
-                                }
-                            ),
-                        ),
-                    )
-
-                    for row in cur:
-                        val = row[0]
-                        if not val:
-                            continue
-                        text = str(val)
-                        try:
-                            payload = json.loads(text)
-                            text = (
-                                payload.get("chunk_data")
-                                or payload.get("chunk_text")
-                                or text
+                        cur.execute(
+                            """
+                            SELECT COLUMN_VALUE FROM TABLE(
+                              DBMS_VECTOR.UTL_TO_CHUNKS(
+                                TO_CLOB(:1),
+                                JSON(:2)
+                              )
                             )
-                        except Exception:
-                            pass
-                        if text:
-                            chunks.append(str(text))
-                except Exception as e:
-                    logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
+                            """,
+                            (
+                                text,
+                                json.dumps(
+                                    {
+                                        "by": "words",
+                                        "max": max_words,
+                                        "overlap": overlap,
+                                        "split": "recursively",
+                                    }
+                                ),
+                            ),
+                        )
+
+                        for row in cur:
+                            val = row[0]
+                            if not val:
+                                continue
+                            ctext = str(val)
+                            try:
+                                payload = json.loads(ctext)
+                                ctext = (
+                                    payload.get("chunk_data")
+                                    or payload.get("chunk_text")
+                                    or ctext
+                                )
+                            except Exception:
+                                pass
+                            if ctext:
+                                chunks.append(str(ctext))
+                    except Exception as e:
+                        logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
         if not chunks:
-            words = content.split()
+            words = text.split()
             step = max(1, max_words - overlap)
             for i in range(0, len(words), step):
                 chunks.append(" ".join(words[i : i + max_words]))
+        return chunks
+
+    def _chunk_and_store(
+        self,
+        content: str,
+        max_words: int,
+        overlap: int,
+        turns: list[dict[str, Any]] | None = None,
+    ) -> list:
+        """Chunk one text unit or an ordered list of conversation turns.
+
+        Each supplied turn ({"text", "sender", "conv_ref", "turn_id"}) is chunked
+        independently and every chunk is stamped with turn_index / chunk_index /
+        turn_id / conv_ref, so the source conversation can be reassembled in
+        order with `ORDER BY turn_index, chunk_index`. Passing only `content`
+        keeps the old single-unit behaviour (one turn, turn_index 0).
+        """
+        if not self._pool:
+            raise RuntimeError(self._init_error or "pool not initialized")
+        if turns is None:
+            turns = [{"text": content}] if content else []
         ids = []
         rows = []
-        for i, ch in enumerate(chunks):
-            mid = f"chk_{uuid.uuid4().hex[:16]}"
-            rows.append({
-                "memory_id": mid,
-                "session_id": self._session_id,
-                "role": "chunk",
-                "content": ch,
-                "target": "memory",
-                "metadata": {"kind": "chunk", "index": i},
-            })
-            ids.append(mid)
+        for t_index, turn in enumerate(turns):
+            text = (turn.get("text") or "").strip()
+            if not text:
+                continue
+            sender = turn.get("sender") or ""
+            conv_ref = (turn.get("conv_ref") or "")[:512] or None
+            turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
+            for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap)):
+                mid = f"chk_{uuid.uuid4().hex[:16]}"
+                rows.append({
+                    "memory_id": mid,
+                    "session_id": self._session_id,
+                    "role": "chunk",
+                    "content": ch,
+                    "target": "memory",
+                    "metadata": {
+                        "kind": "chunk",
+                        "index": t_index,
+                        "chunk_index": c_index,
+                        "turn_id": turn_id,
+                        "conv_ref": conv_ref,
+                        "sender": sender or None,
+                    },
+                    "turn_index": t_index,
+                    "chunk_index": c_index,
+                    "turn_id": turn_id,
+                    "conv_ref": conv_ref,
+                })
+                ids.append(mid)
 
-        self._insert_many(rows)
+        if rows:
+            self._insert_many(rows)
         return ids
 
     def shutdown(self) -> None:

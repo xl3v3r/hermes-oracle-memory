@@ -67,8 +67,11 @@ class TestOracleChunkAndImport(unittest.TestCase):
             res = self.provider.handle_tool_call("oracle_chunk", {"file_path": tf_path})
             parsed = json.loads(res)
             self.assertEqual(parsed["result"], "chunked")
-            expected_text = "[HUMAN]: How do I configure Oracle?\n\n[GPT]: Use oracledb with wallet."
-            self.provider._chunk_and_store.assert_called_once_with(expected_text, 80, 10)
+            expected_turns = [
+                {"sender": "human", "text": "How do I configure Oracle?", "conv_ref": ""},
+                {"sender": "gpt", "text": "Use oracledb with wallet.", "conv_ref": ""},
+            ]
+            self.provider._chunk_and_store.assert_called_once_with("", 80, 10, turns=expected_turns)
         finally:
             os.unlink(tf_path)
 
@@ -89,8 +92,14 @@ class TestOracleChunkAndImport(unittest.TestCase):
             res = self.provider.handle_tool_call("oracle_chunk", {"file_path": tf_path})
             parsed = json.loads(res)
             self.assertEqual(parsed["result"], "chunked")
-            expected_text = "[SYSTEM]: Conversation: ITAHM acronym meaning\n\nSummary: Overview of abbreviations\n\nUUID: 6912"
-            self.provider._chunk_and_store.assert_called_once_with(expected_text, 80, 10)
+            expected_turns = [
+                {
+                    "sender": "system",
+                    "text": "Conversation: ITAHM acronym meaning\n\nSummary: Overview of abbreviations\n\nUUID: 6912",
+                    "conv_ref": "",
+                }
+            ]
+            self.provider._chunk_and_store.assert_called_once_with("", 80, 10, turns=expected_turns)
         finally:
             os.unlink(tf_path)
 
@@ -111,8 +120,11 @@ class TestOracleChunkAndImport(unittest.TestCase):
             res = self.provider.handle_tool_call("oracle_chunk", {"file_path": tf_path})
             parsed = json.loads(res)
             self.assertEqual(parsed["result"], "chunked")
-            expected_text = "[USER]: Turn 1\n\n[ASSISTANT]: Turn 2"
-            self.provider._chunk_and_store.assert_called_once_with(expected_text, 80, 10)
+            expected_turns = [
+                {"sender": "user", "text": "Turn 1", "conv_ref": ""},
+                {"sender": "assistant", "text": "Turn 2", "conv_ref": ""},
+            ]
+            self.provider._chunk_and_store.assert_called_once_with("", 80, 10, turns=expected_turns)
         finally:
             os.unlink(tf_path)
 
@@ -142,13 +154,17 @@ class TestOracleChunkAndImport(unittest.TestCase):
             res = self.provider.handle_tool_call("oracle_chunk", {"file_path": tf_path})
             parsed = json.loads(res)
             self.assertEqual(parsed["result"], "chunked")
-            # Should include conversation header and clean assistant text
-            call_args = self.provider._chunk_and_store.call_args[0][0]
-            self.assertIn("Conversation: Session Alpha", call_args)
-            self.assertIn("Summary: Alpha summary", call_args)
-            self.assertIn("[HUMAN]: What is 2+2?", call_args)
-            self.assertIn("[ASSISTANT]: The answer is 4.", call_args)
-            self.assertNotIn("Internal thought", call_args)
+            # Should include conversation header and clean assistant text as
+            # ordered turns stamped with the conversation title as conv_ref.
+            turns = self.provider._chunk_and_store.call_args[1]["turns"]
+            texts = [t["text"] for t in turns]
+            self.assertIn("Conversation: Session Alpha", texts[0])
+            self.assertIn("Summary: Alpha summary", texts[0])
+            self.assertEqual(turns[1]["text"], "What is 2+2?")
+            self.assertEqual(turns[2]["text"], "The answer is 4.")
+            self.assertNotIn("Internal thought", " ".join(texts))
+            for t in turns:
+                self.assertEqual(t["conv_ref"], "Session Alpha")
         finally:
             os.unlink(tf_path)
 
