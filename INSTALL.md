@@ -1,7 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.0.7-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.7.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
+
+> **CRITICALITY NOTICE**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
@@ -130,12 +132,12 @@ Configure your database connection, wallet path, and fallback embedding provider
 # =============================================================================
 OCI_DB_USER=ADMIN
 OCI_DB_PASSWORD="YourDatabasePasswordHere"
-OCI_DB_DSN="(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=adb.us-ashburn-1.oraclecloud.com))(CONNECT_DATA=(SERVICE_NAME=xxxx_high.adb.oraclecloud.com))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
+OCI_DB_DSN="(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=adb.us-ashburn-1.oraclecloud.com))(CONNECT_DATA=(SERVICE_NAME=xxxx_low.adb.oraclecloud.com))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
 
 # =============================================================================
 # mTLS Wallet Configuration (Required for mTLS connections)
 # =============================================================================
-OCI_WALLET_LOCATION=/home/rocky/.oci/wallet
+OCI_WALLET_LOCATION=~/.oci/wallet
 OCI_WALLET_PASSWORD="YourWalletPassword"
 
 # =============================================================================

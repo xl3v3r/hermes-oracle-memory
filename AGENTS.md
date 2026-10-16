@@ -1,14 +1,14 @@
 # Developer & Agent Guidelines (AGENTS.md)
 
-Welcome! This file provides context, coding conventions, testing procedures, and architectural guidelines for autonomous agents (such as Google Labs Jules at [jules.google.com](https://jules.google.com)) and developers contributing to `hermes-oracle-memory`.
+Welcome! This file provides context, coding conventions, testing procedures, and architectural guidelines for autonomous agents and developers contributing to `hermes-oracle-memory`.
 
 ---
 
 ## 1. Project Overview
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for **Hermes Agent**. It integrates with **Oracle Autonomous AI Database 26ai (ADB)** to provide:
-- Hybrid memory recall combining `VECTOR(1536, FLOAT64)` IVF neighbor-partition search and Oracle Text `CONTAINS` index.
-- Batched embedding generation (OCI GenAI Cohere / OpenRouter).
+- Hybrid memory recall combining `VECTOR(768, FLOAT32)` IVF neighbor-partition search and Oracle Text `CONTAINS` index.
+- In-database ONNX embeddings (`BGE_BASE_EN_V1_5`) with fallback to OCI GenAI Cohere / OpenRouter.
 - In-database text chunking (`DBMS_VECTOR.UTL_TO_CHUNKS`).
 - Tool execution for Hermes memory recall (`oracle_search`, `oracle_add`, `oracle_update`, `oracle_delete`, `oracle_chunk`).
 
@@ -18,17 +18,29 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 
 ```text
 ├── AGENTS.md               # Guidelines and instructions for AI agents and developers
+├── INSTALL.md              # Detailed installation and configuration guide
+├── LICENSE                 # Business Source License 1.1
+├── MANIFEST.in             # Source distribution manifest
 ├── README.md               # Project documentation and usage guide
+├── RELEASE_NOTES_1.0.7.1.md# Release notes for v1.0.7.1
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration
-├── .jules/
-│   └── bolt.md             # Jules learning repository (e.g. database batching notes)
-└── tests/
+├── scripts/                # Utility scripts (verification, backfill, ONNX setup)
+│   ├── audit_embeddings.py
+│   ├── backfill_embeddings.py
+│   ├── import_conversations_ordered.py
+│   ├── reembed_embeddings.py
+│   ├── setup_onnx_model.py
+│   └── verify_provider.py
+├── skills/                 # Hermes agent skills
+│   └── oracle-import/      # Bulk conversation and archive ingestion skill
+└── tests/                  # Unit test suite (91 tests)
     ├── conftest.py         # Test configuration & mocks for Hermes host and DB drivers
     ├── test_format_prefetch.py # Prefetch formatting tests
     ├── test_init.py        # Gateway turn detection and config schema tests
     ├── test_oracle.py      # Core provider unit tests, edge cases, is_available tests
+    ├── test_oracle_import.py# Conversation import and chunking tests
     └── test_plugin.py      # Tool schema and unavailable_reason tests
 ```
 
@@ -65,10 +77,3 @@ All tests in `tests/` must pass cleanly without network access or active databas
 2. **Batched Execution**: Always use `cursor.executemany` for batch database updates (e.g. embedding backfill) to avoid N+1 query overhead.
 3. **Type Safety & Defensive Validation**: Ensure lifecycle methods (`initialize`, `sync_turn`, `prefetch`, `on_memory_write`, `on_session_end`) guard against non-string or `MagicMock` inputs.
 
----
-
-## 6. Interacting with Jules (jules.google.com)
-
-- **PR Feedback**: Reply directly to review comments or threads on PRs opened by Jules. Jules will process the feedback and push updated commits.
-- **Mentions**: Mention `@jules` (or `@google-labs-jules[bot]`) in comments or issues to trigger tasks.
-- **Labels**: Add the `jules` label to any GitHub issue to request autonomous implementation.

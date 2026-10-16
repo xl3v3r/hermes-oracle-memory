@@ -1,11 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.7-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.7.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
+
+> **CRITICALITY NOTICE**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
+
+> **CRITICALITY NOTICE**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
 
 ### Recommended — Hermes plugin manager
 
@@ -61,6 +65,20 @@ Embeddings resolve in this order, in-database first:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.7.1
+
+- **Criticality Notice**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
+- **Oracle-First System Prompt & Dynamic Enforcement**:
+  - Injected header: `# Oracle 26ai Memory (Primary Store)`.
+  - Rule 1 — ORACLE-FIRST SEARCH: `oracle_search` must always be consulted first before answering queries that depend on prior context.
+  - Rule 2 — ORACLE-FIRST FACT SINK: `oracle_add` is the primary sink for all lasting facts and user details (unlimited storage).
+  - Rule 3 — ANTI-CONFLATION & NO CROSS-STORE DELETION: Local `MEMORY.md` is strictly limited to 1,600 chars for bootstrap notes only. Never pass `chk_*` or `fact_*` IDs to the local memory tool.
+  - Rule 4 — BATCH & DOCUMENT STORAGE: Atomic facts via `oracle_add`, long documents/logs via `oracle_chunk`.
+- **Batch Fact Ingestion**: `oracle_add` accepts `facts: list[str] | str` as well as `content: list[str] | str` to persist multiple atomic facts in a single call.
+- **Tool Schema Anti-Conflation**: Schemas across `oracle_search`, `oracle_add`, `oracle_update`, and `oracle_delete` explicitly instruct against using local memory tools for Oracle entries.
+- **ADB Service Tier Migration & Pool Optimization**: Automatic case-insensitive normalization of `_high` DSN service tiers to `_low`. SessionPool defaults configured to `min=1, max=3, increment=1, threaded=True, getmode=oracledb.POOL_GETMODE_WAIT, timeout=5, wait_timeout=5`.
+- **OS-Agnostic Drop-In Design & Zero Drift**: Zero hardcoded OS or user paths; byte-for-byte parity between repository and installed plugin directory.
 
 ## What's new in v1.0.7
 

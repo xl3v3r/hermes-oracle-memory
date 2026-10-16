@@ -37,7 +37,7 @@ def main():
         max_length=512,
     )
     
-    local_onnx_path = Path("/home/rocky/.cache/bge_base_en_v1_5_sliced.onnx")
+    local_onnx_path = Path.home() / ".cache" / "bge_base_en_v1_5_sliced.onnx"
     if local_onnx_path.exists():
         logger.info("Loading cached ONNX pipeline from %s", local_onnx_path)
         model_bytes = local_onnx_path.read_bytes()

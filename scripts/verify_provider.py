@@ -171,6 +171,22 @@ def main() -> None:
         print(f"oracle_update response: {upd_out}")
         assert "updated" in upd_out.lower(), "Failed to update fact"
 
+    # 8b. Verify live batch fact ingestion via oracle_add
+    print("Testing handle_tool_call oracle_add with batch facts...")
+    batch_facts = [
+        f"Batch test fact A {uuid.uuid4().hex[:8]}: Hermes uses Oracle 26ai",
+        f"Batch test fact B {uuid.uuid4().hex[:8]}: ADB provides in-database ONNX",
+    ]
+    batch_out = provider.handle_tool_call("oracle_add", {
+        "facts": batch_facts,
+        "target": "memory",
+    })
+    print(f"oracle_add batch response: {batch_out}")
+    batch_data = json.loads(batch_out)
+    assert batch_data.get("count") == 2, f"Expected 2 batch facts stored, got {batch_data.get('count')}"
+    assert len(batch_data.get("memory_ids", [])) == 2, "Expected 2 memory IDs returned"
+    print("Batch facts insertion verified.")
+
     # 9. Verify live fallback to OpenRouter when ONNX model is unavailable
     print("Testing live fallback from broken ONNX to OpenRouter 768-d...")
     orig_onnx = provider._onnx_model

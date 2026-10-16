@@ -1,8 +1,13 @@
 include plugin.yaml
 include README.md
+include INSTALL.md
+include RELEASE_NOTES_1.0.7.1.md
 include AGENTS.md
+include LICENSE
+include CLA.md
 recursive-include skills *
 recursive-include scripts *
 exclude test_oracle.py
 exclude pytest.ini
 recursive-exclude tests *
+

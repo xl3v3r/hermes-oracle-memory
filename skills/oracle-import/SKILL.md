@@ -1,7 +1,7 @@
 ---
 name: oracle-import
 description: Import conversation archives and documents into Oracle Autonomous AI Database 26ai memory without hitting LLM rate limits.
-version: 1.0.7
+version: 1.0.7.1
 author: Hermes Community
 metadata:
   hermes:
@@ -25,7 +25,7 @@ Ensure ADB credentials and wallet location are configured in `~/.hermes/.env` or
 
 - `OCI_DB_USER` — ADB username (e.g. `ADMIN`)
 - `OCI_DB_PASSWORD` — ADB password
-- `OCI_DB_DSN` — TNS alias or connect descriptor string (e.g. `dbname_high`)
+- `OCI_DB_DSN` — TNS alias or connect descriptor string (e.g. `dbname_low`)
 - `OCI_WALLET_LOCATION` (optional) — Path to the wallet directory containing `cwallet.sso` and `tnsnames.ora`. Auto-detected at `~/.oci/wallet` and `~/.hermes/oracle_wallet`.
 - `OCI_WALLET_PASSWORD` (optional) — Wallet password if encrypted.
 - `python-oracledb` >= 4.0.2 installed in the environment.
@@ -38,7 +38,7 @@ Hermes agents can invoke `oracle_chunk` with a local `file_path` directly. Inste
 
 ```json
 {
-  "file_path": "/home/rocky/sharedconv/oracle_import.json",
+  "file_path": "~/sharedconv/oracle_import.json",
   "max_words": 1000,
   "overlap": 10
 }
@@ -50,10 +50,10 @@ For large archives (e.g. hundreds of conversations or >10 MB), run the standalon
 
 ```bash
 # Ingest ShareGPT, Claude, or summary archive
-python3 skills/oracle-import/scripts/import_conversations.py /home/rocky/sharedconv/oracle_import.json
+python3 skills/oracle-import/scripts/import_conversations.py ~/sharedconv/oracle_import.json
 
 # Specify batch size and session ID
-python3 skills/oracle-import/scripts/import_conversations.py /home/rocky/sharedconv/conversations.json --batch-size 50 --session-id "archive-2026-06"
+python3 skills/oracle-import/scripts/import_conversations.py ~/sharedconv/conversations.json --batch-size 50 --session-id "archive-2026-06"
 ```
 
 ## Quick Reference

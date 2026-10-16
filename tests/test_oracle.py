@@ -644,6 +644,242 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(binds[3], "BGE_BASE_EN_V1_5")
         self.assertEqual(binds[4], "m1")
 
+    # -- Oracle-first behavior and _low pool tests --------------------------------
+
+    def test_version(self):
+        self.assertEqual(oracle_plugin.__version__, "1.0.7.1")
+
+    def test_system_prompt_block_oracle_first_rules(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._agent_id = "test-agent"
+        block = provider.system_prompt_block()
+        self.assertIn("# Oracle 26ai Memory (Primary Store)", block)
+        self.assertIn("Rule 1 — ORACLE-FIRST SEARCH", block)
+        self.assertIn("Rule 2 — ORACLE-FIRST FACT SINK", block)
+        self.assertIn("Rule 3 — ANTI-CONFLATION & NO CROSS-STORE DELETION", block)
+        self.assertIn("DO NOT CONFLATE WITH LOCAL MEMORY", block)
+        self.assertIn("Rule 4 — BATCH & DOCUMENT STORAGE", block)
+        self.assertIn("1,600-character", block)
+
+    def test_tool_schemas_oracle_first(self):
+        schemas = {s["name"]: s for s in oracle_plugin.TOOL_SCHEMAS}
+        self.assertIn("oracle_search", schemas)
+        self.assertIn("oracle_add", schemas)
+        # Search must instruct consulting first before local memory
+        self.assertIn("ALWAYS consult oracle_search FIRST", schemas["oracle_search"]["description"])
+        # Add must instruct primary sink and mention unlimited storage / not using local memory
+        self.assertIn("Primary sink for persistent facts", schemas["oracle_add"]["description"])
+        self.assertIn("facts", schemas["oracle_add"]["parameters"]["properties"])
+
+    def test_oracle_add_single_fact(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {"content": "User prefers python3"})
+        data = json.loads(res)
+        self.assertEqual(data["result"], "Fact stored.")
+        self.assertTrue(data["memory_id"].startswith("fact_"))
+        provider._insert.assert_called_once()
+        kwargs = provider._insert.call_args[1]
+        self.assertEqual(kwargs["content"], "User prefers python3")
+        self.assertEqual(kwargs["target"], "memory")
+
+    def test_oracle_add_batch_facts_via_facts_parameter(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {
+            "facts": ["Fact 1: server is Linux", "Fact 2: Python 3.12 active"],
+            "target": "memory",
+        })
+        data = json.loads(res)
+        self.assertIn("Batch facts stored (2)", data["result"])
+        self.assertEqual(len(data["memory_ids"]), 2)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(provider._insert.call_count, 2)
+
+    def test_oracle_add_batch_facts_via_content_list(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {
+            "content": ["Fact A", "Fact B", "Fact C"],
+            "target": "user",
+        })
+        data = json.loads(res)
+        self.assertEqual(data["count"], 3)
+        self.assertEqual(provider._insert.call_count, 3)
+
+    def test_oracle_add_stringified_json_array(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {
+            "facts": '["Fact X: parsed from JSON string", "Fact Y: JSON string"]',
+            "target": "memory",
+        })
+        data = json.loads(res)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(provider._insert.call_count, 2)
+
+    def test_oracle_add_content_stringified_json_array(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {
+            "content": '["Fact Alpha", "Fact Beta"]',
+        })
+        data = json.loads(res)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(provider._insert.call_count, 2)
+
+    def test_oracle_add_dict_facts(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {
+            "facts": [{"fact": "Dict fact 1"}, {"text": "Dict fact 2"}],
+            "target": "invalid_target",
+        })
+        data = json.loads(res)
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(provider._insert.call_count, 2)
+        # Invalid target must normalize to "memory"
+        self.assertEqual(provider._insert.call_args_list[0][1]["target"], "memory")
+        self.assertEqual(provider._insert.call_args_list[0][1]["content"], "Dict fact 1")
+        self.assertEqual(provider._insert.call_args_list[1][1]["content"], "Dict fact 2")
+
+    def test_oracle_add_missing_content(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        with patch.object(oracle_plugin, "tool_error", side_effect=lambda msg: f"Error: {msg}"):
+            res = provider.handle_tool_call("oracle_add", {})
+            self.assertIn("Missing required parameter", res)
+
+    def test_oracle_add_whitespace_and_empty_facts(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        with patch.object(oracle_plugin, "tool_error", side_effect=lambda msg: f"Error: {msg}"):
+            res = provider.handle_tool_call("oracle_add", {"facts": ["  ", ""]})
+            self.assertIn("Missing required parameter", res)
+            res2 = provider.handle_tool_call("oracle_add", {"facts": []})
+            self.assertIn("Missing required parameter", res2)
+
+    def test_oracle_add_facts_as_string(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._session_id = "sess-1"
+        provider._insert = MagicMock()
+
+        res = provider.handle_tool_call("oracle_add", {"facts": "User prefers Linux"})
+        data = json.loads(res)
+        self.assertEqual(data["result"], "Fact stored.")
+        self.assertEqual(provider._insert.call_count, 1)
+
+    def test_tool_schemas_update_delete_anti_conflation(self):
+        schemas = {s["name"]: s for s in oracle_plugin.TOOL_SCHEMAS}
+        self.assertIn("oracle_update", schemas)
+        self.assertIn("oracle_delete", schemas)
+        self.assertIn("Never use the local memory tool", schemas["oracle_update"]["description"])
+        self.assertIn("chk_* or fact_*", schemas["oracle_update"]["description"])
+        self.assertIn("Never use the local memory tool", schemas["oracle_delete"]["description"])
+        self.assertIn("chk_* or fact_*", schemas["oracle_delete"]["description"])
+
+    def test_dsn_high_to_low_normalization_and_pool_limits(self):
+        secrets = {
+            "OCI_DB_USER": "TESTUSER",
+            "OCI_DB_PASSWORD": "TESTPASSWORD",
+            "OCI_DB_DSN": "db_high",
+        }
+        with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)):
+            with patch("oracledb.SessionPool") as mock_session_pool:
+                provider = oracle_plugin.OracleMemoryProvider()
+                provider._verify_schema = MagicMock()
+                provider._ensure_schema = MagicMock()
+                provider._ensure_write_worker = MagicMock()
+                provider.initialize("test-session")
+                self.assertEqual(provider._dsn, "db_low")
+                self.assertTrue(mock_session_pool.called)
+                pool_kwargs = mock_session_pool.call_args[1]
+                self.assertEqual(pool_kwargs["min"], 1)
+                self.assertEqual(pool_kwargs["max"], 3)
+                self.assertEqual(pool_kwargs["dsn"], "db_low")
+
+    def test_dsn_high_descriptor_to_low_normalization(self):
+        secrets = {
+            "OCI_DB_USER": "TESTUSER",
+            "OCI_DB_PASSWORD": "TESTPASSWORD",
+            "OCI_DB_DSN": "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=myadb_high.adb.oraclecloud.com)))",
+        }
+        with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)):
+            with patch("oracledb.SessionPool") as mock_session_pool:
+                provider = oracle_plugin.OracleMemoryProvider()
+                provider._verify_schema = MagicMock()
+                provider._ensure_schema = MagicMock()
+                provider._ensure_write_worker = MagicMock()
+                provider.initialize("test-session")
+                self.assertIn("myadb_low.adb.oraclecloud.com", provider._dsn)
+                self.assertNotIn("myadb_high", provider._dsn)
+
+    def test_dsn_uppercase_high_normalization(self):
+        secrets = {
+            "OCI_DB_USER": "TESTUSER",
+            "OCI_DB_PASSWORD": "TESTPASSWORD",
+            "OCI_DB_DSN": "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=MYADB_HIGH.adb.oraclecloud.com)))",
+        }
+        with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)):
+            with patch("oracledb.SessionPool") as mock_session_pool:
+                provider = oracle_plugin.OracleMemoryProvider()
+                provider._verify_schema = MagicMock()
+                provider._ensure_schema = MagicMock()
+                provider._ensure_write_worker = MagicMock()
+                provider.initialize("test-session")
+                self.assertIn("MYADB_low.adb.oraclecloud.com", provider._dsn)
+                self.assertNotIn("MYADB_HIGH", provider._dsn)
+
+    def test_zero_drift_with_installed_plugin(self):
+        import filecmp
+        import os
+        from pathlib import Path
+        repo_dir = Path(__file__).resolve().parent.parent
+        plugin_dir = Path.home() / ".hermes" / "plugins" / "oracle"
+        # Cleanup scratch verify_drift.py if present
+        scratch = repo_dir / "scripts" / "verify_drift.py"
+        if scratch.exists():
+            scratch.unlink()
+        if not plugin_dir.exists():
+            return
+        
+        ignored_patterns = {
+            ".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist",
+            "hermes_oracle_memory.egg-info", "uv.lock", "backups", "backfills",
+        }
+        
+        for root, dirs, files in os.walk(repo_dir):
+            dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
+            for f in files:
+                if f.endswith((".pyc", ".lock")):
+                    continue
+                full_path = Path(root) / f
+                rel = full_path.relative_to(repo_dir)
+                plugin_file = plugin_dir / rel
+                self.assertTrue(plugin_file.exists(), f"File missing in plugin: {rel}")
+                self.assertTrue(filecmp.cmp(str(full_path), str(plugin_file), shallow=False), f"Drift detected in {rel}")
+
 
 if __name__ == "__main__":
     unittest.main()
+

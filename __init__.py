@@ -27,6 +27,8 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+__version__ = "1.0.7.1"
+
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
 _EMBED_MODEL = "qwen/qwen3-embedding-4b"
@@ -67,10 +69,10 @@ TOOL_SCHEMAS = [
     {
         "name": "oracle_search",
         "description": (
-            "Search Oracle 26ai persistent memory (VECTOR cosine + Oracle Text + JSON). "
-            "Use before answering questions that depend on prior facts, preferences, "
-            "decisions, people, or projects. mode=hybrid (default) ranks both vector "
-            "and keyword; vector = semantic only; text = CONTAINS only."
+            "Primary memory search. Search Oracle 26ai persistent memory (VECTOR cosine + Oracle Text + JSON). "
+            "ALWAYS consult oracle_search FIRST before answering questions that depend on prior facts, "
+            "preferences, decisions, people, or projects, before falling back to local memory. "
+            "mode=hybrid (default) ranks both vector and keyword; vector = semantic only; text = CONTAINS only."
         ),
         "parameters": {
             "type": "object",
@@ -97,26 +99,34 @@ TOOL_SCHEMAS = [
     {
         "name": "oracle_add",
         "description": (
-            "Store a durable fact in Oracle 26ai (embedded + Text + JSON indexed). "
-            "Call when the user states a lasting preference, correction, decision, "
-            "or personal detail. Skip chit-chat and facts already stored."
+            "Primary sink for persistent facts in Oracle 26ai (unlimited storage, embedded + Text + JSON indexed). "
+            "Call oracle_add as the primary store whenever storing durable facts, preferences, corrections, "
+            "decisions, environment details, or batch knowledge. Do NOT use local 1600-char memory for facts "
+            "that belong in Oracle. Accepts a single fact string, list of facts, or 'facts' array."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "The fact to store."},
+                "content": {
+                    "type": "string",
+                    "description": "The fact (or facts) to store. Can be a single declarative fact or multiple facts.",
+                },
+                "facts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of facts to store in batch.",
+                },
                 "target": {
                     "type": "string",
                     "enum": ["memory", "user"],
-                    "description": "memory = environment/conventions; user = who they are.",
+                    "description": "memory = environment/conventions/projects; user = who they are/preferences.",
                 },
             },
-            "required": ["content"],
         },
     },
     {
         "name": "oracle_update",
-        "description": "Replace the text of an existing memory by memory_id from oracle_search.",
+        "description": "Replace the text of an existing Oracle memory by memory_id (e.g. chk_* or fact_*) from oracle_search. Never use the local memory tool to edit Oracle entries.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -128,7 +138,7 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "oracle_delete",
-        "description": "Delete a memory by memory_id from oracle_search.",
+        "description": "Delete an Oracle memory by memory_id (e.g. chk_* or fact_*) from oracle_search. Never use the local memory tool to remove Oracle entries.",
         "parameters": {
             "type": "object",
             "properties": {"memory_id": {"type": "string"}},
@@ -167,12 +177,22 @@ TOOL_SCHEMAS = [
 ]
 
 _PROMPT_BODY = (
-    "Oracle AI Database 26ai is the primary persistent memory. "
-    "Call oracle_search before answering anything that could depend on prior context "
-    "(preferences, facts, history, people, projects, decisions). "
-    "Use oracle_add the moment a lasting fact is stated. "
-    "oracle_update / oracle_delete manage by memory_id. "
-    "oracle_chunk splits long documents via in-database UTL_TO_CHUNKS."
+    "Oracle AI Database 26ai is your PRIMARY and UNLIMITED persistent memory backend.\n"
+    "CRITICAL MEMORY RULES:\n"
+    "Rule 1 — ORACLE-FIRST SEARCH: ALWAYS call `oracle_search` FIRST before answering any questions that depend on "
+    "prior context, user preferences, configurations, architecture, credentials, people, or project history. "
+    "Never assume a fact is unknown or rely solely on local prompt buffers without searching Oracle memory.\n"
+    "Rule 2 — ORACLE-FIRST FACT SINK: `oracle_add` is the PRIMARY SINK for all lasting facts, user details, "
+    "decisions, preferences, and session learnings. Oracle storage is UNLIMITED and persists across all sessions.\n"
+    "Rule 3 — ANTI-CONFLATION & NO CROSS-STORE DELETION (DO NOT CONFLATE WITH LOCAL MEMORY): Local MEMORY.md (the built-in memory tool) has a hard 1,600-character "
+    "budget intended ONLY for minimal bootstrap notes. NEVER attempt to save general operational facts, project "
+    "knowledge, or batch summaries into the 1,600-char local memory store. When extracting facts or asked to "
+    "commit information to memory, ALWAYS route facts to Oracle 26ai via `oracle_add`. Furthermore, NEVER use "
+    "the local memory tool to remove or edit Oracle entries: identifiers starting with `chk_` or `fact_` belong "
+    "exclusively to Oracle 26ai and must be managed via `oracle_delete` and `oracle_update`.\n"
+    "Rule 4 — BATCH & DOCUMENT STORAGE: Use `oracle_add` (single facts or batch fact lists) for atomic knowledge; "
+    "use `oracle_chunk` for documents, logs, or conversation exports via in-database UTL_TO_CHUNKS. "
+    "Manage existing entries via `oracle_update` and `oracle_delete` using memory_id."
 )
 
 
@@ -343,6 +363,11 @@ class OracleMemoryProvider(MemoryProvider):
         password = pwd_val if isinstance(pwd_val, str) else ""
         dsn_val = get_secret("OCI_DB_DSN")
         self._dsn = dsn_val if isinstance(dsn_val, str) else ""
+        if self._dsn:
+            # Auto-normalize _high service tier to _low for conservative pool and serial query safety
+            self._dsn = _re.sub(r"([a-zA-Z0-9_]+)_high\b", r"\1_low", self._dsn, flags=_re.IGNORECASE)
+            if "_high.adb.oraclecloud.com" in self._dsn.lower():
+                self._dsn = _re.sub(r"_high\.adb\.oraclecloud\.com", "_low.adb.oraclecloud.com", self._dsn, flags=_re.IGNORECASE)
         if not password or not self._dsn:
             self._init_error = "OCI_DB_PASSWORD or OCI_DB_DSN missing"
             logger.error("Oracle memory: %s", self._init_error)
@@ -354,8 +379,8 @@ class OracleMemoryProvider(MemoryProvider):
                 "user": self._user,
                 "password": password,
                 "dsn": self._dsn,
-                "min": 2,
-                "max": 8,
+                "min": 1,
+                "max": 3,
                 "increment": 1,
                 "threaded": True,
                 "getmode": oracledb.POOL_GETMODE_WAIT,
@@ -462,8 +487,8 @@ class OracleMemoryProvider(MemoryProvider):
             reason = self._init_error or self.unavailable_reason() or "not initialized"
             return f"# Oracle 26ai Memory\nUnavailable ({reason}). Built-in MEMORY.md still applies."
         return (
-            "# Oracle 26ai Memory\n"
-            f"Active (primary). ADB VECTOR IVF + Oracle Text + JSON. Agent: {self._agent_id}.\n"
+            "# Oracle 26ai Memory (Primary Store)\n"
+            f"Active: ADB VECTOR IVF + Oracle Text + JSON. Agent: {self._agent_id}.\n"
             f"{_PROMPT_BODY}"
         )
 
@@ -1637,19 +1662,79 @@ class OracleMemoryProvider(MemoryProvider):
                     )
                 return json.dumps({"results": rows, "count": len(rows)})
             if tool_name == "oracle_add":
-                content = (args.get("content") or "").strip()
-                if not content:
-                    return tool_error("Missing required parameter: content")
-                mid = f"fact_{uuid.uuid4().hex[:16]}"
-                self._insert(
-                    memory_id=mid,
-                    session_id=self._session_id,
-                    role="fact",
-                    content=content,
-                    target=args.get("target") or "memory",
-                    metadata={"kind": "tool"},
-                )
-                return json.dumps({"result": "Fact stored.", "memory_id": mid})
+                raw_facts = args.get("facts")
+                target = args.get("target") or "memory"
+                if target not in ("memory", "user"):
+                    target = "memory"
+                facts_to_add: list[str] = []
+
+                def _extract_fact(item: Any) -> str:
+                    if isinstance(item, dict):
+                        val = item.get("fact") or item.get("content") or item.get("text") or ""
+                        return str(val).strip()
+                    return str(item).strip() if item is not None else ""
+
+                if isinstance(raw_facts, str) and raw_facts.strip().startswith("[") and raw_facts.strip().endswith("]"):
+                    try:
+                        parsed = json.loads(raw_facts)
+                        if isinstance(parsed, list):
+                            raw_facts = parsed
+                    except Exception:
+                        pass
+
+                if isinstance(raw_facts, (list, tuple, set)):
+                    facts_to_add = [_extract_fact(f) for f in raw_facts if _extract_fact(f)]
+                elif isinstance(raw_facts, str) and raw_facts.strip():
+                    facts_to_add = [raw_facts.strip()]
+
+                if not facts_to_add:
+                    raw_content = args.get("content")
+                    if isinstance(raw_content, str) and raw_content.strip().startswith("[") and raw_content.strip().endswith("]"):
+                        try:
+                            parsed = json.loads(raw_content)
+                            if isinstance(parsed, list):
+                                raw_content = parsed
+                        except Exception:
+                            pass
+                    if isinstance(raw_content, (list, tuple, set)):
+                        facts_to_add = [_extract_fact(f) for f in raw_content if _extract_fact(f)]
+                    elif isinstance(raw_content, str) and raw_content.strip():
+                        facts_to_add = [raw_content.strip()]
+                    elif raw_content is not None and str(raw_content).strip():
+                        facts_to_add = [str(raw_content).strip()]
+
+                if not facts_to_add:
+                    return tool_error("Missing required parameter: content or facts")
+
+                if len(facts_to_add) == 1:
+                    mid = f"fact_{uuid.uuid4().hex[:16]}"
+                    self._insert(
+                        memory_id=mid,
+                        session_id=self._session_id,
+                        role="fact",
+                        content=facts_to_add[0],
+                        target=target,
+                        metadata={"kind": "tool"},
+                    )
+                    return json.dumps({"result": "Fact stored.", "memory_id": mid})
+                else:
+                    mids = []
+                    for f in facts_to_add:
+                        mid = f"fact_{uuid.uuid4().hex[:16]}"
+                        self._insert(
+                            memory_id=mid,
+                            session_id=self._session_id,
+                            role="fact",
+                            content=f,
+                            target=target,
+                            metadata={"kind": "tool"},
+                        )
+                        mids.append(mid)
+                    return json.dumps({
+                        "result": f"Batch facts stored ({len(mids)}).",
+                        "memory_ids": mids,
+                        "count": len(mids),
+                    })
             if tool_name == "oracle_update":
                 mid = args.get("memory_id")
                 content = (args.get("content") or "").strip()
