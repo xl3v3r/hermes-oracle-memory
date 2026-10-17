@@ -52,6 +52,7 @@ _EXTERNAL_EMBED_KILLSWITCH = (
 )
 _MAX_CHUNK_FILE_BYTES = 64 * 1024 * 1024
 _CONTAINS_CLEAN_RE = re.compile(r"[^\w\s-]")
+_FORMAT_CLEAN_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"^\s*(?:"
     r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
@@ -1586,7 +1587,7 @@ class OracleMemoryProvider(MemoryProvider):
             if not isinstance(r, dict):
                 continue
             body = (r.get("content") or "").replace("\n", " ").strip()
-            body = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", body)
+            body = _FORMAT_CLEAN_RE.sub("", body)
             if len(body) > 280:
                 body = body[:277] + "..."
             mid = html.escape(str(r.get("memory_id") or ""), quote=True)
