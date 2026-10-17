@@ -647,7 +647,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.7.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.8")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -849,6 +849,191 @@ class TestOraclePlugin(unittest.TestCase):
                 provider.initialize("test-session")
                 self.assertIn("MYADB_low.adb.oraclecloud.com", provider._dsn)
                 self.assertNotIn("MYADB_HIGH", provider._dsn)
+
+    def test_live_queries_contain_no_parallel_hints(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        txt_sql, _ = provider._build_text_search_sql("query", 8, "", "any")
+        self.assertIn("/*+ NO_PARALLEL */", txt_sql)
+
+        vec_sql_onnx, _ = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True)
+        self.assertIn("/*+ NO_PARALLEL */", vec_sql_onnx)
+
+        vec_sql_ext, _ = provider._build_vector_search_sql("query", [0.1] * 768, 8, "", "any", use_onnx=False)
+        self.assertIn("/*+ NO_PARALLEL */", vec_sql_ext)
+
+        hybrid_sql_onnx, _ = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True)
+        self.assertIn("/*+ NO_PARALLEL */", hybrid_sql_onnx)
+
+        hybrid_sql_ext, _ = provider._build_hybrid_search_sql("query", [0.1] * 768, "query", 8, "", "any", use_onnx=False)
+        self.assertIn("/*+ NO_PARALLEL */", hybrid_sql_ext)
+
+    def test_dml_queries_contain_no_parallel_hints(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        # Test insert
+        provider._insert(
+            memory_id="m1", session_id="s1", role="fact",
+            content="fact text", target="memory",
+        )
+        sql, _ = mock_cur.execute.call_args[0]
+        self.assertIn("/*+ NO_PARALLEL */", sql)
+
+        # Test delete
+        provider.handle_tool_call("oracle_delete", {"memory_id": "m1"})
+        sql, _ = mock_cur.execute.call_args[0]
+        self.assertIn("/*+ NO_PARALLEL */", sql)
+
+        # Test update
+        provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated"})
+        sql, _ = mock_cur.execute.call_args[0]
+        self.assertIn("/*+ NO_PARALLEL */", sql)
+
+    def test_session_callback_enforces_serial(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        secrets = {
+            "OCI_DB_USER": "testuser",
+            "OCI_DB_PASSWORD": "supersecretpassword123",
+            "OCI_DB_DSN": "testdsn_low",
+            "HERMES_ORACLE_TABLE": "TEST_TABLE",
+        }
+        with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)), \
+             patch("oracledb.SessionPool") as mock_pool_cls:
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value = mock_pool
+            mock_conn, mock_cur = self._mocked_conn()
+            mock_pool.acquire.return_value = mock_conn
+
+            provider.initialize(session_id="test_sess")
+            self.assertEqual(mock_pool_cls.call_count, 1)
+            pool_kwargs = mock_pool_cls.call_args[1]
+            self.assertIn("session_callback", pool_kwargs)
+            cb = pool_kwargs["session_callback"]
+
+            test_conn = MagicMock()
+            test_cur = MagicMock()
+            test_conn.cursor.return_value.__enter__.return_value = test_cur
+            cb(test_conn)
+
+            executed = [call[0][0] for call in test_cur.execute.call_args_list]
+            self.assertIn("ALTER SESSION SET parallel_degree_policy = MANUAL", executed)
+            self.assertIn("ALTER SESSION DISABLE PARALLEL QUERY", executed)
+            self.assertIn("ALTER SESSION DISABLE PARALLEL DML", executed)
+
+    def test_password_redacted_on_init_failure(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        secret_pwd = "my_super_secret_db_pass_987"
+        secrets = {
+            "OCI_DB_USER": "testuser",
+            "OCI_DB_PASSWORD": secret_pwd,
+            "OCI_DB_DSN": "testdsn_low",
+        }
+        with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)), \
+             patch("oracledb.SessionPool", side_effect=Exception(f"Connection failed to db with password {secret_pwd} ORA-01017")):
+            provider.initialize(session_id="test_sess")
+            self.assertNotIn(secret_pwd, provider._init_error)
+            self.assertIn("******", provider._init_error)
+
+    def test_additional_queries_contain_no_parallel_hints(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        # Test _insert_many ONNX
+        provider._insert_many([{"memory_id": "m1", "content": "text 1"}])
+        sql, _ = mock_cur.executemany.call_args[0]
+        self.assertIn("/*+ NO_PARALLEL */", sql)
+
+        # Test _insert_many fallback
+        provider._onnx_model = None
+        provider._insert_many([{"memory_id": "m2", "content": "text 2", "embedding": [0.1] * 768}])
+        sql, _ = mock_cur.executemany.call_args[0]
+        self.assertIn("/*+ NO_PARALLEL */", sql)
+
+        # Test _chunk_text
+        provider._chunk_text("Some text to chunk into pieces", 100, 10)
+        chunk_sql = mock_cur.execute.call_args[0][0]
+        self.assertIn("/*+ NO_PARALLEL */", chunk_sql)
+
+    def test_schema_policy_require_existing(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._verify_schema = MagicMock()
+
+        with patch.dict(os.environ, {"HERMES_ORACLE_SCHEMA_POLICY": "REQUIRE_EXISTING"}):
+            provider._ensure_schema()
+            self.assertEqual(provider._verify_schema.call_count, 1)
+            # execute should not be called for DDL statements
+            self.assertEqual(mock_cur.execute.call_count, 0)
+
+    def test_cascading_thread_purge_session_id(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        mock_conn, mock_cur = self._mocked_conn(rowcount=5)
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        # Missing both memory_id and session_id
+        with patch.object(oracle_plugin, "tool_error", side_effect=lambda msg: f"Error: {msg}"):
+            res_err = provider.handle_tool_call("oracle_delete", {})
+            self.assertIn("memory_id or session_id required", res_err)
+
+        # Purge by session_id
+        res_ok = json.loads(provider.handle_tool_call("oracle_delete", {"session_id": "thread-456"}))
+        self.assertEqual(res_ok["result"], "thread_deleted")
+        self.assertEqual(res_ok["session_id"], "thread-456")
+        self.assertEqual(res_ok["deleted_count"], 5)
+        sql, binds = mock_cur.execute.call_args[0]
+        self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY WHERE session_id = :1", sql)
+        self.assertEqual(binds, ("thread-456",))
+
+    def test_oracle_search_scoped_filters(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        txt_sql, txt_binds = provider._build_text_search_sql("query", 8, "", "any", session_id="s1", agent_id="a1")
+        self.assertIn("AND session_id = :sid", txt_sql)
+        self.assertIn("AND agent_id = :aid", txt_sql)
+        self.assertIn(provider._JUNK.strip(), txt_sql)
+        self.assertEqual(txt_binds["sid"], "s1")
+        self.assertEqual(txt_binds["aid"], "a1")
+
+        vec_sql, vec_binds = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True, session_id="s1", agent_id="a1")
+        self.assertIn("AND session_id = :sid", vec_sql)
+        self.assertIn("AND agent_id = :aid", vec_sql)
+        self.assertIn(provider._JUNK.strip(), vec_sql)
+        self.assertEqual(vec_binds["sid"], "s1")
+        self.assertEqual(vec_binds["aid"], "a1")
+
+        hybrid_sql, hybrid_binds = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True, session_id="s1", agent_id="a1")
+        self.assertIn("AND session_id = :sid", hybrid_sql)
+        self.assertIn("AND agent_id = :aid", hybrid_sql)
+        self.assertIn(provider._JUNK.strip(), hybrid_sql)
+        self.assertEqual(hybrid_binds["sid"], "s1")
+        self.assertEqual(hybrid_binds["aid"], "a1")
+
+        # Test handle_tool_call passing scoping filters to _search
+        provider._search = MagicMock(return_value=[{"memory_id": "m1", "content": "res", "score": 0.9}])
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        res = provider.handle_tool_call("oracle_search", {"query": "test", "session_id": "s1", "agent_id": "a1"})
+        self.assertIn("m1", res)
+        provider._search.assert_called_with("test", top_k=8, mode="hybrid", target="any", session_id="s1", agent_id="a1")
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp

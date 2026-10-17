@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.7.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.8-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
+> **CRITICALITY NOTICE**: v1.0.8 updates are CRITICAL to functionality. Hardened serial execution, prompt injection defense, thread purging, and search scoping require this version.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
+> **CRITICALITY NOTICE**: v1.0.8 updates are CRITICAL to functionality. Hardened serial execution, prompt injection defense, thread purging, and search scoping require this version.
 
 ### Recommended — Hermes plugin manager
 
@@ -65,6 +65,28 @@ Embeddings resolve in this order, in-database first:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.8
+
+- **Criticality Notice**: v1.0.8 updates are CRITICAL to functionality. Hardened serial execution, prompt injection defense, thread purging, and search scoping require this version.
+- **Mandatory Serial Execution & Auto-DOP Hardening**:
+  - Injected `/*+ NO_PARALLEL */` optimizer hints across all query builders (vector search, full-text search, hybrid search) and DML operations (`_insert`, `_insert_many`, ONNX batch embed `SELECT`, backfill `UPDATE`, `oracle_update`, `oracle_delete`).
+  - Session callback on every connection pool acquire enforces serial mode via `parallel_degree_policy = MANUAL`, `DISABLE PARALLEL QUERY`, and `DISABLE PARALLEL DML`.
+  - Migration and re-embedding utilities hardened with session serial enforcement and explicit table-aliased hints (`UPDATE /*+ NO_PARALLEL(m) */`, `MERGE /*+ NO_PARALLEL */`).
+- **Prompt Injection Defense & Prefetch XML Isolation**:
+  - Prefetched memory items wrapped in explicit `<retrieved_memory id="..." target="..." score="...">` isolation tags.
+  - Strips ASCII control characters (`[\x00-\x08\x0b-\x1f\x7f]`) and escapes metadata attributes to prevent XML injection and terminal disruption.
+- **Cascading Thread Purge in `oracle_delete`**:
+  - `oracle_delete` accepts `session_id` to purge all memory turns and chunks associated with an entire conversation thread.
+  - Relaxed tool schema requirements (`required: ["memory_id"]` removed) to support both item and thread deletion.
+- **Schema Policy Enforcement (`HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING`)**:
+  - Allows skipping runtime DDL creation (`_ensure_schema()`) in locked-down or least-privilege database environments.
+- **Search Scoping Filters**:
+  - `oracle_search` accepts optional `session_id` and `agent_id` filters while preserving query plan stability.
+- **Credential Protection**:
+  - Database connection password redacted from error output and initialization failure diagnostics.
+- **ONNX Setup Wallet Resolution**:
+  - Automatic wallet location resolution and encrypted wallet support (`OCI_WALLET_PASSWORD`) in `scripts/setup_onnx_model.py`.
 
 ## What's new in v1.0.7.1
 

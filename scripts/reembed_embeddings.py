@@ -114,13 +114,13 @@ def guard_serial(cur: Any) -> None:
 def assert_no_px(cur: Any) -> None:
     try:
         cur.execute(
-            "SELECT COUNT(*) FROM v$px_session "
+            "SELECT /*+ NO_PARALLEL */ COUNT(*) FROM v$px_session "
             "WHERE qcsid = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')) "
             "  AND sid != TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))"
         )
         px = cur.fetchone()[0]
     except Exception:
-        cur.execute("SELECT COUNT(*) FROM v$px_session")
+        cur.execute("SELECT /*+ NO_PARALLEL */ COUNT(*) FROM v$px_session")
         px = cur.fetchone()[0]
     if px:
         raise RuntimeError(
@@ -211,7 +211,7 @@ def run_worker(
                 f"SELECT /*+ NO_PARALLEL(m) */ m.memory_id, m.content FROM {table} m "
                 f"WHERE {' AND '.join(clauses)} ORDER BY m.memory_id"
             )
-            sql = f"SELECT memory_id, content FROM ({inner}) WHERE ROWNUM <= :n"
+            sql = f"SELECT /*+ NO_PARALLEL */ memory_id, content FROM ({inner}) WHERE ROWNUM <= :n"
             try:
                 cur.execute(sql, binds + [args.batch_size])
                 rows = cur.fetchall()
@@ -221,7 +221,7 @@ def run_worker(
 
                 if args.mode == "verify":
                     cur.execute(
-                        f"""SELECT COUNT(*),
+                        f"""SELECT /*+ NO_PARALLEL */ COUNT(*),
                                    SUM(CASE WHEN VECTOR_DISTANCE(m.embedding,
                                          VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA),
                                          COSINE) <= :tol THEN 1 ELSE 0 END)
@@ -235,11 +235,11 @@ def run_worker(
                     counters.add(scanned=n, matched=ok, mismatched=n - ok)
                 elif args.mode == "nulls":
                     cur.execute(
-                        f"""UPDATE {table} m
+                        f"""UPDATE /*+ NO_PARALLEL(m) */ {table} m
                                SET m.embedding = VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA),
                                    m.embedding_model = :model,
                                    m.embedding_updated_at = SYSTIMESTAMP
-                             WHERE /*+ NO_PARALLEL(m) */ m.memory_id >= :lo AND m.memory_id <= :hi
+                             WHERE m.memory_id >= :lo AND m.memory_id <= :hi
                                AND (m.embedding IS NULL OR m.embedding_model IS NULL)
                                AND m.content IS NOT NULL""",  # nosec B608
                         [model, batch_lo, batch_hi],
@@ -248,11 +248,11 @@ def run_worker(
                     conn.commit()
                 elif args.mode == "reembed":
                     cur.execute(
-                        f"""UPDATE {table} m
+                        f"""UPDATE /*+ NO_PARALLEL(m) */ {table} m
                                SET m.embedding = VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA),
                                    m.embedding_model = :model,
                                    m.embedding_updated_at = SYSTIMESTAMP
-                             WHERE /*+ NO_PARALLEL(m) */ m.memory_id >= :lo AND m.memory_id <= :hi
+                             WHERE m.memory_id >= :lo AND m.memory_id <= :hi
                                AND m.content IS NOT NULL""",  # nosec B608
                         [model, batch_lo, batch_hi],
                     )
@@ -260,7 +260,7 @@ def run_worker(
                     conn.commit()
                 else:  # stale: one ONNX evaluation per row, writes only what differs
                     cur.execute(
-                        f"""MERGE INTO {table} t
+                        f"""MERGE /*+ NO_PARALLEL */ INTO {table} t
                             USING (SELECT /*+ NO_PARALLEL */ m.memory_id AS memory_id,
                                           VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA) AS newvec,
                                           m.embedding AS oldvec

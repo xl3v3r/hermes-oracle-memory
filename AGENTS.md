@@ -22,7 +22,7 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ├── LICENSE                 # Business Source License 1.1
 ├── MANIFEST.in             # Source distribution manifest
 ├── README.md               # Project documentation and usage guide
-├── RELEASE_NOTES_1.0.7.1.md# Release notes for v1.0.7.1
+├── RELEASE_NOTES_1.0.8.md  # Release notes for v1.0.8
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration
@@ -35,7 +35,7 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 │   └── verify_provider.py
 ├── skills/                 # Hermes agent skills
 │   └── oracle-import/      # Bulk conversation and archive ingestion skill
-└── tests/                  # Unit test suite (91 tests)
+└── tests/                  # Unit test suite (112 tests)
     ├── conftest.py         # Test configuration & mocks for Hermes host and DB drivers
     ├── test_format_prefetch.py # Prefetch formatting tests
     ├── test_init.py        # Gateway turn detection and config schema tests

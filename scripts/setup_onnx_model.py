@@ -50,12 +50,34 @@ def main():
         local_onnx_path.write_bytes(model_bytes)
 
     logger.info("Connecting to Oracle Database...")
-    conn = oracledb.connect(
-        user=os.environ["OCI_DB_USER"],
-        password=os.environ["OCI_DB_PASSWORD"],
-        dsn=os.environ["OCI_DB_DSN"],
-    )
+    wallet_dir = os.environ.get("OCI_WALLET_LOCATION")
+    if not wallet_dir:
+        for candidate in (Path.home() / ".oci" / "wallet", Path.home() / ".hermes" / "oracle_wallet"):
+            if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
+                wallet_dir = str(candidate)
+                break
+    kwargs = {
+        "user": os.environ["OCI_DB_USER"],
+        "password": os.environ["OCI_DB_PASSWORD"],
+        "dsn": os.environ["OCI_DB_DSN"],
+    }
+    if wallet_dir:
+        kwargs["config_dir"] = wallet_dir
+        kwargs["wallet_location"] = wallet_dir
+        pwd = os.environ.get("OCI_WALLET_PASSWORD")
+        if pwd:
+            kwargs["wallet_password"] = pwd
+    conn = oracledb.connect(**kwargs)
     cur = conn.cursor()
+    for stmt in (
+        "ALTER SESSION SET parallel_degree_policy = MANUAL",
+        "ALTER SESSION DISABLE PARALLEL QUERY",
+        "ALTER SESSION DISABLE PARALLEL DML",
+    ):
+        try:
+            cur.execute(stmt)
+        except Exception:
+            pass
 
     # Step 1: Write to DATA_PUMP_DIR
     logger.info("Writing ONNX model to DATA_PUMP_DIR/%s ...", FILE_NAME)
@@ -94,13 +116,13 @@ def main():
     logger.info("Wrote file to DATA_PUMP_DIR in %.2fs", time.time() - t0)
 
     # Verify file exists in DATA_PUMP_DIR
-    cur.execute("SELECT object_name, bytes FROM DBMS_CLOUD.LIST_FILES('DATA_PUMP_DIR') WHERE object_name = :fn", [FILE_NAME])
+    cur.execute("SELECT /*+ NO_PARALLEL */ object_name, bytes FROM DBMS_CLOUD.LIST_FILES('DATA_PUMP_DIR') WHERE object_name = :fn", [FILE_NAME])
     row = cur.fetchone()
     logger.info("File in DATA_PUMP_DIR: %s", row)
 
     # Step 2: Drop existing model if present
     logger.info("Checking if model %s already exists...", MODEL_NAME)
-    cur.execute("SELECT COUNT(*) FROM USER_MINING_MODELS WHERE MODEL_NAME = :m", [MODEL_NAME])
+    cur.execute("SELECT /*+ NO_PARALLEL */ COUNT(*) FROM USER_MINING_MODELS WHERE MODEL_NAME = :m", [MODEL_NAME])
     if cur.fetchone()[0] > 0:
         logger.info("Dropping existing model %s...", MODEL_NAME)
         cur.execute("BEGIN DBMS_VECTOR.DROP_ONNX_MODEL(MODEL_NAME => :m, FORCE => TRUE); END;", [MODEL_NAME])
@@ -133,7 +155,7 @@ def main():
 
     # Step 4: Verify in-database inference
     logger.info("Testing in-database VECTOR_EMBEDDING with %s...", MODEL_NAME)
-    cur.execute(f"SELECT VECTOR_EMBEDDING({MODEL_NAME} USING 'Oracle 23ai AI Vector Search test' AS DATA) FROM DUAL")
+    cur.execute(f"SELECT /*+ NO_PARALLEL */ VECTOR_EMBEDDING({MODEL_NAME} USING 'Oracle 23ai AI Vector Search test' AS DATA) FROM DUAL")
     emb = cur.fetchone()[0]
     logger.info("Result vector type: %s, len: %d", type(emb), len(emb) if emb is not None else 0)
     assert emb is not None, "Failed: VECTOR_EMBEDDING returned None"

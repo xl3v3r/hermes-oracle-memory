@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.0.7.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.8-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.7.1 updates are CRITICAL to functionality. Oracle-first memory behavior and batch writes require this version.
+> **CRITICALITY NOTICE**: v1.0.8 updates are CRITICAL to functionality. Hardened serial execution, prompt injection defense, thread purging, and search scoping require this version.
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
@@ -212,3 +212,26 @@ The backfill utility:
 - Multithreads batch processing across database sessions.
 - Automatically tracks checkpoints in `backfills/backfill_progress_768.json`.
 - Refreshes vector indexes and table optimizer statistics upon completion (`DBMS_STATS.GATHER_TABLE_STATS`).
+
+---
+
+## Step 7: Security & Least-Privilege Operation
+
+### Restricted DB Environments (`REQUIRE_EXISTING` Schema Policy)
+
+In enterprise environments where the database schema is managed via CI/CD migrations and application accounts do not possess `CREATE TABLE` or `CREATE INDEX` privileges, configure:
+
+```bash
+HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING
+```
+
+When set, the provider skips runtime DDL attempts (`_ensure_schema()`) and verifies that required tables and indexes exist (`_verify_schema()`).
+
+### Prompt Injection Hardening
+
+Prefetched memories injected into prompt context are isolated inside `<retrieved_memory id="..." target="..." score="...">` XML boundary tags with metadata attribute escaping (`html.escape`) and ASCII control-character stripping (`[\x00-\x08\x0b-\x1f\x7f]`).
+
+### Credential Protection
+
+Database credentials (such as `OCI_DB_PASSWORD`) are automatically redacted from error outputs and initialization exception logs.
+

@@ -10,6 +10,7 @@ OCI GenAI cohere.embed-v4.0 is tried first if configured; on failure it falls ba
 from __future__ import annotations
 
 import array
+import html
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.7.1"
+__version__ = "1.0.8"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -92,6 +93,14 @@ TOOL_SCHEMAS = [
                     "enum": ["memory", "user", "any"],
                     "description": "Restrict to built-in memory vs user profile (default any).",
                 },
+                "session_id": {
+                    "type": "string",
+                    "description": "Restrict search to a specific session ID.",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Restrict search to a specific agent ID.",
+                },
             },
             "required": ["query"],
         },
@@ -138,11 +147,13 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "oracle_delete",
-        "description": "Delete an Oracle memory by memory_id (e.g. chk_* or fact_*) from oracle_search. Never use the local memory tool to remove Oracle entries.",
+        "description": "Delete an Oracle memory by memory_id (e.g. chk_* or fact_*) or purge an entire session thread by session_id from oracle_search. Never use the local memory tool to remove Oracle entries.",
         "parameters": {
             "type": "object",
-            "properties": {"memory_id": {"type": "string"}},
-            "required": ["memory_id"],
+            "properties": {
+                "memory_id": {"type": "string", "description": "Specific memory ID to delete."},
+                "session_id": {"type": "string", "description": "Session ID to delete all associated memories for thread purge."},
+            },
         },
     },
     {
@@ -419,16 +430,41 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
 
+            def _session_callback(conn: Any, tag: Any = None) -> None:
+                try:
+                    with conn.cursor() as cur:
+                        for stmt in (
+                            "ALTER SESSION SET parallel_degree_policy = MANUAL",
+                            "ALTER SESSION DISABLE PARALLEL QUERY",
+                            "ALTER SESSION DISABLE PARALLEL DML",
+                        ):
+                            try:
+                                cur.execute(stmt)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            pool_kwargs["session_callback"] = _session_callback
+
             self._pool = oracledb.SessionPool(**pool_kwargs)
             self._ensure_schema()
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
         except Exception as e:
-            self._init_error = str(e)
-            logger.error("Oracle memory pool failed: %s", e)
+            err_msg = str(e)
+            if password and password in err_msg:
+                err_msg = err_msg.replace(password, "******")
+            self._init_error = err_msg
+            logger.error("Oracle memory pool failed: %s", err_msg)
             self._pool = None
 
     def _ensure_schema(self) -> None:
         if not self._pool:
+            return
+        policy = (os.environ.get("HERMES_ORACLE_SCHEMA_POLICY") or "").strip().upper()
+        if policy == "REQUIRE_EXISTING":
+            logger.info("HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING set: skipping runtime DDL and verifying schema")
+            self._verify_schema()
             return
         # Use DBMS_ASSERT to safely quote the table name and EXECUTE IMMEDIATE to run DDL.
         # This prevents SQL injection vulnerabilities when executing dynamically built schema statements.
@@ -479,7 +515,7 @@ class OracleMemoryProvider(MemoryProvider):
         """Raise if the memory table is not queryable, so `initialize` surfaces
         the failure instead of reporting the provider as active while broken."""
         with self._pool.acquire() as conn, conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {self._table}")  # nosec B608
+            cur.execute(f"SELECT /*+ NO_PARALLEL */ COUNT(*) FROM {self._table}")  # nosec B608
             cur.fetchone()
 
     def system_prompt_block(self) -> str:
@@ -721,7 +757,7 @@ class OracleMemoryProvider(MemoryProvider):
                         binds = []
                         for j, t in enumerate(batch_texts):
                             parts.append(
-                                f"SELECT {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
+                                f"SELECT /*+ NO_PARALLEL */ {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
                             )
                             binds.append(t[:4000])
                         cur.execute(" UNION ALL ".join(parts) + " ORDER BY id", binds)
@@ -897,7 +933,7 @@ class OracleMemoryProvider(MemoryProvider):
                             # Bulk update embeddings in a single round-trip,
                             # stamping provenance alongside the vector.
                             sql = (
-                                f"UPDATE {self._table} SET embedding = :1, "
+                                f"UPDATE /*+ NO_PARALLEL */ {self._table} SET embedding = :1, "
                                 "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
                                 "WHERE memory_id = :3"
                             )  # nosec B608
@@ -947,7 +983,7 @@ class OracleMemoryProvider(MemoryProvider):
         onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
             sql = f"""
-                INSERT INTO {self._table}
+                INSERT /*+ NO_PARALLEL */ INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
                      created_at, target, metadata, content_txt,
                      embedding_model, embedding_updated_at)
@@ -982,7 +1018,7 @@ class OracleMemoryProvider(MemoryProvider):
                     vec = ext_vecs[0]
 
         sql = f"""
-            INSERT INTO {self._table}
+            INSERT /*+ NO_PARALLEL */ INTO {self._table}
                 (memory_id, session_id, agent_id, role, content, embedding,
                  created_at, target, metadata, content_txt,
                  embedding_model, embedding_updated_at)
@@ -1022,7 +1058,7 @@ class OracleMemoryProvider(MemoryProvider):
         onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
             sql = f"""
-                INSERT INTO {self._table}
+                INSERT /*+ NO_PARALLEL */ INTO {self._table}
                     (memory_id, session_id, agent_id, role, content, embedding,
                      created_at, target, metadata, content_txt,
                      embedding_model, embedding_updated_at,
@@ -1116,7 +1152,7 @@ class OracleMemoryProvider(MemoryProvider):
                 backfill_queue.append((memory_id, content))
 
         sql = f"""
-            INSERT INTO {self._table}
+            INSERT /*+ NO_PARALLEL */ INTO {self._table}
                 (memory_id, session_id, agent_id, role, content, embedding,
                  created_at, target, metadata, content_txt,
                  embedding_model, embedding_updated_at,
@@ -1175,42 +1211,60 @@ class OracleMemoryProvider(MemoryProvider):
             )
         return out
 
-    def _build_text_search_sql(self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str) -> Tuple[str, dict]:
+    def _build_text_search_sql(
+        self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None
+    ) -> Tuple[str, dict]:
+        extra_filters = ""
+        binds = {"q": contains_q, "k": fetch_k}
+        if session_id:
+            extra_filters += " AND session_id = :sid "
+            binds["sid"] = session_id
+        if agent_id:
+            extra_filters += " AND agent_id = :aid "
+            binds["aid"] = agent_id
+
         sql = f"""
-            SELECT memory_id, session_id, agent_id, role, content, target,
+            SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                    SCORE(1) AS txt_score, NULL AS distance
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
-            {self._JUNK}{tgt_sql}
+            {self._JUNK}{tgt_sql}{extra_filters}
             ORDER BY txt_score DESC
             FETCH FIRST :k ROWS ONLY
         """
-        binds = {"q": contains_q, "k": fetch_k}
         if tgt_sql:
             binds["tgt"] = tgt
         return sql, binds
 
-    def _build_vector_search_sql(self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True) -> Tuple[str, dict]:
+    def _build_vector_search_sql(
+        self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
+    ) -> Tuple[str, dict]:
+        extra_filters = ""
+        if session_id:
+            extra_filters += " AND session_id = :sid "
+        if agent_id:
+            extra_filters += " AND agent_id = :aid "
+
         if use_onnx and self._onnx_model:
             sql = f"""
-                SELECT memory_id, session_id, agent_id, role, content, target,
+                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
                        VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
-                {self._JUNK}{tgt_sql}
+                {self._JUNK}{tgt_sql}{extra_filters}
                 ORDER BY distance ASC
                 FETCH FIRST :k ROWS ONLY
             """
             binds = {"qv": query[:4000], "k": fetch_k}
         else:
             sql = f"""
-                SELECT memory_id, session_id, agent_id, role, content, target,
+                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
                        VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
-                {self._JUNK}{tgt_sql}
+                {self._JUNK}{tgt_sql}{extra_filters}
                 ORDER BY distance ASC
                 FETCH FIRST :k ROWS ONLY
             """
@@ -1218,32 +1272,44 @@ class OracleMemoryProvider(MemoryProvider):
 
         if tgt_sql:
             binds["tgt"] = tgt
+        if session_id:
+            binds["sid"] = session_id
+        if agent_id:
+            binds["aid"] = agent_id
         return sql, binds
 
-    def _build_hybrid_search_sql(self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True) -> Tuple[str, dict]:
+    def _build_hybrid_search_sql(
+        self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
+    ) -> Tuple[str, dict]:
+        extra_filters = ""
+        if session_id:
+            extra_filters += " AND session_id = :sid "
+        if agent_id:
+            extra_filters += " AND agent_id = :aid "
+
         if use_onnx and self._onnx_model:
             fused_sql = f"""
-                SELECT memory_id, session_id, agent_id, role, content, target,
+                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        txt_score, distance
                 FROM (
-                    SELECT memory_id, session_id, agent_id, role, content, target,
+                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
                            VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
-                    {self._JUNK}{tgt_sql}
+                    {self._JUNK}{tgt_sql}{extra_filters}
                     ORDER BY distance ASC
                     FETCH FIRST :k ROWS ONLY
                 )
                 UNION ALL
-                SELECT memory_id, session_id, agent_id, role, content, target,
+                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        txt_score, distance
                 FROM (
-                    SELECT memory_id, session_id, agent_id, role, content, target,
+                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            SCORE(1) AS txt_score, NULL AS distance
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
-                    {self._JUNK}{tgt_sql}
+                    {self._JUNK}{tgt_sql}{extra_filters}
                     ORDER BY txt_score DESC
                     FETCH FIRST :k ROWS ONLY
                 )
@@ -1255,27 +1321,27 @@ class OracleMemoryProvider(MemoryProvider):
             }
         else:
             fused_sql = f"""
-                SELECT memory_id, session_id, agent_id, role, content, target,
+                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        txt_score, distance
                 FROM (
-                    SELECT memory_id, session_id, agent_id, role, content, target,
+                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
                            VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
-                    {self._JUNK}{tgt_sql}
+                    {self._JUNK}{tgt_sql}{extra_filters}
                     ORDER BY distance ASC
                     FETCH FIRST :k ROWS ONLY
                 )
                 UNION ALL
-                SELECT memory_id, session_id, agent_id, role, content, target,
+                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        txt_score, distance
                 FROM (
-                    SELECT memory_id, session_id, agent_id, role, content, target,
+                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            SCORE(1) AS txt_score, NULL AS distance
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
-                    {self._JUNK}{tgt_sql}
+                    {self._JUNK}{tgt_sql}{extra_filters}
                     ORDER BY txt_score DESC
                     FETCH FIRST :k ROWS ONLY
                 )
@@ -1283,15 +1349,21 @@ class OracleMemoryProvider(MemoryProvider):
             fused_binds = {"v": vec, "q": contains_q, "k": fetch_k}
         if tgt_sql:
             fused_binds["tgt"] = tgt
+        if session_id:
+            fused_binds["sid"] = session_id
+        if agent_id:
+            fused_binds["aid"] = agent_id
         return fused_sql, fused_binds
 
     def _execute_hybrid_search(
-        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None
     ) -> list:
         merged: dict = {}
         use_onnx = bool(self._onnx_model)
         try:
-            fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx)
+            fused_sql, fused_binds = self._build_hybrid_search_sql(
+                query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
+            )
             for r in self._fetch_rows(cur, fused_sql, fused_binds):
                 prev = merged.get(r["memory_id"])
                 if prev:
@@ -1310,7 +1382,9 @@ class OracleMemoryProvider(MemoryProvider):
                     vec = self._embed_external([query])[0]
                 if vec is not None:
                     try:
-                        fused_sql, fused_binds = self._build_hybrid_search_sql(query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=False)
+                        fused_sql, fused_binds = self._build_hybrid_search_sql(
+                            query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
+                        )
                         for r in self._fetch_rows(cur, fused_sql, fused_binds):
                             prev = merged.get(r["memory_id"])
                             if prev:
@@ -1322,16 +1396,22 @@ class OracleMemoryProvider(MemoryProvider):
                     except Exception as e2:
                         logger.debug("Fallback hybrid failed (%s); falling back to vector or text", e2)
                         try:
-                            v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                            v_sql, v_binds = self._build_vector_search_sql(
+                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
+                            )
                             for r in self._fetch_rows(cur, v_sql, v_binds):
                                 merged[r["memory_id"]] = r
                         except Exception as e3:
                             logger.debug("Fallback vector also failed (%s); falling back to text-only", e3)
-                            t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                            t_sql, t_binds = self._build_text_search_sql(
+                                contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                            )
                             for r in self._fetch_rows(cur, t_sql, t_binds):
                                 merged[r["memory_id"]] = r
                 else:
-                    t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                    t_sql, t_binds = self._build_text_search_sql(
+                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                    )
                     for r in self._fetch_rows(cur, t_sql, t_binds):
                         merged[r["memory_id"]] = r
             else:
@@ -1340,16 +1420,22 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 if vec is not None:
                     try:
-                        v_sql, v_binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                        v_sql, v_binds = self._build_vector_search_sql(
+                            query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
+                        )
                         for r in self._fetch_rows(cur, v_sql, v_binds):
                             merged[r["memory_id"]] = r
                     except Exception as e_vec:
                         logger.debug("vector-only failed (%s); falling back to text", e_vec)
-                        t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                        t_sql, t_binds = self._build_text_search_sql(
+                            contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                        )
                         for r in self._fetch_rows(cur, t_sql, t_binds):
                             merged[r["memory_id"]] = r
                 else:
-                    t_sql, t_binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                    t_sql, t_binds = self._build_text_search_sql(
+                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                    )
                     for r in self._fetch_rows(cur, t_sql, t_binds):
                         merged[r["memory_id"]] = r
         ranked = sorted(
@@ -1366,6 +1452,8 @@ class OracleMemoryProvider(MemoryProvider):
         mode: str = "hybrid",
         target: str = "any",
         rerank: bool = True,
+        session_id: Any = None,
+        agent_id: Any = None,
     ) -> list:
         if not self._pool or not query:
             return []
@@ -1384,14 +1472,18 @@ class OracleMemoryProvider(MemoryProvider):
         with self._pool.acquire() as conn:
             with conn.cursor() as cur:
                 if mode == "text":
-                    sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                    sql, binds = self._build_text_search_sql(
+                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                    )
                     rows = self._fetch_rows(cur, sql, binds)
                 elif mode == "vector":
                     rows = []
                     use_onnx = bool(self._onnx_model)
                     if use_onnx:
                         try:
-                            sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=True)
+                            sql, binds = self._build_vector_search_sql(
+                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=True, session_id=session_id, agent_id=agent_id
+                            )
                             rows = self._fetch_rows(cur, sql, binds)
                         except Exception as e:
                             logger.warning(
@@ -1402,36 +1494,48 @@ class OracleMemoryProvider(MemoryProvider):
                                 vec = self._embed_external([query])[0]
                             if vec is not None:
                                 try:
-                                    sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                                    sql, binds = self._build_vector_search_sql(
+                                        query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
+                                    )
                                     rows = self._fetch_rows(cur, sql, binds)
                                 except Exception as e2:
                                     logger.warning(
                                         "Fallback vector search failed (%s); falling back to text search",
                                         e2,
                                     )
-                                    sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                                    sql, binds = self._build_text_search_sql(
+                                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                                    )
                                     rows = self._fetch_rows(cur, sql, binds)
                             else:
-                                sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                                sql, binds = self._build_text_search_sql(
+                                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                                )
                                 rows = self._fetch_rows(cur, sql, binds)
                     else:
                         if vec is not None:
                             try:
-                                sql, binds = self._build_vector_search_sql(query, vec, fetch_k, tgt_sql, tgt, use_onnx=False)
+                                sql, binds = self._build_vector_search_sql(
+                                    query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
+                                )
                                 rows = self._fetch_rows(cur, sql, binds)
                             except Exception as e:
                                 logger.warning(
                                     "Vector search failed (%s); falling back to text search",
                                     e,
                                 )
-                                sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                                sql, binds = self._build_text_search_sql(
+                                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                                )
                                 rows = self._fetch_rows(cur, sql, binds)
                         else:
-                            sql, binds = self._build_text_search_sql(contains_q, fetch_k, tgt_sql, tgt)
+                            sql, binds = self._build_text_search_sql(
+                                contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                            )
                             rows = self._fetch_rows(cur, sql, binds)
                 else:
                     rows = self._execute_hybrid_search(
-                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank
+                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id
                     )
         return rows[:top_k]
 
@@ -1480,10 +1584,14 @@ class OracleMemoryProvider(MemoryProvider):
         lines = []
         for r in rows[:8]:
             body = (r.get("content") or "").replace("\n", " ").strip()
+            body = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", body)
             if len(body) > 280:
                 body = body[:277] + "..."
+            mid = html.escape(str(r.get("memory_id") or ""), quote=True)
+            target = html.escape(str(r.get("target") or "memory"), quote=True)
+            score = html.escape(str(r.get("score") if r.get("score") is not None else 0), quote=True)
             lines.append(
-                f"- [{r.get('target', 'memory')}|{r.get('agent_id', 'hermes')}|{r.get('score', 0)}] {body}"
+                f'<retrieved_memory id="{mid}" target="{target}" score="{score}">{body}</retrieved_memory>'
             )
         return "## Oracle 26ai Memory\n" + "\n".join(lines)
 
@@ -1655,6 +1763,8 @@ class OracleMemoryProvider(MemoryProvider):
                     top_k=int(args.get("top_k") or 8),
                     mode=args.get("mode") or "hybrid",
                     target=args.get("target") or "any",
+                    session_id=args.get("session_id"),
+                    agent_id=args.get("agent_id"),
                 )
                 if not rows:
                     return json.dumps(
@@ -1753,7 +1863,7 @@ class OracleMemoryProvider(MemoryProvider):
                         if onnx_enabled:
                             try:
                                 sql = f"""
-                                    UPDATE {self._table}
+                                    UPDATE /*+ NO_PARALLEL */ {self._table}
                                     SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3,
                                         embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
                                     WHERE memory_id = :5
@@ -1772,7 +1882,7 @@ class OracleMemoryProvider(MemoryProvider):
                                     ext_vecs, vec_model = self._embed_external_tagged([content])
                                     vec = ext_vecs[0]
                                 sql = f"""
-                                    UPDATE {self._table}
+                                    UPDATE /*+ NO_PARALLEL */ {self._table}
                                     SET content = :1, embedding = :2, content_txt = :3,
                                         embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
                                     WHERE memory_id = :5
@@ -1783,7 +1893,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 )
                         else:
                             sql = f"""
-                                UPDATE {self._table}
+                                UPDATE /*+ NO_PARALLEL */ {self._table}
                                 SET content = :1, embedding = :2, content_txt = :3,
                                     embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
                                 WHERE memory_id = :5
@@ -1801,20 +1911,34 @@ class OracleMemoryProvider(MemoryProvider):
                 return json.dumps({"result": "updated", "memory_id": mid})
             if tool_name == "oracle_delete":
                 mid = args.get("memory_id")
-                if not mid:
-                    return tool_error("memory_id required")
+                sid = args.get("session_id")
+                if not mid and not sid:
+                    return tool_error("memory_id or session_id required")
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        query = f"DELETE FROM {self._table} WHERE memory_id = :1"  # nosec B608
-                        cur.execute(
-                            query,
-                            (mid,),
-                        )
-                        n = cur.rowcount
-                    conn.commit()
-                if not n:
-                    return tool_error(f"Memory not found: {mid}")
-                return json.dumps({"result": "deleted", "memory_id": mid})
+                        if sid:
+                            query = f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE session_id = :1"  # nosec B608
+                            cur.execute(query, (sid,))
+                            n = cur.rowcount
+                            conn.commit()
+                            return json.dumps(
+                                {
+                                    "result": "thread_deleted",
+                                    "session_id": sid,
+                                    "deleted_count": n,
+                                }
+                            )
+                        else:
+                            query = f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                            cur.execute(
+                                query,
+                                (mid,),
+                            )
+                            n = cur.rowcount
+                            conn.commit()
+                            if not n:
+                                return tool_error(f"Memory not found: {mid}")
+                            return json.dumps({"result": "deleted", "memory_id": mid})
             if tool_name == "oracle_chunk":
                 content = (args.get("content") or "").strip()
                 file_path = (args.get("file_path") or args.get("path") or "").strip()
@@ -1932,7 +2056,7 @@ class OracleMemoryProvider(MemoryProvider):
 
                         cur.execute(
                             """
-                            SELECT COLUMN_VALUE FROM TABLE(
+                            SELECT /*+ NO_PARALLEL */ COLUMN_VALUE FROM TABLE(
                               DBMS_VECTOR.UTL_TO_CHUNKS(
                                 TO_CLOB(:1),
                                 JSON(:2)

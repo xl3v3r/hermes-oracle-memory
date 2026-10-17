@@ -82,6 +82,19 @@ def get_db_connection() -> Any:
             kwargs["wallet_password"] = wallet_pwd
 
     conn = oracledb.connect(**kwargs)
+    try:
+        with conn.cursor() as cur:
+            for stmt in (
+                "ALTER SESSION SET parallel_degree_policy = MANUAL",
+                "ALTER SESSION DISABLE PARALLEL QUERY",
+                "ALTER SESSION DISABLE PARALLEL DML",
+            ):
+                try:
+                    cur.execute(stmt)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     return conn
 
 
@@ -106,12 +119,28 @@ def get_db_pool(min_conns: int = 1, max_conns: int = 8) -> Any:
                 wallet_dir = str(candidate)
                 break
 
+    def _init_session(conn: Any, tag: Any = None) -> None:
+        try:
+            with conn.cursor() as cur:
+                for stmt in (
+                    "ALTER SESSION SET parallel_degree_policy = MANUAL",
+                    "ALTER SESSION DISABLE PARALLEL QUERY",
+                    "ALTER SESSION DISABLE PARALLEL DML",
+                ):
+                    try:
+                        cur.execute(stmt)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     kwargs: dict[str, Any] = {
         "user": user,
         "password": password,
         "dsn": dsn,
         "min": min_conns,
         "max": max_conns,
+        "session_callback": _init_session,
     }
     if wallet_dir:
         kwargs["config_dir"] = wallet_dir
@@ -241,12 +270,12 @@ def run_backfill(
         raise ValueError(f"Invalid Oracle table name: {table_name!r}")
 
     logger.info("Checking total rows in table %s...", clean_table)
-    cur.execute(f"SELECT count(*) FROM {clean_table}")  # nosec B608
+    cur.execute(f"SELECT /*+ NO_PARALLEL */ count(*) FROM {clean_table}")  # nosec B608
     total_rows = cur.fetchone()[0]
     logger.info("Total rows in %s: %d", clean_table, total_rows)
 
     logger.info("Fetching rows to embed...")
-    query = f"SELECT memory_id, content FROM {clean_table} WHERE embedding IS NULL ORDER BY created_at ASC, memory_id ASC"  # nosec B608
+    query = f"SELECT /*+ NO_PARALLEL */ memory_id, content FROM {clean_table} WHERE embedding IS NULL ORDER BY created_at ASC, memory_id ASC"  # nosec B608
     cur.execute(query)
 
     rows_to_process: list[tuple[str, str]] = []
@@ -271,7 +300,7 @@ def run_backfill(
             # Checkpoint had all records; sample 5 directly from table to test connection and embedding
             cur_sample = conn.cursor()
             cur_sample.outputtypehandler = out_type_handler
-            cur_sample.execute(f"SELECT memory_id, content FROM {clean_table} WHERE ROWNUM <= 5")  # nosec B608
+            cur_sample.execute(f"SELECT /*+ NO_PARALLEL */ memory_id, content FROM {clean_table} WHERE ROWNUM <= 5")  # nosec B608
             sample = [
                 (mid, content.read() if hasattr(content, "read") else (content or ""))
                 for mid, content in cur_sample.fetchall()
@@ -298,7 +327,7 @@ def run_backfill(
         if onnx_model:
             try:
                 with pool.acquire() as b_conn, b_conn.cursor() as update_cur:
-                    sql = f"UPDATE {clean_table} SET embedding = VECTOR_EMBEDDING({onnx_model} USING :1 AS DATA) WHERE memory_id = :2"  # nosec B608
+                    sql = f"UPDATE /*+ NO_PARALLEL */ {clean_table} SET embedding = VECTOR_EMBEDDING({onnx_model} USING :1 AS DATA) WHERE memory_id = :2"  # nosec B608
                     binds = [(txt[:4000], mid) for mid, txt in zip(ids, texts)]
                     update_cur.executemany(sql, binds)
                     b_conn.commit()
@@ -310,7 +339,7 @@ def run_backfill(
         binds = [(vec, mid) for mid, vec in zip(ids, vecs) if vec is not None]
         if binds:
             with pool.acquire() as b_conn, b_conn.cursor() as update_cur:
-                sql = f"UPDATE {clean_table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
+                sql = f"UPDATE /*+ NO_PARALLEL */ {clean_table} SET embedding = :1 WHERE memory_id = :2"  # nosec B608
                 update_cur.executemany(sql, binds)
                 b_conn.commit()
         success_ids = [mid for mid, vec in zip(ids, vecs) if vec is not None]
@@ -378,7 +407,7 @@ def run_backfill(
         try:
             with conn.cursor() as idx_cur:
                 idx_cur.execute(
-                    "SELECT index_type FROM user_indexes WHERE table_name = :1 AND index_name = :2",
+                    "SELECT /*+ NO_PARALLEL */ index_type FROM user_indexes WHERE table_name = :1 AND index_name = :2",
                     [clean_table, f"{clean_table}_VEC_IDX"],
                 )
                 row = idx_cur.fetchone()

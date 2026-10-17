@@ -1,7 +1,7 @@
 ---
 name: oracle-import
 description: Import conversation archives and documents into Oracle Autonomous AI Database 26ai memory without hitting LLM rate limits.
-version: 1.0.7.1
+version: 1.0.8
 author: Hermes Community
 metadata:
   hermes:

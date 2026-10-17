@@ -75,7 +75,11 @@ def run(args: argparse.Namespace) -> int:
     conn = connect()
     cur = conn.cursor()
     # never let auto-DOP touch this: the audit must stay serial and cheap
-    for stmt in ("ALTER SESSION DISABLE PARALLEL QUERY",):
+    for stmt in (
+        "ALTER SESSION SET parallel_degree_policy = MANUAL",
+        "ALTER SESSION DISABLE PARALLEL QUERY",
+        "ALTER SESSION DISABLE PARALLEL DML",
+    ):
         try:
             cur.execute(stmt)
         except Exception:
@@ -85,7 +89,7 @@ def run(args: argparse.Namespace) -> int:
 
     # ---- check 1: provenance distribution (no inference) --------------------
     cur.execute(
-        f"SELECT NVL(embedding_model, '(NULL)'), COUNT(*) FROM {table} GROUP BY embedding_model"
+        f"SELECT /*+ NO_PARALLEL */ NVL(embedding_model, '(NULL)'), COUNT(*) FROM {table} GROUP BY embedding_model"
     )  # nosec B608
     dist = cur.fetchall()
     total = sum(n for _m, n in dist)
@@ -103,9 +107,9 @@ def run(args: argparse.Namespace) -> int:
     # the plugin restart every new write should be stamped, so flag a nonzero
     # count of *recently written* unstamped rows.
     cur.execute(
-        f"""SELECT COUNT(*) FROM {table}
+        f"""SELECT /*+ NO_PARALLEL */ COUNT(*) FROM {table}
             WHERE embedding_model IS NULL
-              AND created_at > (SELECT MAX(created_at) FROM {table} WHERE embedding_model IS NOT NULL)"""
+              AND created_at > (SELECT /*+ NO_PARALLEL */ MAX(created_at) FROM {table} WHERE embedding_model IS NOT NULL)"""
     )  # nosec B608
     recent_null = cur.fetchone()[0] or 0
     if recent_null:
@@ -116,7 +120,7 @@ def run(args: argparse.Namespace) -> int:
 
     # ---- check 2: random recompute sample ------------------------------------
     cur.execute(
-        f"""SELECT memory_id FROM (
+        f"""SELECT /*+ NO_PARALLEL */ memory_id FROM (
                 SELECT /*+ NO_PARALLEL */ memory_id FROM {table}
                 WHERE embedding IS NOT NULL AND content IS NOT NULL
                 ORDER BY DBMS_RANDOM.VALUE)
@@ -126,7 +130,7 @@ def run(args: argparse.Namespace) -> int:
     mismatches = []
     for mid in ids:
         cur.execute(
-            f"""SELECT ROUND(VECTOR_DISTANCE(m.embedding,
+            f"""SELECT /*+ NO_PARALLEL */ ROUND(VECTOR_DISTANCE(m.embedding,
                     VECTOR_EMBEDDING({args.expected_model} USING DBMS_LOB.SUBSTR(m.content, 4000, 1) AS DATA),
                     COSINE), 6)
                 FROM {table} m WHERE m.memory_id = :mid""",  # nosec B608

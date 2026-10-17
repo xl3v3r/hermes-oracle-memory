@@ -104,7 +104,7 @@ class TestReembedEmbeddings(unittest.TestCase):
         all_stmts = [c[0][0] for c in cur.execute.call_args_list]
         self.assertTrue(any("embedding IS NULL OR m.embedding_model IS NULL" in s for s in all_stmts))
 
-        update_stmts = [s for s in all_stmts if "UPDATE HERMES_AGENT_MEMORY" in s]
+        update_stmts = [s for s in all_stmts if "UPDATE /*+ NO_PARALLEL(m) */ HERMES_AGENT_MEMORY" in s]
         self.assertTrue(len(update_stmts) > 0)
         self.assertIn("m.embedding_model = :model", update_stmts[0])
         self.assertIn("m.embedding_updated_at = SYSTIMESTAMP", update_stmts[0])
@@ -153,11 +153,12 @@ class TestReembedEmbeddings(unittest.TestCase):
             stop=stop,
         )
 
-        merge_calls = [c for c in cur.execute.call_args_list if "MERGE INTO" in c[0][0]]
+        merge_calls = [c for c in cur.execute.call_args_list if "MERGE /*+ NO_PARALLEL */ INTO" in c[0][0]]
         self.assertEqual(len(merge_calls), 1)
         sql, binds = merge_calls[0][0]
         self.assertIn("t.embedding_model = :model", sql)
         self.assertIn("t.embedding_updated_at = SYSTIMESTAMP", sql)
+        self.assertIn("/*+ NO_PARALLEL */", sql)
         # Position 1: :lo -> row1, Position 2: :hi -> row2, Position 3: :model -> model, Position 4: :tol -> tolerance
         self.assertEqual(binds, ["row1", "row2", "BGE_BASE_EN_V1_5", 0.01])
 
@@ -199,10 +200,11 @@ class TestReembedEmbeddings(unittest.TestCase):
             stop=stop,
         )
 
-        update_calls = [c for c in cur.execute.call_args_list if "UPDATE HERMES_AGENT_MEMORY" in c[0][0]]
+        update_calls = [c for c in cur.execute.call_args_list if "UPDATE /*+ NO_PARALLEL(m) */ HERMES_AGENT_MEMORY" in c[0][0]]
         self.assertEqual(len(update_calls), 1)
         sql, binds = update_calls[0][0]
         self.assertIn("m.embedding_model = :model", sql)
+        self.assertIn("/*+ NO_PARALLEL(m) */", sql)
         self.assertEqual(binds, ["BGE_BASE_EN_V1_5", "row1", "row2"])
 
     def test_assert_no_px_session_scoped_query(self):
