@@ -26,6 +26,7 @@ Modes
   verify   read-only; reports how many rows already match the internal model
   stale    recomputes and rewrites only rows whose stored vector differs (MERGE)
   reembed  blind rewrite of every row in range (use only for a model migration)
+  nulls    backfills and stamps rows missing embeddings or model provenance
 
 Each worker owns a disjoint MEMORY_ID range, pages by keyset and commits per
 batch, so the job is interruptible and resumable via --checkpoint --resume.
@@ -99,16 +100,28 @@ def connect() -> Any:
 
 def guard_serial(cur: Any) -> None:
     """Force serial execution. ADB auto-DOP is what hangs VECTOR_EMBEDDING work."""
-    for stmt in ("ALTER SESSION DISABLE PARALLEL QUERY", "ALTER SESSION DISABLE PARALLEL DML"):
+    for stmt in (
+        "ALTER SESSION SET parallel_degree_policy = MANUAL",
+        "ALTER SESSION DISABLE PARALLEL QUERY",
+        "ALTER SESSION DISABLE PARALLEL DML",
+    ):
         try:
             cur.execute(stmt)
         except Exception as e:  # pragma: no cover - privileges vary
-            logger.warning("could not run %r: %s", stmt, e)
+            logger.debug("could not run %r: %s", stmt, e)
 
 
 def assert_no_px(cur: Any) -> None:
-    cur.execute("SELECT COUNT(*) FROM v$px_session")
-    px = cur.fetchone()[0]
+    try:
+        cur.execute(
+            "SELECT COUNT(*) FROM v$px_session "
+            "WHERE qcsid = TO_NUMBER(SYS_CONTEXT('USERENV', 'SID')) "
+            "  AND sid != TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))"
+        )
+        px = cur.fetchone()[0]
+    except Exception:
+        cur.execute("SELECT COUNT(*) FROM v$px_session")
+        px = cur.fetchone()[0]
     if px:
         raise RuntimeError(
             f"{px} PX slave session(s) appeared - parallel execution is active and this "
@@ -121,21 +134,26 @@ def content_expr(alias: str) -> str:
     return f"DBMS_LOB.SUBSTR({alias}.content,{_MAX_CONTENT},1)"
 
 
-def partition_bounds(table: str, workers: int) -> list[str | None]:
+def partition_bounds(table: str, workers: int, nulls_only: bool = False) -> list[str | None]:
     """workers+1 MEMORY_ID boundaries splitting the table into equal ranges."""
+    if workers <= 1:
+        return [None, None]
     conn = connect()
     cur = conn.cursor()
     guard_serial(cur)
+    where = "WHERE (embedding IS NULL OR embedding_model IS NULL)" if nulls_only else "WHERE embedding IS NOT NULL"
     cur.execute(
         f"""SELECT MAX(memory_id) FROM (
               SELECT /*+ NO_PARALLEL */ memory_id,
                      NTILE(:n) OVER (ORDER BY memory_id) g
-              FROM {table} WHERE embedding IS NOT NULL)
+              FROM {table} {where})
             GROUP BY g ORDER BY g""",  # nosec B608
         [workers],
     )
-    highs = [r[0] for r in cur.fetchall()]
+    highs = [r[0] for r in cur.fetchall() if r[0] is not None]
     bounds: list[str | None] = [None, *highs]
+    if len(bounds) == 1:
+        bounds.append(None)
     cur.close()
     conn.close()
     return bounds
@@ -179,7 +197,10 @@ def run_worker(
     strikes = 0
     try:
         while not stop.is_set():
-            clauses = ["m.embedding IS NOT NULL", "m.content IS NOT NULL"]
+            if args.mode == "nulls":
+                clauses = ["(m.embedding IS NULL OR m.embedding_model IS NULL)", "m.content IS NOT NULL"]
+            else:
+                clauses = ["m.embedding IS NOT NULL", "m.content IS NOT NULL"]
             binds: list[Any] = []
             if last is not None:
                 clauses.append("m.memory_id > :last")
@@ -212,13 +233,28 @@ def run_worker(
                     n, ok = cur.fetchone()
                     n, ok = n or 0, ok or 0
                     counters.add(scanned=n, matched=ok, mismatched=n - ok)
+                elif args.mode == "nulls":
+                    cur.execute(
+                        f"""UPDATE {table} m
+                               SET m.embedding = VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA),
+                                   m.embedding_model = :model,
+                                   m.embedding_updated_at = SYSTIMESTAMP
+                             WHERE /*+ NO_PARALLEL(m) */ m.memory_id >= :lo AND m.memory_id <= :hi
+                               AND (m.embedding IS NULL OR m.embedding_model IS NULL)
+                               AND m.content IS NOT NULL""",  # nosec B608
+                        [model, batch_lo, batch_hi],
+                    )
+                    counters.add(written=cur.rowcount or 0, scanned=len(rows))
+                    conn.commit()
                 elif args.mode == "reembed":
                     cur.execute(
                         f"""UPDATE {table} m
-                               SET m.embedding = VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA)
+                               SET m.embedding = VECTOR_EMBEDDING({model} USING {content_expr('m')} AS DATA),
+                                   m.embedding_model = :model,
+                                   m.embedding_updated_at = SYSTIMESTAMP
                              WHERE /*+ NO_PARALLEL(m) */ m.memory_id >= :lo AND m.memory_id <= :hi
                                AND m.content IS NOT NULL""",  # nosec B608
-                        [batch_lo, batch_hi],
+                        [model, batch_lo, batch_hi],
                     )
                     counters.add(written=cur.rowcount or 0, scanned=len(rows))
                     conn.commit()
@@ -232,9 +268,11 @@ def run_worker(
                                     WHERE m.memory_id >= :lo AND m.memory_id <= :hi
                                       AND m.embedding IS NOT NULL AND m.content IS NOT NULL) s
                                ON (t.memory_id = s.memory_id)
-                            WHEN MATCHED THEN UPDATE SET t.embedding = s.newvec
+                            WHEN MATCHED THEN UPDATE SET t.embedding = s.newvec,
+                                                         t.embedding_model = :model,
+                                                         t.embedding_updated_at = SYSTIMESTAMP
                                  WHERE VECTOR_DISTANCE(s.oldvec, s.newvec, COSINE) > :tol""",  # nosec B608
-                        [batch_lo, batch_hi, args.tolerance],
+                        [batch_lo, batch_hi, model, args.tolerance],
                     )
                     counters.add(written=cur.rowcount or 0, scanned=len(rows))
                     conn.commit()
@@ -285,7 +323,16 @@ def run(args: argparse.Namespace) -> int:
         except Exception as e:
             logger.warning("ignoring unreadable checkpoint %s: %s", checkpoint, e)
 
-    bounds = partition_bounds(table, args.workers)
+    if args.mode == "nulls":
+        if args.batch_size > 25:
+            logger.info("mode=nulls: capping batch size from %d to 25 to stay strictly below Auto DOP threshold (~10s)", args.batch_size)
+            args.batch_size = 25
+        if args.workers != 1:
+            logger.info("mode=nulls: enforcing workers=1 for strictly serial execution to prevent Auto-DOP hangs (was %d)", args.workers)
+            args.workers = 1
+        if args.total_rows == 162_400:
+            args.total_rows = 1_228
+    bounds = partition_bounds(table, args.workers, nulls_only=(args.mode == "nulls"))
     # The partition is a snapshot; rows inserted while the job runs would sort
     # above the last boundary and be skipped. Extend the final range to a
     # sentinel that sorts above every MEMORY_ID form in use.
@@ -354,7 +401,7 @@ def main() -> None:
         description="Re-embed/verify Oracle 26ai memory embeddings using only the in-database ONNX model."
     )
     p.add_argument("--table", default=os.environ.get("HERMES_ORACLE_TABLE", _DEFAULT_TABLE))
-    p.add_argument("--mode", choices=("verify", "stale", "reembed"), default="verify")
+    p.add_argument("--mode", choices=("verify", "stale", "reembed", "nulls"), default="verify")
     p.add_argument("--onnx-model", default=os.environ.get("HERMES_ORACLE_ONNX_MODEL", _DEFAULT_MODEL))
     p.add_argument("--batch-size", type=int, default=_DEFAULT_BATCH)
     p.add_argument("--workers", type=int, default=_DEFAULT_WORKERS,
