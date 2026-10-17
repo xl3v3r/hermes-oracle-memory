@@ -1583,6 +1583,8 @@ class OracleMemoryProvider(MemoryProvider):
             return ""
         lines = []
         for r in rows[:8]:
+            if not isinstance(r, dict):
+                continue
             body = (r.get("content") or "").replace("\n", " ").strip()
             body = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", body)
             if len(body) > 280:
@@ -1756,6 +1758,8 @@ class OracleMemoryProvider(MemoryProvider):
                     "error": f"Oracle memory not initialized: {self._init_error or self.unavailable_reason()}"
                 }
             )
+        if not isinstance(args, dict):
+            args = {}
         try:
             if tool_name == "oracle_search":
                 rows = self._search(

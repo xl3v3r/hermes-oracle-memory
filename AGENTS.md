@@ -35,7 +35,7 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 │   └── verify_provider.py
 ├── skills/                 # Hermes agent skills
 │   └── oracle-import/      # Bulk conversation and archive ingestion skill
-└── tests/                  # Unit test suite (112 tests)
+└── tests/                  # Unit test suite (115 tests)
     ├── conftest.py         # Test configuration & mocks for Hermes host and DB drivers
     ├── test_format_prefetch.py # Prefetch formatting tests
     ├── test_init.py        # Gateway turn detection and config schema tests

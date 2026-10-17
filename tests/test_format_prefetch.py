@@ -83,6 +83,12 @@ class TestFormatPrefetch(unittest.TestCase):
         result = provider._format_prefetch(rows)
         self.assertIn('id="m&quot;&lt;&gt;&amp;" target="user&#x27;x"', result)
 
+    def test_non_dict_row_ignored(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        rows = [None, "invalid", 123, {"content": "valid memory"}]
+        result = provider._format_prefetch(rows)
+        self.assertIn("valid memory", result)
+
 
 if __name__ == '__main__':
     unittest.main()

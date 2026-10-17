@@ -1035,6 +1035,45 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("m1", res)
         provider._search.assert_called_with("test", top_k=8, mode="hybrid", target="any", session_id="s1", agent_id="a1")
 
+    def test_handle_tool_call_non_dict_args(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        # Passing None as args should be handled defensively and not raise TypeError
+        with patch.object(oracle_plugin, "tool_error", side_effect=lambda msg: f"Error: {msg}"):
+            res = provider.handle_tool_call("oracle_delete", None)
+            self.assertIn("memory_id or session_id required", res)
+
+    def test_metadata_version_consistency(self):
+        from pathlib import Path
+        repo_dir = Path(__file__).resolve().parent.parent
+
+        # 1. __init__.py
+        self.assertEqual(oracle_plugin.__version__, "1.0.8")
+
+        # 2. plugin.yaml
+        plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
+        self.assertIn("version: 1.0.8", plugin_yaml)
+        self.assertIn("version-1.0.8-blue.svg", plugin_yaml)
+
+        # 3. pyproject.toml
+        pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('version = "1.0.8"', pyproject)
+
+        # 4. skills/oracle-import/SKILL.md
+        skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("version: 1.0.8", skill_md)
+
+        # 5. README.md & INSTALL.md
+        readme = (repo_dir / "README.md").read_text(encoding="utf-8")
+        self.assertIn("version-1.0.8-blue.svg", readme)
+        self.assertIn("v1.0.8", readme)
+
+        install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
+        self.assertIn("version-1.0.8-blue.svg", install_md)
+        self.assertIn("v1.0.8", install_md)
+
     def test_zero_drift_with_installed_plugin(self):
         import filecmp
         import os
@@ -1053,18 +1092,20 @@ class TestOraclePlugin(unittest.TestCase):
             "hermes_oracle_memory.egg-info", "uv.lock", "backups", "backfills",
         }
         
-        for root, dirs, files in os.walk(repo_dir):
-            dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
-            for f in files:
-                if f.endswith((".pyc", ".lock")):
-                    continue
-                full_path = Path(root) / f
-                rel = full_path.relative_to(repo_dir)
-                plugin_file = plugin_dir / rel
-                self.assertTrue(plugin_file.exists(), f"File missing in plugin: {rel}")
-                self.assertTrue(filecmp.cmp(str(full_path), str(plugin_file), shallow=False), f"Drift detected in {rel}")
+        for base, other, label in [(repo_dir, plugin_dir, "plugin"), (plugin_dir, repo_dir, "repository")]:
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
+                for f in files:
+                    if f.endswith((".pyc", ".lock")):
+                        continue
+                    full_path = Path(root) / f
+                    rel = full_path.relative_to(base)
+                    target_file = other / rel
+                    self.assertTrue(target_file.exists(), f"File missing in {label}: {rel}")
+                    self.assertTrue(filecmp.cmp(str(full_path), str(target_file), shallow=False), f"Drift detected in {rel}")
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
