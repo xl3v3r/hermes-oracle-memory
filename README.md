@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.8-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.8.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.8 updates are CRITICAL to functionality. Hardened serial execution, prompt injection defense, thread purging, and search scoping require this version.
+> **CRITICALITY NOTICE**: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.8 updates are CRITICAL to functionality. Hardened serial execution, prompt injection defense, thread purging, and search scoping require this version.
+> **CRITICALITY NOTICE**: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 ### Recommended — Hermes plugin manager
 
@@ -65,6 +65,12 @@ Embeddings resolve in this order, in-database first:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.8.1
+
+- **Criticality Notice**: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+- **Updated 9 Oracle 26ai Memory Rules**: System prompt enforces strict 9 rules covering Oracle-first search, atomic fact sink, memory_id lifecycle, storage tiers, Oracle-only store (no local MEMORY.md), Oracle unavailability behavior, internal write-ahead logging (`wal_*`), session scoping tags, and pre-write validation.
+- **Local Memory Deactivation & Rule 6 Fallback**: Aligned provider fallback prompt with Rule 6 to prohibit local memory; Oracle ADB 26ai serves as the sole system of record.
 
 ## What's new in v1.0.8
 

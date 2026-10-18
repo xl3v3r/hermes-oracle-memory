@@ -647,7 +647,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.8")
+        self.assertEqual(oracle_plugin.__version__, "1.0.8.1")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -655,12 +655,20 @@ class TestOraclePlugin(unittest.TestCase):
         provider._agent_id = "test-agent"
         block = provider.system_prompt_block()
         self.assertIn("# Oracle 26ai Memory (Primary Store)", block)
-        self.assertIn("Rule 1 — ORACLE-FIRST SEARCH", block)
-        self.assertIn("Rule 2 — ORACLE-FIRST FACT SINK", block)
-        self.assertIn("Rule 3 — ANTI-CONFLATION & NO CROSS-STORE DELETION", block)
-        self.assertIn("DO NOT CONFLATE WITH LOCAL MEMORY", block)
-        self.assertIn("Rule 4 — BATCH & DOCUMENT STORAGE", block)
-        self.assertIn("1,600-character", block)
+        self.assertIn("1. ORACLE-FIRST SEARCH", block)
+        self.assertIn("2. ORACLE-FIRST FACT SINK", block)
+        self.assertIn("3. MEMORY_ID LIFECYCLE", block)
+        self.assertIn("4. STORAGE TIERS", block)
+        self.assertIn("5. ORACLE-ONLY STORE", block)
+        self.assertIn("6. ORACLE UNAVAILABILITY", block)
+        self.assertIn("7. INTERNAL WRITE-AHEAD", block)
+        self.assertIn("8. SESSION SCOPING", block)
+        self.assertIn("9. VALIDATION BEFORE WRITE", block)
+
+        provider_down = oracle_plugin.OracleMemoryProvider()
+        provider_down._pool = None
+        down_block = provider_down.system_prompt_block()
+        self.assertIn("No memory store is available. Local memory is prohibited.", down_block)
 
     def test_tool_schemas_oracle_first(self):
         schemas = {s["name"]: s for s in oracle_plugin.TOOL_SCHEMAS}
@@ -1050,29 +1058,29 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.8")
+        self.assertEqual(oracle_plugin.__version__, "1.0.8.1")
 
         # 2. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.8", plugin_yaml)
-        self.assertIn("version-1.0.8-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.8.1", plugin_yaml)
+        self.assertIn("version-1.0.8.1-blue.svg", plugin_yaml)
 
         # 3. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.8"', pyproject)
+        self.assertIn('version = "1.0.8.1"', pyproject)
 
         # 4. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.8", skill_md)
+        self.assertIn("version: 1.0.8.1", skill_md)
 
         # 5. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.8-blue.svg", readme)
-        self.assertIn("v1.0.8", readme)
+        self.assertIn("version-1.0.8.1-blue.svg", readme)
+        self.assertIn("v1.0.8.1", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.8-blue.svg", install_md)
-        self.assertIn("v1.0.8", install_md)
+        self.assertIn("version-1.0.8.1-blue.svg", install_md)
+        self.assertIn("v1.0.8.1", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp

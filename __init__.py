@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.8"
+__version__ = "1.0.8.1"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -188,22 +188,30 @@ TOOL_SCHEMAS = [
 ]
 
 _PROMPT_BODY = (
-    "Oracle AI Database 26ai is your PRIMARY and UNLIMITED persistent memory backend.\n"
-    "CRITICAL MEMORY RULES:\n"
-    "Rule 1 — ORACLE-FIRST SEARCH: ALWAYS call `oracle_search` FIRST before answering any questions that depend on "
-    "prior context, user preferences, configurations, architecture, credentials, people, or project history. "
-    "Never assume a fact is unknown or rely solely on local prompt buffers without searching Oracle memory.\n"
-    "Rule 2 — ORACLE-FIRST FACT SINK: `oracle_add` is the PRIMARY SINK for all lasting facts, user details, "
-    "decisions, preferences, and session learnings. Oracle storage is UNLIMITED and persists across all sessions.\n"
-    "Rule 3 — ANTI-CONFLATION & NO CROSS-STORE DELETION (DO NOT CONFLATE WITH LOCAL MEMORY): Local MEMORY.md (the built-in memory tool) has a hard 1,600-character "
-    "budget intended ONLY for minimal bootstrap notes. NEVER attempt to save general operational facts, project "
-    "knowledge, or batch summaries into the 1,600-char local memory store. When extracting facts or asked to "
-    "commit information to memory, ALWAYS route facts to Oracle 26ai via `oracle_add`. Furthermore, NEVER use "
-    "the local memory tool to remove or edit Oracle entries: identifiers starting with `chk_` or `fact_` belong "
-    "exclusively to Oracle 26ai and must be managed via `oracle_delete` and `oracle_update`.\n"
-    "Rule 4 — BATCH & DOCUMENT STORAGE: Use `oracle_add` (single facts or batch fact lists) for atomic knowledge; "
-    "use `oracle_chunk` for documents, logs, or conversation exports via in-database UTL_TO_CHUNKS. "
-    "Manage existing entries via `oracle_update` and `oracle_delete` using memory_id."
+    "# Oracle 26ai Memory Rules (Hermes Agent)\n\n"
+    "Oracle 26ai ADB is the system of record for all lasting memory. There is no local memory store. "
+    "If Oracle is unreachable, the agent remembers nothing.\n\n"
+    "1. ORACLE-FIRST SEARCH: Before answering any context-dependent question, call oracle_search. "
+    "Use results as authoritative context. Re-search with broader terms if ambiguous. "
+    "If Oracle is unreachable, state that no memory is available. Ask the user only if Oracle returns nothing.\n\n"
+    "2. ORACLE-FIRST FACT SINK: All lasting facts, preferences, decisions, configurations, and learnings "
+    "go to Oracle via oracle_add. Use a stable memory_id, compact content (<~200 chars), and tags. "
+    "No local fallback — if Oracle is unreachable, facts are not stored.\n\n"
+    "3. MEMORY_ID LIFECYCLE: oracle_search before oracle_add to avoid duplicates. "
+    "If memory_id exists, use oracle_update(memory_id, ...). Use oracle_delete(memory_id) for obsolete or incorrect facts.\n\n"
+    "4. STORAGE TIERS: oracle_add for atomic facts/batch lists; oracle_chunk for documents/logs/conversation exports; "
+    "skill_manage for task-specific procedures; no TODO state stored anywhere.\n\n"
+    "5. ORACLE-ONLY STORE: There is no local memory. MEMORY.md and all local files are off-limits for facts. "
+    "All lasting facts live exclusively in Oracle 26ai.\n\n"
+    "6. ORACLE UNAVAILABILITY: If Oracle is unreachable, the agent remembers nothing. No facts are buffered, cached, "
+    "or written locally. State clearly that Oracle is unavailable. On reconnection, resume normal operations.\n\n"
+    "7. INTERNAL WRITE-AHEAD: When Oracle is reachable, stage writes inside Oracle before committing. "
+    "oracle_add to a staging memory_id prefixed with wal_ (e.g., wal_20261017_user_lang) with tags [\"pending\", \"wal\"]. "
+    "Validate via oracle_search, then oracle_add the final entry with its canonical memory_id and production tags, "
+    "and oracle_delete the wal_ staging entry.\n\n"
+    "8. SESSION SCOPING: Tag every Oracle entry: [\"global\"], [\"user:<id>\"], [\"session:<id>\"], "
+    "[\"project:<name>\"], [\"session_learn\"], or [\"pending\", \"wal\"] for staging.\n\n"
+    "9. VALIDATION BEFORE WRITE: Confirm durability, dedupe via search, keep content compact, normalize terminology."
 )
 
 
@@ -521,7 +529,7 @@ class OracleMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not self._pool:
             reason = self._init_error or self.unavailable_reason() or "not initialized"
-            return f"# Oracle 26ai Memory\nUnavailable ({reason}). Built-in MEMORY.md still applies."
+            return f"# Oracle 26ai Memory\nUnavailable ({reason}). No memory store is available. Local memory is prohibited."
         return (
             "# Oracle 26ai Memory (Primary Store)\n"
             f"Active: ADB VECTOR IVF + Oracle Text + JSON. Agent: {self._agent_id}.\n"

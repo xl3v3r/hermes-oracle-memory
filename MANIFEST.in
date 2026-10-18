@@ -1,7 +1,7 @@
 include plugin.yaml
 include README.md
 include INSTALL.md
-include RELEASE_NOTES_1.0.8.md
+include RELEASE_NOTES_1.0.8.1.md
 include AGENTS.md
 include LICENSE
 include CLA.md
