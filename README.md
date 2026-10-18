@@ -70,7 +70,7 @@ Embeddings are computed 100% in-house:
 - **Automated Skill Lifecycle Observer Hook (Option B)**:
   - In `register(ctx)`: registers an observer hook on `on_skill_lifecycle` via `ctx.register_hook("on_skill_lifecycle", callback)`.
   - Captures skill lifecycle actions (`action in ("used", "loaded")`) and records compact facts (<200 chars satisfying Rule 2 and avoiding 280-char prefetch truncation) stamped with Rule 8 bracketed tags:
-    `[skill_usage] [skill:<skill_name>] [action:<action>] [ts:<ISO8601>] [session:<session_id>] Skill '<skill_name>' activated in session '<session_id>'.`
+    `[skill_usage] [skill:<skill_name>] [action:<action>] [ts:<ISO8601>] [session:<session_id>] Skill '<skill_name>' activated.`
   - Asynchronously enqueues writes to Oracle ADB memory via `_queue_background_insert` for non-blocking, fail-safe background persistence.
   - Zero external API transit: 100% in-database ONNX embedding generation strictly within Oracle Autonomous AI Database 26ai.
 

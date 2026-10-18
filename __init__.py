@@ -1606,7 +1606,7 @@ class OracleMemoryProvider(MemoryProvider):
 
             content = (
                 f"[skill_usage] [skill:{skill_name}] [action:{action}] [ts:{ts}] "
-                f"[session:{session_id}] Skill '{skill_name}' activated in session '{session_id}'."
+                f"[session:{session_id}] Skill '{skill_name}' activated."
             )
             self._queue_background_insert(
                 memory_id=f"skill_{uuid.uuid4().hex[:16]}",

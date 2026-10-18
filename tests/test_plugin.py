@@ -117,7 +117,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
             self.assertIn("[skill:oracle-import]", content)
             self.assertIn("[action:used]", content)
             self.assertIn("[session:test-session-123]", content)
-            self.assertIn("Skill 'oracle-import' activated in session 'test-session-123'.", content)
+            self.assertIn("Skill 'oracle-import' activated.", content)
             self.assertLess(len(content), 200)
 
     def test_on_skill_lifecycle_loaded_action(self):
@@ -138,7 +138,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
             kwargs = mock_insert.call_args[1]
             expected_content = (
                 "[skill_usage] [skill:test-skill] [action:loaded] [ts:2026-10-18T07:49:40Z] "
-                "[session:session-xyz] Skill 'test-skill' activated in session 'session-xyz'."
+                "[session:session-xyz] Skill 'test-skill' activated."
             )
             self.assertEqual(kwargs["content"], expected_content)
             self.assertLess(len(kwargs["content"]), 200)
