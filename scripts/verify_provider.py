@@ -92,25 +92,22 @@ def main() -> None:
             print(f"Init error: {provider._init_error}")
         sys.exit(1)
 
-    print(f"Configured ONNX model: {provider._onnx_model or 'None (using OpenRouter 768-d fallback)'}")
+    print(f"Configured ONNX model: {provider._onnx_model}")
 
     # 1. Verify single embedding generation
-    print("Testing _embed (Option B in-database ONNX or Option C OpenRouter fallback)...")
+    print("Testing _embed (in-database ONNX VECTOR_EMBEDDING)...")
     vec = provider._embed("Oracle 26ai Autonomous Database vector search verification")
     assert vec is not None, "Failed to get vector embedding"
     assert len(vec) == 768, f"Expected 768 dimensions, got {len(vec)}"
     print(f"Vector embedding verified: dim={len(vec)}, type={vec.typecode}")
 
-    # 2. Verify batch embedding with edge cases (empty strings, whitespace, None)
-    print("Testing _embed_openrouter with edge cases...")
-    edge_vecs = provider._embed_openrouter(["valid query", "", "   ", None, "another query"])
-    assert len(edge_vecs) == 5, f"Expected 5 results, got {len(edge_vecs)}"
-    assert edge_vecs[0] is not None and len(edge_vecs[0]) == 768, "Failed valid query 1"
-    assert edge_vecs[1] is None, "Empty string should yield None"
-    assert edge_vecs[2] is None, "Whitespace string should yield None"
-    assert edge_vecs[3] is None, "None should yield None"
-    assert edge_vecs[4] is not None and len(edge_vecs[4]) == 768, "Failed valid query 2"
-    print("Batch edge cases handled successfully.")
+    # 2. Verify batch embedding
+    print("Testing _embed_many with batch of texts...")
+    batch_vecs = provider._embed_many(["valid query", "another query"])
+    assert len(batch_vecs) == 2, f"Expected 2 results, got {len(batch_vecs)}"
+    assert batch_vecs[0] is not None and len(batch_vecs[0]) == 768, "Failed valid query 1"
+    assert batch_vecs[1] is not None and len(batch_vecs[1]) == 768, "Failed valid query 2"
+    print("Batch embedding verified successfully.")
 
     # 3. Verify vector search
     print("Testing vector search...")
@@ -187,23 +184,27 @@ def main() -> None:
     assert len(batch_data.get("memory_ids", [])) == 2, "Expected 2 memory IDs returned"
     print("Batch facts insertion verified.")
 
-    # 9. Verify live fallback to OpenRouter when ONNX model is unavailable
-    print("Testing live fallback from broken ONNX to OpenRouter 768-d...")
+    # 9. Verify error handling when ONNX model is unavailable (no external fallback)
+    print("Testing strictly in-database error handling when ONNX model is unavailable...")
     orig_onnx = provider._onnx_model
     try:
         provider._onnx_model = "NONEXISTENT_ONNX_MODEL_TEST"
-        fallback_results = provider._search("database memory architecture", mode="vector", top_k=2)
-        print(f"Fallback vector search returned {len(fallback_results)} results")
-        fallback_hybrid = provider._search("database memory architecture", mode="hybrid", top_k=2)
-        print(f"Fallback hybrid search returned {len(fallback_hybrid)} results")
-        fallback_add = provider._insert(
-            memory_id=f"fallback_test_{uuid.uuid4().hex[:8]}",
-            session_id="fallback-session",
-            role="user",
-            content="Fallback content test for OpenRouter",
-            target="memory",
-        )
-        print("Fallback insert succeeded.")
+        try:
+            provider._search("database memory architecture", mode="vector", top_k=2)
+            assert False, "Expected RuntimeError when ONNX model does not exist"
+        except RuntimeError as e:
+            print(f"Verified expected RuntimeError on broken ONNX vector search: {e}")
+        try:
+            provider._insert(
+                memory_id=f"broken_onnx_test_{uuid.uuid4().hex[:8]}",
+                session_id="broken-session",
+                role="user",
+                content="Broken ONNX insert test",
+                target="memory",
+            )
+            assert False, "Expected RuntimeError on broken ONNX insert"
+        except RuntimeError as e:
+            print(f"Verified expected RuntimeError on broken ONNX insert: {e}")
     finally:
         provider._onnx_model = orig_onnx
 

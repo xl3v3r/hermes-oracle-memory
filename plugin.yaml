@@ -1,9 +1,9 @@
 name: oracle
-version: 1.0.8.1
-description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version."
+version: 1.0.8.2
+description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version."
 pip_dependencies:
   - oracledb>=4.0.2
 
 # Badges & Criticality Notice
-# [![Version](https://img.shields.io/badge/version-1.0.8.1-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
-# CRITICALITY NOTICE: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+# [![Version](https://img.shields.io/badge/version-1.0.8.2-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
+# CRITICALITY NOTICE: v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.

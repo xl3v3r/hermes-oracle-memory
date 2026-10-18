@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.8.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.8.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 ### Recommended — Hermes plugin manager
 
@@ -46,11 +46,9 @@ OCI_DB_DSN="(DESCRIPTION=(...))"        # Oracle Net descriptor or TNS alias
 OCI_WALLET_LOCATION=~/.oci/wallet        # mTLS wallet dir (optional)
 ```
 
-Embeddings resolve in this order, in-database first:
+Embeddings are computed 100% in-house:
 
-1. **In-database ONNX** (`HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5`) — zero external API cost
-2. **OCI GenAI** (`OCI_GENAI_REGION`, instance-principal auth) — optional
-3. **OpenRouter** (`OPENROUTER_API_KEY`) — fallback
+1. **In-database ONNX** (`HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5`) — strictly in-database kernel execution; external fallback disabled.
 
 ## Tools
 
@@ -65,6 +63,14 @@ Embeddings resolve in this order, in-database first:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.8.2
+
+- **Criticality Notice**: v1.0.8.2 updates are CRITICAL to functionality. Eliminates external OpenRouter fallback for strict 100% in-house database ONNX embeddings, tunes connection pool limits (`min: 2, max: 6, call_timeout: 30000`), fixes hyphen minus syntax collisions in Oracle Text queries, and registers `oracle_search` as parallel-safe.
+- **100% In-House Data Retention (No External Fallback)**: Completely removed the external OpenRouter embedding fallback. Vector embeddings are generated strictly in-database via ONNX `VECTOR_EMBEDDING`, ensuring confidential agent memory never leaves the customer database enclave.
+- **Session Pool Concurrency Tuning**: Adjusted pool parameters to `min: 2, max: 6` with `call_timeout: 30000` ms to eliminate pool contention and connection starvation during concurrent tool calls and turn synchronization.
+- **Oracle Text Syntax Resilience**: Sanitized hyphen/minus characters in `_CONTAINS_CLEAN_RE` so queries with hyphenated terms (e.g. `top-secret`) do not trigger `DRG-50901: text query syntax error`.
+- **Parallel Dispatch Safety**: Registered `oracle_search` under Hermes agent `_PARALLEL_SAFE_TOOLS` for concurrency-safe execution alongside parallel tool calling.
 
 ## What's new in v1.0.8.1
 

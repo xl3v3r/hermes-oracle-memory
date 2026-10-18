@@ -2,9 +2,8 @@
 
 VECTOR IVF + Oracle Text + JSON search as the primary Hermes memory backend.
 Credentials: OCI_DB_USER / OCI_DB_PASSWORD / OCI_DB_DSN in $HERMES_HOME/.env.
-Embeddings: Option B (768-d in-database ONNX model) as primary, with Option C
-(OpenRouter qwen/qwen3-embedding-4b at 768-d FLOAT64) as automatic graceful fallback.
-OCI GenAI cohere.embed-v4.0 is tried first if configured; on failure it falls back.
+Embeddings: In-database ONNX model (768-d BGE_BASE_EN_V1_5 via VECTOR_EMBEDDING) strictly
+in-database. Keeping all data 100% in-house with zero external third-party endpoint fallback.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.8.1"
+__version__ = "1.0.8.2"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -51,7 +50,7 @@ _EXTERNAL_EMBED_KILLSWITCH = (
     in ("1", "true", "yes")
 )
 _MAX_CHUNK_FILE_BYTES = 64 * 1024 * 1024
-_CONTAINS_CLEAN_RE = re.compile(r"[^\w\s-]")
+_CONTAINS_CLEAN_RE = re.compile(r"[^\w\s]")
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"^\s*(?:"
     r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
@@ -398,13 +397,14 @@ class OracleMemoryProvider(MemoryProvider):
                 "user": self._user,
                 "password": password,
                 "dsn": self._dsn,
-                "min": 1,
-                "max": 3,
+                "min": 2,
+                "max": 6,
                 "increment": 1,
                 "threaded": True,
                 "getmode": oracledb.POOL_GETMODE_WAIT,
                 "timeout": 5,
                 "wait_timeout": 5,
+                "call_timeout": 30000,
             }
 
             raw_wallet = get_secret("OCI_WALLET_LOCATION")
@@ -637,97 +637,16 @@ class OracleMemoryProvider(MemoryProvider):
                 self._oci_embed_failed_at = None
             return out
         except Exception as e:
-            logger.info("OCI GenAI embed unavailable (%s); using OpenRouter", e)
+            logger.info("OCI GenAI embed unavailable (%s)", e)
             with self._embed_lock:
                 self._oci_embed_failed_at = now
             return None
 
-    def _embed_openrouter(self, texts: list[str]) -> list[array.array | None]:
-        out: list[array.array | None] = [None] * len(texts)
-        if not texts:
-            return out
-        try:
-            key = get_secret("OPENROUTER_API_KEY")
-        except Exception:
-            # No profile secret scope on this worker thread (multiplex). OCI is the
-            # preferred path anyway; fail soft and let the caller keep the None vec.
-            logger.debug("OpenRouter embed skipped: no OPENROUTER_API_KEY in scope")
-            return out
-        if not key or not isinstance(key, str):
-            return out
-
-        # Filter and track non-empty texts to avoid OpenRouter 400 Bad Request on empty strings
-        # or TypeError on None.
-        valid_indices: list[int] = [
-            i
-            for i, t in enumerate(texts)
-            if t is not None and isinstance(t, str) and t.strip()
-        ]
-        if not valid_indices:
-            return out
-
-        input_payload = [texts[i][:8000] for i in valid_indices]
-
-        try:
-            import urllib.error
-            import urllib.request
-
-            req_data = json.dumps(
-                {
-                    "model": _EMBED_MODEL,
-                    "input": input_payload,
-                    "dimensions": _EMBED_DIM,
-                }
-            ).encode("utf-8")
-
-            max_retries = _EMBED_MAX_RETRIES
-            backoff = 1.0
-            data = None
-
-            for attempt in range(1, max_retries + 1):
-                try:
-                    req = urllib.request.Request(
-                        "https://openrouter.ai/api/v1/embeddings",
-                        data=req_data,
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type": "application/json",
-                        },
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=_EMBED_TIMEOUT_SECS) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                    break
-                except urllib.error.HTTPError as he:
-                    if (he.code == 429 or he.code >= 500) and attempt < max_retries:
-                        time.sleep(backoff)
-                        backoff *= 2.0
-                        continue
-                    raise
-                except Exception as ex:
-                    if attempt < max_retries:
-                        time.sleep(backoff)
-                        backoff *= 2.0
-                        continue
-                    raise
-
-            if data:
-                for item in data.get("data") or []:
-                    resp_idx = int(item.get("index", 0))
-                    vec = item.get("embedding") or []
-                    if 0 <= resp_idx < len(valid_indices) and len(vec) == _EMBED_DIM:
-                        orig_idx = valid_indices[resp_idx]
-                        out[orig_idx] = array.array("f", vec)
-        except Exception as e:
-            logger.warning("OpenRouter embed failed: %s", e)
-        return out
-
     def _embed_many_tagged(self, texts: list[str]) -> list[tuple[array.array | None, str | None]]:
-        """Embed texts and report which backend produced each vector.
+        """Embed texts via in-database ONNX model and report provenance.
 
         Returns (vec, model) pairs where model is the provenance stamp stored in
-        embedding_model. Write paths use this so every stored vector records its
-        origin; search paths use _embed_many and ignore the tag.
+        embedding_model. All embeddings run strictly via in-database ONNX.
         """
         if not texts:
             return []
@@ -746,52 +665,56 @@ class OracleMemoryProvider(MemoryProvider):
                 unique_miss_texts.append(text)
             unique_indices[text].append(i)
         miss_texts = unique_miss_texts
-        got: list[array.array | None] | None = None
-        got_tags: list[str | None] = [None] * len(miss_texts)
 
-        # Option B: Primary in-database ONNX model embedding
-        onnx_enabled = bool(
-            self._onnx_model and self._pool and not self._onnx_in_cooldown()
-        )
-        if onnx_enabled:
-            try:
-                db_vecs: list[array.array | None] = [None] * len(miss_texts)
-                with self._pool.acquire() as conn, conn.cursor() as cur:
-                    # Batch all texts in a single UNION ALL round-trip instead of
-                    # one VECTOR_EMBEDDING query per text (the N+1 problem).
-                    for i in range(0, len(miss_texts), _EMBED_BATCH):
-                        batch_texts = miss_texts[i : i + _EMBED_BATCH]
-                        parts = []
-                        binds = []
-                        for j, t in enumerate(batch_texts):
-                            parts.append(
-                                f"SELECT /*+ NO_PARALLEL */ {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
-                            )
-                            binds.append(t[:4000])
-                        cur.execute(" UNION ALL ".join(parts) + " ORDER BY id", binds)
-                        for row in cur.fetchall():
-                            idx = int(row[0])
-                            vec = row[1] if len(row) > 1 else None
-                            if vec is not None and len(vec) == _EMBED_DIM:
-                                db_vecs[i + idx] = vec
-                if any(v is not None for v in db_vecs):
-                    got = db_vecs
-                    got_tags = [
-                        self._onnx_model if v is not None else None for v in got
-                    ]
-                self._onnx_mark_ok()
-            except Exception as e:
-                logger.warning(
-                    "In-database ONNX embed_many failed (%s); falling back to external embedding",
-                    e,
-                )
-                self._onnx_mark_failed()
-                got = None
+        if not self._onnx_model:
+            raise RuntimeError(
+                "In-database ONNX embedding model is not configured; external fallback is disabled"
+            )
+        if not self._pool:
+            raise RuntimeError(
+                "Database session pool is not initialized; external fallback is disabled"
+            )
+        if self._onnx_in_cooldown():
+            raise RuntimeError(
+                "In-database ONNX embedding model is in cooldown; external fallback is disabled"
+            )
 
-        # Option C: Fallback to OCI GenAI or OpenRouter
-        if got is None:
-            got, ext_tag = self._embed_external_tagged(miss_texts)
-            got_tags = [ext_tag if v is not None else None for v in got]
+        try:
+            db_vecs: list[array.array | None] = [None] * len(miss_texts)
+            with self._pool.acquire() as conn, conn.cursor() as cur:
+                # Batch all texts in a single UNION ALL round-trip instead of
+                # one VECTOR_EMBEDDING query per text (the N+1 problem).
+                for i in range(0, len(miss_texts), _EMBED_BATCH):
+                    batch_texts = miss_texts[i : i + _EMBED_BATCH]
+                    parts = []
+                    binds = []
+                    for j, t in enumerate(batch_texts):
+                        parts.append(
+                            f"SELECT /*+ NO_PARALLEL */ {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
+                        )
+                        binds.append(t[:4000])
+                    cur.execute(" UNION ALL ".join(parts) + " ORDER BY id", binds)
+                    for row in cur.fetchall():
+                        idx = int(row[0])
+                        vec = row[1] if len(row) > 1 else None
+                        if vec is not None and len(vec) == _EMBED_DIM:
+                            db_vecs[i + idx] = vec
+            if not any(v is not None for v in db_vecs):
+                raise RuntimeError("No valid vectors returned from in-database ONNX inference")
+            got = db_vecs
+            got_tags = [
+                self._onnx_model if v is not None else None for v in got
+            ]
+            self._onnx_mark_ok()
+        except Exception as e:
+            logger.warning(
+                "In-database ONNX embed_many failed (%s); external fallback is disabled",
+                e,
+            )
+            self._onnx_mark_failed()
+            raise RuntimeError(
+                f"In-database ONNX embedding failed ({e}); external fallback is disabled"
+            ) from e
 
         for text, vec, model in zip(miss_texts, got, got_tags):
             if vec is not None:
@@ -803,36 +726,6 @@ class OracleMemoryProvider(MemoryProvider):
     def _embed_many(self, texts: list[str]) -> list[array.array | None]:
         """Untagged view for search paths, which never store the vectors."""
         return [v for v, _m in self._embed_many_tagged(texts)]
-
-    def _embed_external_tagged(self, texts: list[str]) -> tuple[list[array.array | None], str | None]:
-        """Embed through remote providers without retrying the in-database model,
-        reporting which provider produced the vectors.
-
-        Remote providers receive raw memory content, so this path is guarded:
-        HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1 disables it entirely, and a
-        one-time warning is emitted so operators know when data leaves the DB.
-        """
-        if _EXTERNAL_EMBED_KILLSWITCH:
-            return [None] * len(texts), None
-        if not self._external_embed_warned:
-            with self._embed_lock:
-                if not self._external_embed_warned:
-                    self._external_embed_warned = True
-                    logger.warning(
-                        "external embedding provider in use: %d memory text(s) "
-                        "will be sent outside the database (set "
-                        "HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1 to forbid this)",
-                        len(texts),
-                    )
-        got = self._embed_oci(texts)
-        if got is not None:
-            return got, f"oci:{os.environ.get('OCI_EMBED_MODEL', _OCI_EMBED_MODEL)}"
-        got = self._embed_openrouter(texts)
-        return got, f"openrouter:{_EMBED_MODEL}"
-
-    def _embed_external(self, texts: list[str]) -> list[array.array | None]:
-        vecs, _model = self._embed_external_tagged(texts)
-        return vecs
 
     def _embed(self, text: str) -> array.array | None:
         if not text:
@@ -1017,13 +910,18 @@ class OracleMemoryProvider(MemoryProvider):
                 return
             except Exception as e:
                 logger.warning(
-                    "In-database ONNX insert failed (%s); falling back to OpenRouter embedding",
+                    "In-database ONNX insert failed (%s); external fallback is disabled",
                     e,
                 )
                 self._onnx_mark_failed()
-                if vec is None:
-                    ext_vecs, vec_model = self._embed_external_tagged([content])
-                    vec = ext_vecs[0]
+                raise RuntimeError(
+                    f"In-database ONNX insert failed ({e}); external fallback is disabled"
+                ) from e
+
+        if vec is None:
+            raise RuntimeError(
+                "In-database ONNX embedding model is unavailable; external fallback is disabled"
+            )
 
         sql = f"""
             INSERT /*+ NO_PARALLEL */ INTO {self._table}
@@ -1108,33 +1006,30 @@ class OracleMemoryProvider(MemoryProvider):
                 return
             except Exception as e:
                 logger.warning(
-                    "In-database ONNX insert_many failed (%s); falling back to OpenRouter embedding",
+                    "In-database ONNX insert_many failed (%s); external fallback is disabled",
                     e,
                 )
                 self._onnx_mark_failed()
+                raise RuntimeError(
+                    f"In-database ONNX insert_many failed ({e}); external fallback is disabled"
+                ) from e
+
+        if any(r.get("embedding") is None for r in rows):
+            raise RuntimeError(
+                "In-database ONNX embedding model is unavailable; external fallback is disabled"
+            )
 
         binds_list = []
-        backfill_queue = []
-        contents = [(r.get("content") or "") for r in rows]
-        needed_indices = [i for i, r in enumerate(rows) if r.get("embedding") is None]
-        needed_texts = [contents[i] for i in needed_indices]
-        fetched = self._embed_many_tagged(needed_texts) if needed_texts else []
-        vec_map = {idx: fetched[j][0] for j, idx in enumerate(needed_indices)}
-        model_map = {idx: fetched[j][1] for j, idx in enumerate(needed_indices)}
-
-        for i, row in enumerate(rows):
+        for row in rows:
             memory_id = row.get("memory_id")
             session_id = row.get("session_id") or self._session_id or "none"
             role = row.get("role")
             content = row.get("content")
             target = row.get("target")
             metadata = row.get("metadata")
-            embedding = row.get("embedding") if row.get("embedding") is not None else vec_map.get(i)
-            # An embedding supplied by the caller has unknown provenance; one
-            # computed here carries the tag of the backend that produced it.
-            model = None if row.get("embedding") is not None else model_map.get(i)
+            vec = row.get("embedding")
+            model = row.get("embedding_model")
 
-            vec = embedding if embedding is not None else None
             meta = json.dumps(metadata or {})
             txt = (content or "")[:4000]
 
@@ -1156,9 +1051,6 @@ class OracleMemoryProvider(MemoryProvider):
             )
             binds_list.append(binds)
 
-            if vec is None:
-                backfill_queue.append((memory_id, content))
-
         sql = f"""
             INSERT /*+ NO_PARALLEL */ INTO {self._table}
                 (memory_id, session_id, agent_id, role, content, embedding,
@@ -1172,9 +1064,6 @@ class OracleMemoryProvider(MemoryProvider):
         with self._pool.acquire() as conn, conn.cursor() as cur:
             cur.executemany(sql, binds_list)
             conn.commit()
-
-        for memory_id, content in backfill_queue:
-            self._queue_embed_backfill(memory_id, content)
 
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
@@ -1368,6 +1257,10 @@ class OracleMemoryProvider(MemoryProvider):
     ) -> list:
         merged: dict = {}
         use_onnx = bool(self._onnx_model)
+        if not use_onnx and vec is None:
+            raise RuntimeError(
+                "In-database ONNX model is not configured; external fallback is disabled"
+            )
         try:
             fused_sql, fused_binds = self._build_hybrid_search_sql(
                 query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
@@ -1381,71 +1274,15 @@ class OracleMemoryProvider(MemoryProvider):
                 else:
                     merged[r["memory_id"]] = r
         except Exception as e:
+            logger.warning(
+                "In-database ONNX hybrid search failed (%s); external fallback is disabled",
+                e,
+            )
             if use_onnx:
-                logger.warning(
-                    "In-database ONNX hybrid search failed (%s); falling back to OpenRouter 768-d embedding",
-                    e,
-                )
-                if vec is None:
-                    vec = self._embed_external([query])[0]
-                if vec is not None:
-                    try:
-                        fused_sql, fused_binds = self._build_hybrid_search_sql(
-                            query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
-                        )
-                        for r in self._fetch_rows(cur, fused_sql, fused_binds):
-                            prev = merged.get(r["memory_id"])
-                            if prev:
-                                prev["score"] = round(
-                                    min(1.0, prev["score"] + r["score"] * 0.3), 4
-                                )
-                            else:
-                                merged[r["memory_id"]] = r
-                    except Exception as e2:
-                        logger.debug("Fallback hybrid failed (%s); falling back to vector or text", e2)
-                        try:
-                            v_sql, v_binds = self._build_vector_search_sql(
-                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
-                            )
-                            for r in self._fetch_rows(cur, v_sql, v_binds):
-                                merged[r["memory_id"]] = r
-                        except Exception as e3:
-                            logger.debug("Fallback vector also failed (%s); falling back to text-only", e3)
-                            t_sql, t_binds = self._build_text_search_sql(
-                                contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                            )
-                            for r in self._fetch_rows(cur, t_sql, t_binds):
-                                merged[r["memory_id"]] = r
-                else:
-                    t_sql, t_binds = self._build_text_search_sql(
-                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                    )
-                    for r in self._fetch_rows(cur, t_sql, t_binds):
-                        merged[r["memory_id"]] = r
-            else:
-                logger.debug(
-                    "fused hybrid failed (%s); falling back to vector-only", e
-                )
-                if vec is not None:
-                    try:
-                        v_sql, v_binds = self._build_vector_search_sql(
-                            query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
-                        )
-                        for r in self._fetch_rows(cur, v_sql, v_binds):
-                            merged[r["memory_id"]] = r
-                    except Exception as e_vec:
-                        logger.debug("vector-only failed (%s); falling back to text", e_vec)
-                        t_sql, t_binds = self._build_text_search_sql(
-                            contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                        )
-                        for r in self._fetch_rows(cur, t_sql, t_binds):
-                            merged[r["memory_id"]] = r
-                else:
-                    t_sql, t_binds = self._build_text_search_sql(
-                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                    )
-                    for r in self._fetch_rows(cur, t_sql, t_binds):
-                        merged[r["memory_id"]] = r
+                self._onnx_mark_failed()
+            raise RuntimeError(
+                f"In-database ONNX hybrid search failed ({e}); external fallback is disabled"
+            ) from e
         ranked = sorted(
             merged.values(), key=lambda x: x["score"], reverse=True
         )
@@ -1470,11 +1307,11 @@ class OracleMemoryProvider(MemoryProvider):
         tgt = (target or "any").lower()
         tgt_sql = "" if tgt in ("", "any") else " AND target = :tgt "
         contains_q = self._contains_query(query)
-        # Oracle can generate the query vector in SQL; avoid a redundant client
-        # embedding request while the configured ONNX model is available.
-        vec = None if mode == "text" or self._onnx_model else self._embed(query)
-        if not self._onnx_model and mode != "text" and vec is None:
-            mode = "text"
+        vec = None
+        if not self._onnx_model and mode != "text":
+            raise RuntimeError(
+                "In-database ONNX model is not configured; external fallback is disabled"
+            )
 
         fetch_k = top_k * 2 if mode == "hybrid" else top_k
         with self._pool.acquire() as conn:
@@ -1487,60 +1324,25 @@ class OracleMemoryProvider(MemoryProvider):
                 elif mode == "vector":
                     rows = []
                     use_onnx = bool(self._onnx_model)
-                    if use_onnx:
-                        try:
-                            sql, binds = self._build_vector_search_sql(
-                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=True, session_id=session_id, agent_id=agent_id
-                            )
-                            rows = self._fetch_rows(cur, sql, binds)
-                        except Exception as e:
-                            logger.warning(
-                                "In-database ONNX vector search failed (%s); falling back to OpenRouter 768-d embedding",
-                                e,
-                            )
-                            if vec is None:
-                                vec = self._embed_external([query])[0]
-                            if vec is not None:
-                                try:
-                                    sql, binds = self._build_vector_search_sql(
-                                        query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
-                                    )
-                                    rows = self._fetch_rows(cur, sql, binds)
-                                except Exception as e2:
-                                    logger.warning(
-                                        "Fallback vector search failed (%s); falling back to text search",
-                                        e2,
-                                    )
-                                    sql, binds = self._build_text_search_sql(
-                                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                                    )
-                                    rows = self._fetch_rows(cur, sql, binds)
-                            else:
-                                sql, binds = self._build_text_search_sql(
-                                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                                )
-                                rows = self._fetch_rows(cur, sql, binds)
-                    else:
-                        if vec is not None:
-                            try:
-                                sql, binds = self._build_vector_search_sql(
-                                    query, vec, fetch_k, tgt_sql, tgt, use_onnx=False, session_id=session_id, agent_id=agent_id
-                                )
-                                rows = self._fetch_rows(cur, sql, binds)
-                            except Exception as e:
-                                logger.warning(
-                                    "Vector search failed (%s); falling back to text search",
-                                    e,
-                                )
-                                sql, binds = self._build_text_search_sql(
-                                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                                )
-                                rows = self._fetch_rows(cur, sql, binds)
-                        else:
-                            sql, binds = self._build_text_search_sql(
-                                contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                            )
-                            rows = self._fetch_rows(cur, sql, binds)
+                    if not use_onnx and vec is None:
+                        raise RuntimeError(
+                            "In-database ONNX model is not configured; external fallback is disabled"
+                        )
+                    try:
+                        sql, binds = self._build_vector_search_sql(
+                            query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
+                        )
+                        rows = self._fetch_rows(cur, sql, binds)
+                    except Exception as e:
+                        logger.warning(
+                            "In-database ONNX vector search failed (%s); external fallback is disabled",
+                            e,
+                        )
+                        if use_onnx:
+                            self._onnx_mark_failed()
+                        raise RuntimeError(
+                            f"In-database ONNX vector search failed ({e}); external fallback is disabled"
+                        ) from e
                 else:
                     rows = self._execute_hybrid_search(
                         cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id
@@ -1862,64 +1664,41 @@ class OracleMemoryProvider(MemoryProvider):
                 content = (args.get("content") or "").strip()
                 if not mid or not content:
                     return tool_error("memory_id and content required")
-                vec = None
-                vec_model = None
                 if not self._onnx_model:
-                    # No in-database model: embed client-side and keep its origin.
-                    _tagged = self._embed_many_tagged([content])
-                    vec, vec_model = _tagged[0]
-                onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
+                    raise RuntimeError(
+                        "In-database ONNX model is not configured; external fallback is disabled"
+                    )
+                if self._onnx_in_cooldown():
+                    raise RuntimeError(
+                        "In-database ONNX embedding model is in cooldown; external fallback is disabled"
+                    )
                 txt = content[:4000]
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
-                        if onnx_enabled:
-                            try:
-                                sql = f"""
-                                    UPDATE /*+ NO_PARALLEL */ {self._table}
-                                    SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3,
-                                        embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
-                                    WHERE memory_id = :5
-                                    """  # nosec B608
-                                cur.execute(
-                                    sql,
-                                    (content, txt, txt, self._onnx_model, mid),
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    "In-database ONNX update failed (%s); falling back to OpenRouter embedding",
-                                    e,
-                                )
-                                self._onnx_mark_failed()
-                                if vec is None:
-                                    ext_vecs, vec_model = self._embed_external_tagged([content])
-                                    vec = ext_vecs[0]
-                                sql = f"""
-                                    UPDATE /*+ NO_PARALLEL */ {self._table}
-                                    SET content = :1, embedding = :2, content_txt = :3,
-                                        embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
-                                    WHERE memory_id = :5
-                                    """  # nosec B608
-                                cur.execute(
-                                    sql,
-                                    (content, vec, txt, vec_model, mid),
-                                )
-                        else:
+                        try:
                             sql = f"""
                                 UPDATE /*+ NO_PARALLEL */ {self._table}
-                                SET content = :1, embedding = :2, content_txt = :3,
+                                SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3,
                                     embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
                                 WHERE memory_id = :5
                                 """  # nosec B608
                             cur.execute(
                                 sql,
-                                (content, vec, txt, vec_model, mid),
+                                (content, txt, txt, self._onnx_model, mid),
                             )
+                        except Exception as e:
+                            logger.warning(
+                                "In-database ONNX update failed (%s); external fallback is disabled",
+                                e,
+                            )
+                            self._onnx_mark_failed()
+                            raise RuntimeError(
+                                f"In-database ONNX update failed ({e}); external fallback is disabled"
+                            ) from e
                         n = cur.rowcount
                     conn.commit()
                 if not n:
                     return tool_error(f"Memory not found: {mid}")
-                if vec is None:
-                    self._queue_embed_backfill(mid, content)
                 return json.dumps({"result": "updated", "memory_id": mid})
             if tool_name == "oracle_delete":
                 mid = args.get("memory_id")

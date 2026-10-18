@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.0.8.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.8.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.8.1 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
@@ -144,18 +144,6 @@ OCI_WALLET_PASSWORD="YourWalletPassword"
 # Primary In-Database ONNX Model
 # =============================================================================
 HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5
-
-# =============================================================================
-# OCI Cloud Architecture Integration (Fallback & Compute Instances)
-# =============================================================================
-OCI_GENAI_REGION=us-chicago-1
-OCI_COMPARTMENT_ID=ocid1.compartment.oc1..aaaaaaaexample
-OCI_EMBED_MODEL=cohere.embed-v4.0
-
-# =============================================================================
-# Third-Party Fallback (Optional)
-# =============================================================================
-OPENROUTER_API_KEY="sk-or-v1-..."
 ```
 
 ---

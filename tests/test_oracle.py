@@ -53,7 +53,7 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._contains_query("test query"), "test ACCUM query")
 
         # Test hyphen
-        self.assertEqual(provider._contains_query("top-secret info"), "top-secret ACCUM info")
+        self.assertEqual(provider._contains_query("top-secret info"), "top ACCUM secret ACCUM info")
 
         # Test punctuation
         self.assertEqual(provider._contains_query("hello, world! how's it going?"), "hello ACCUM world ACCUM how ACCUM going")
@@ -128,138 +128,79 @@ class TestOraclePlugin(unittest.TestCase):
             with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, *args: secrets.get(k)):
                 self.assertTrue(provider.is_available())
 
-    def test_embed_openrouter_model_and_dimensions(self):
-        self.assertEqual(oracle_plugin._EMBED_MODEL, "qwen/qwen3-embedding-4b")
-        self.assertEqual(oracle_plugin._EMBED_DIM, 768)
-
+    def test_embed_openrouter_removed(self):
         provider = oracle_plugin.OracleMemoryProvider()
-        captured_req = {}
+        self.assertFalse(hasattr(provider, "_embed_openrouter"))
 
-        class DummyResponse:
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
-            def read(self):
-                import json
-                return json.dumps({
-                    "data": [{"index": 0, "embedding": [0.1] * 768}]
-                }).encode("utf-8")
-
-        def fake_urlopen(req, timeout=20):
-            captured_req["url"] = req.full_url
-            captured_req["data"] = json.loads(req.data.decode("utf-8"))
-            captured_req["headers"] = dict(req.headers)
-            return DummyResponse()
-
-        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
-             patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            res = provider._embed_openrouter(["sample text to embed"])
-            self.assertEqual(len(res), 1)
-            self.assertIsNotNone(res[0])
-            self.assertEqual(len(res[0]), 768)
-            self.assertEqual(captured_req["data"]["model"], "qwen/qwen3-embedding-4b")
-            self.assertEqual(captured_req["data"]["dimensions"], 768)
-            self.assertEqual(captured_req["data"]["input"], ["sample text to embed"])
-
-    def test_embed_openrouter_empty_none_and_whitespace(self):
+    def test_embed_many_tagged_raises_on_unconfigured_onnx(self):
         provider = oracle_plugin.OracleMemoryProvider()
-        captured_req = {}
+        provider._onnx_model = ""
+        provider._pool = MagicMock()
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._embed_many_tagged(["test text"])
+        self.assertIn("external fallback is disabled", str(ctx.exception))
 
-        class DummyResponse:
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
-            def read(self):
-                import json
-                return json.dumps({
-                    "data": [
-                        {"index": 0, "embedding": [0.1] * 768},
-                        {"index": 1, "embedding": [0.2] * 768},
-                    ]
-                }).encode("utf-8")
-
-        def fake_urlopen(req, timeout=20):
-            captured_req["data"] = json.loads(req.data.decode("utf-8"))
-            return DummyResponse()
-
-        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
-             patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            inputs = ["valid one", "", "   ", None, "valid two"]
-            res = provider._embed_openrouter(inputs)
-            self.assertEqual(len(res), 5)
-            self.assertIsNotNone(res[0])
-            self.assertEqual(len(res[0]), 768)
-            self.assertIsNone(res[1])
-            self.assertIsNone(res[2])
-            self.assertIsNone(res[3])
-            self.assertIsNotNone(res[4])
-            self.assertEqual(len(res[4]), 768)
-            # Only valid, non-empty items sent to OpenRouter
-            self.assertEqual(captured_req["data"]["input"], ["valid one", "valid two"])
-
-    def test_embed_openrouter_all_empty(self):
+    def test_embed_many_tagged_raises_on_uninitialized_pool(self):
         provider = oracle_plugin.OracleMemoryProvider()
-        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
-             patch("urllib.request.urlopen") as mock_urlopen:
-            res = provider._embed_openrouter(["", "   ", None])
-            self.assertEqual(res, [None, None, None])
-            mock_urlopen.assert_not_called()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = None
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._embed_many_tagged(["test text"])
+        self.assertIn("session pool is not initialized", str(ctx.exception))
 
-    def test_embed_openrouter_dimension_mismatch(self):
+    def test_embed_many_tagged_raises_on_cooldown(self):
         provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        provider._onnx_failed_at = 9999999999.0
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._embed_many_tagged(["test text"])
+        self.assertIn("in cooldown", str(ctx.exception))
 
-        class DummyResponse:
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
-            def read(self):
-                import json
-                return json.dumps({
-                    "data": [
-                        {"index": 0, "embedding": [0.1] * 512},  # wrong dim
-                        {"index": 1, "embedding": [0.2] * 768}, # correct dim
-                    ]
-                }).encode("utf-8")
-
-        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
-             patch("urllib.request.urlopen", return_value=DummyResponse()):
-            res = provider._embed_openrouter(["doc1", "doc2"])
-            self.assertEqual(len(res), 2)
-            self.assertIsNone(res[0])  # Discarded due to 512 != 768
-            self.assertIsNotNone(res[1])
-            self.assertEqual(len(res[1]), 768)
+    def test_embed_many_tagged_raises_on_onnx_failure(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        mock_cur.execute.side_effect = Exception("ORA-29532: Java or ONNX call failed")
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._embed_many_tagged(["test text"])
+        self.assertIn("In-database ONNX embedding failed", str(ctx.exception))
+        self.assertTrue(provider._onnx_in_cooldown())
 
     def test_embed_many_deduplicates_embedding_misses(self):
         import array
 
         provider = oracle_plugin.OracleMemoryProvider()
-        provider._onnx_model = ""
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
         first = array.array("f", [0.1] * 768)
         second = array.array("f", [0.2] * 768)
-        provider._embed_oci = MagicMock(return_value=None)
-        provider._embed_openrouter = MagicMock(return_value=[first, second])
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        mock_cur.fetchall.return_value = [(0, first), (1, second)]
 
         result = provider._embed_many(["duplicate", "duplicate", "unique"])
 
         self.assertEqual(result, [first, first, second])
-        provider._embed_openrouter.assert_called_once_with(["duplicate", "unique"])
+        self.assertEqual(mock_cur.execute.call_count, 1)
+        binds = mock_cur.execute.call_args[0][1]
+        self.assertEqual(binds, ["duplicate", "unique"])
 
     def test_embed_many_cools_down_after_onnx_failure(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._onnx_model = "BGE_BASE_EN_V1_5"
         provider._pool = MagicMock()
         provider._pool.acquire.side_effect = Exception("model unavailable")
-        provider._embed_oci = MagicMock(return_value=None)
-        provider._embed_openrouter = MagicMock(return_value=[None])
 
-        provider._embed_many(["first"])
-        provider._embed_many(["second"])
+        with self.assertRaises(RuntimeError):
+            provider._embed_many(["first"])
+        with self.assertRaises(RuntimeError):
+            provider._embed_many(["second"])
 
         self.assertEqual(provider._pool.acquire.call_count, 1)
-        self.assertEqual(provider._embed_openrouter.call_count, 2)
+        self.assertTrue(provider._onnx_in_cooldown())
 
     def test_search_does_not_client_embed_when_onnx_is_configured(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -346,147 +287,62 @@ class TestOraclePlugin(unittest.TestCase):
         queue.assert_called_once()
         self.assertEqual(queue.call_args.kwargs["role"], "session")
 
-    def test_embed_openrouter_retry_on_transient_error(self):
-        provider = oracle_plugin.OracleMemoryProvider()
-        import urllib.error
-
-        class DummyResponse:
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
-            def read(self):
-                import json
-                return json.dumps({
-                    "data": [{"index": 0, "embedding": [0.3] * 768}]
-                }).encode("utf-8")
-
-        call_count = [0]
-        def fake_urlopen_with_retry(req, timeout=20):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                fp = MagicMock()
-                fp.read.return_value = b'{"error": "rate limit"}'
-                raise urllib.error.HTTPError("https://openrouter.ai/api/v1/embeddings", 429, "Too Many Requests", {}, fp)
-            return DummyResponse()
-
-        with patch.object(oracle_plugin, "get_secret", return_value="fake-openrouter-key"), \
-             patch("urllib.request.urlopen", side_effect=fake_urlopen_with_retry), \
-             patch("time.sleep"):
-            res = provider._embed_openrouter(["retry text"])
-            self.assertEqual(call_count[0], 2)
-            self.assertIsNotNone(res[0])
-            self.assertEqual(len(res[0]), 768)
-
-    def test_onnx_search_fallback_to_openrouter(self):
-        import array
+    def test_onnx_search_raises_on_failure_no_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
         provider._pool.acquire.return_value = mock_conn
 
-        # Mock query failure on in-database ONNX call
-        fake_fallback_vec = array.array("d", [0.1] * 768)
-        provider._embed_external = MagicMock(return_value=[fake_fallback_vec])
+        mock_cur.fetchall.side_effect = Exception("ORA-29532: Java or ONNX call failed")
 
-        # Cur.fetchall raises error on ONNX query, then succeeds on fallback
-        call_count = [0]
-        def side_effect_fetch(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise Exception("ORA-29532: Java or ONNX call failed")
-            return [("m1", "s1", "hermes", "user", "Memory text", "memory", 0.0, 0.2)]
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._search("database query", mode="vector")
+        self.assertIn("In-database ONNX vector search failed", str(ctx.exception))
+        self.assertIn("external fallback is disabled", str(ctx.exception))
+        self.assertTrue(provider._onnx_in_cooldown())
 
-        mock_cur.fetchall.side_effect = side_effect_fetch
-
-        results = provider._search("database query", mode="vector")
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["memory_id"], "m1")
-        provider._embed_external.assert_called_with(["database query"])
-
-    def test_onnx_insert_fallback_to_openrouter(self):
-        import array
+    def test_onnx_insert_raises_on_failure_no_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
         provider._pool.acquire.return_value = mock_conn
 
-        fake_fallback_vec = array.array("d", [0.2] * 768)
-        provider._embed_external_tagged = MagicMock(
-            return_value=([fake_fallback_vec], "openrouter:test-model")
-        )
+        mock_cur.execute.side_effect = Exception("ORA-40284: model does not exist")
 
-        # First cur.execute fails on ONNX INSERT, second succeeds
-        call_count = [0]
-        def side_effect_execute(sql, binds):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise Exception("ORA-40284: model does not exist")
-            return None
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._insert(
+                memory_id="test_id",
+                session_id="s1",
+                role="user",
+                content="test content",
+                target="memory",
+            )
+        self.assertIn("In-database ONNX insert failed", str(ctx.exception))
+        self.assertIn("external fallback is disabled", str(ctx.exception))
+        self.assertTrue(provider._onnx_in_cooldown())
 
-        mock_cur.execute.side_effect = side_effect_execute
-
-        provider._insert(
-            memory_id="test_id",
-            session_id="s1",
-            role="user",
-            content="test content",
-            target="memory",
-        )
-        self.assertEqual(call_count[0], 2)
-        provider._embed_external_tagged.assert_called_with(["test content"])
-        # the fallback INSERT must stamp the external model, not leave it NULL
-        fallback_sql, fallback_binds = mock_cur.execute.call_args[0]
-        self.assertIn("embedding_model", fallback_sql)
-        self.assertIn("openrouter:test-model", fallback_binds)
-
-    def test_onnx_update_fallback_to_openrouter(self):
-        import array
+    def test_onnx_update_raises_on_failure_no_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
-        mock_cur.rowcount = 1
+        mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
         provider._pool.acquire.return_value = mock_conn
 
-        fake_fallback_vec = array.array("d", [0.3] * 768)
-        provider._embed_external_tagged = MagicMock(
-            return_value=([fake_fallback_vec], "openrouter:test-model")
-        )
+        mock_cur.execute.side_effect = Exception("ORA-40284: model does not exist")
 
-        call_count = [0]
-        def side_effect_execute(sql, binds):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise Exception("ORA-40284: model does not exist")
-            return None
-
-        mock_cur.execute.side_effect = side_effect_execute
-
-        res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated content"})
-        self.assertIn('"result": "updated"', res)
-        self.assertEqual(call_count[0], 2)
-        # the fallback UPDATE stamps the external model it actually used
-        fallback_sql, fallback_binds = mock_cur.execute.call_args[0]
-        self.assertIn("embedding_model", fallback_sql)
-        self.assertIn("openrouter:test-model", fallback_binds)
+        with patch.object(oracle_plugin, "tool_error", side_effect=lambda msg: f"Error: {msg}"):
+            res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated content"})
+            self.assertIn("In-database ONNX update failed", res)
+            self.assertIn("external fallback is disabled", res)
+            self.assertTrue(provider._onnx_in_cooldown())
 
     def test_onnx_update_does_not_client_embed_before_sql_attempt(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -577,10 +433,11 @@ class TestOraclePlugin(unittest.TestCase):
         import array
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
-        provider._onnx_model = ""
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
         provider._pool = MagicMock()
-        provider._embed_external_tagged = MagicMock(
-            return_value=([array.array("d", [0.1] * 768)], "openrouter:test-model")
+        fake_vec = array.array("f", [0.1] * 768)
+        provider._embed_many_tagged = MagicMock(
+            return_value=[(fake_vec, "BGE_BASE_EN_V1_5")]
         )
         mock_conn, mock_cur = self._mocked_conn()
         provider._pool.acquire.return_value = mock_conn
@@ -590,40 +447,41 @@ class TestOraclePlugin(unittest.TestCase):
 
         sql, binds_list = mock_cur.executemany.call_args[0]
         self.assertIn("embedding_model", sql)
-        self.assertEqual(binds_list[0][1], "openrouter:test-model")
+        self.assertEqual(binds_list[0][1], "BGE_BASE_EN_V1_5")
 
     def test_embed_many_tagged_reports_backend(self):
         import array
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
-        provider._onnx_model = ""  # force the client-side external path
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
-        fake_vec = array.array("d", [0.1] * 768)
-        provider._embed_external_tagged = MagicMock(
-            return_value=([fake_vec], "openrouter:test-model")
-        )
+        provider._pool.acquire.return_value = mock_conn
+        fake_vec = array.array("f", [0.1] * 768)
+        mock_cur.fetchall.return_value = [(0, fake_vec)]
 
         result = provider._embed_many_tagged(["hello", "hello"])
         self.assertEqual([v for v, _m in result], [fake_vec, fake_vec])
-        self.assertEqual([m for _v, m in result], ["openrouter:test-model"] * 2)
+        self.assertEqual([m for _v, m in result], ["BGE_BASE_EN_V1_5"] * 2)
         # the untagged view stays compatible with search-only callers
+        mock_cur.fetchall.return_value = [(0, fake_vec)]
         self.assertEqual(provider._embed_many(["hello"]), [fake_vec])
 
     def test_embed_cache_preserves_provenance(self):
         import array
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
-        provider._onnx_model = ""
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
-        fake_vec = array.array("d", [0.1] * 768)
-        tagged_mock = MagicMock(return_value=([fake_vec], "openrouter:test-model"))
-        provider._embed_external_tagged = tagged_mock
+        provider._pool.acquire.return_value = mock_conn
+        fake_vec = array.array("f", [0.1] * 768)
+        mock_cur.fetchall.return_value = [(0, fake_vec)]
 
-        provider._embed_many_tagged(["same text"])
-        provider._embed_many_tagged(["same text"])
-        self.assertEqual(tagged_mock.call_count, 1)  # second served from cache
-        result = provider._embed_many_tagged(["same text"])
-        self.assertEqual(result[0][1], "openrouter:test-model")
+        res1 = provider._embed_many_tagged(["same text"])
+        res2 = provider._embed_many_tagged(["same text"])
+        self.assertEqual(mock_cur.execute.call_count, 1)  # second served from cache
+        self.assertEqual(res2[0][1], "BGE_BASE_EN_V1_5")
 
     def test_onnx_update_stamps_provenance(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -647,7 +505,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.8.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.8.2")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -822,8 +680,9 @@ class TestOraclePlugin(unittest.TestCase):
                 self.assertEqual(provider._dsn, "db_low")
                 self.assertTrue(mock_session_pool.called)
                 pool_kwargs = mock_session_pool.call_args[1]
-                self.assertEqual(pool_kwargs["min"], 1)
-                self.assertEqual(pool_kwargs["max"], 3)
+                self.assertEqual(pool_kwargs["min"], 2)
+                self.assertEqual(pool_kwargs["max"], 6)
+                self.assertEqual(pool_kwargs["call_timeout"], 30000)
                 self.assertEqual(pool_kwargs["dsn"], "db_low")
 
     def test_dsn_high_descriptor_to_low_normalization(self):
@@ -1058,29 +917,29 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.8.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.8.2")
 
         # 2. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.8.1", plugin_yaml)
-        self.assertIn("version-1.0.8.1-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.8.2", plugin_yaml)
+        self.assertIn("version-1.0.8.2-blue.svg", plugin_yaml)
 
         # 3. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.8.1"', pyproject)
+        self.assertIn('version = "1.0.8.2"', pyproject)
 
         # 4. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.8.1", skill_md)
+        self.assertIn("version: 1.0.8.2", skill_md)
 
         # 5. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.8.1-blue.svg", readme)
-        self.assertIn("v1.0.8.1", readme)
+        self.assertIn("version-1.0.8.2-blue.svg", readme)
+        self.assertIn("v1.0.8.2", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.8.1-blue.svg", install_md)
-        self.assertIn("v1.0.8.1", install_md)
+        self.assertIn("version-1.0.8.2-blue.svg", install_md)
+        self.assertIn("v1.0.8.2", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp
