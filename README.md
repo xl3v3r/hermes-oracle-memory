@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.8.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9 updates are CRITICAL to functionality. Automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.8.2 updates are CRITICAL to functionality. Updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9 updates are CRITICAL to functionality. Automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 ### Recommended — Hermes plugin manager
 
@@ -63,6 +63,16 @@ Embeddings are computed 100% in-house:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.9
+
+- **Criticality Notice**: v1.0.9 updates are CRITICAL to functionality. Implements Option B automated `on_skill_lifecycle` observer hook recording skill activations directly into Oracle 26ai ADB persistent memory as vectorized facts with zero external API transit.
+- **Automated Skill Lifecycle Observer Hook (Option B)**:
+  - In `register(ctx)`: registers an observer hook on `on_skill_lifecycle` via `ctx.register_hook("on_skill_lifecycle", callback)`.
+  - Captures skill lifecycle actions (`action in ("used", "loaded")`) and records compact facts (<200 chars satisfying Rule 2 and avoiding 280-char prefetch truncation) stamped with Rule 8 bracketed tags:
+    `[skill_usage] [skill:<skill_name>] [action:<action>] [ts:<ISO8601>] [session:<session_id>] Skill '<skill_name>' activated in session '<session_id>'.`
+  - Asynchronously enqueues writes to Oracle ADB memory via `_queue_background_insert` for non-blocking, fail-safe background persistence.
+  - Zero external API transit: 100% in-database ONNX embedding generation strictly within Oracle Autonomous AI Database 26ai.
 
 ## What's new in v1.0.8.2
 

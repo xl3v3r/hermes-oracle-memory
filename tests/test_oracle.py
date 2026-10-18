@@ -505,7 +505,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.8.2")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -917,29 +917,29 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.8.2")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9")
 
         # 2. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.8.2", plugin_yaml)
-        self.assertIn("version-1.0.8.2-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9", plugin_yaml)
+        self.assertIn("version-1.0.9-blue.svg", plugin_yaml)
 
         # 3. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.8.2"', pyproject)
+        self.assertIn('version = "1.0.9"', pyproject)
 
         # 4. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.8.2", skill_md)
+        self.assertIn("version: 1.0.9", skill_md)
 
         # 5. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.8.2-blue.svg", readme)
-        self.assertIn("v1.0.8.2", readme)
+        self.assertIn("version-1.0.9-blue.svg", readme)
+        self.assertIn("v1.0.9", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.8.2-blue.svg", install_md)
-        self.assertIn("v1.0.8.2", install_md)
+        self.assertIn("version-1.0.9-blue.svg", install_md)
+        self.assertIn("v1.0.9", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp

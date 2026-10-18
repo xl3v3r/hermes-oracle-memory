@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
@@ -27,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.8.2"
+__version__ = "1.0.9"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -1558,6 +1559,70 @@ class OracleMemoryProvider(MemoryProvider):
         if isinstance(new_session_id, str) and new_session_id:
             self._session_id = new_session_id
 
+    def on_skill_lifecycle(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Observer hook recording skill usage/load lifecycle events into Oracle 26ai ADB memory."""
+        try:
+            data = args[0] if args and isinstance(args[0], dict) else {}
+            action = kwargs.get("action") or data.get("action")
+            if not action and args and isinstance(args[0], str):
+                action = args[0]
+                if len(args) > 1 and isinstance(args[1], str) and "skill_name" not in kwargs:
+                    kwargs = dict(kwargs)
+                    kwargs["skill_name"] = args[1]
+            if action not in ("used", "loaded"):
+                return
+
+            skill_name = (
+                kwargs.get("skill_name")
+                or data.get("skill_name")
+                or (args[1] if len(args) > 1 and isinstance(args[1], str) else "")
+            )
+            if not skill_name:
+                return
+
+            session_id = (
+                kwargs.get("session_id")
+                or data.get("session_id")
+                or self._session_id
+                or ""
+            )
+
+            raw_ts = (
+                kwargs.get("ts")
+                or kwargs.get("timestamp")
+                or data.get("ts")
+                or data.get("timestamp")
+            )
+            if not raw_ts:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            elif isinstance(raw_ts, datetime):
+                ts = raw_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                ts = str(raw_ts)
+
+            content = (
+                f"[skill_usage] [skill:{skill_name}] [action:{action}] [ts:{ts}] "
+                f"[session:{session_id}] Skill '{skill_name}' activated in session '{session_id}'."
+            )
+            self._queue_background_insert(
+                memory_id=f"skill_{uuid.uuid4().hex[:16]}",
+                session_id=session_id,
+                role="fact",
+                content=content,
+                target="memory",
+                metadata={
+                    "kind": "skill_usage",
+                    "skill": skill_name,
+                    "action": action,
+                },
+            )
+        except Exception as exc:
+            logger.debug("oracle on_skill_lifecycle failed: %s", exc)
+
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(TOOL_SCHEMAS)
 
@@ -1964,7 +2029,13 @@ class OracleMemoryProvider(MemoryProvider):
 
 
 def register(ctx) -> None:
-    ctx.register_memory_provider(OracleMemoryProvider())
+    provider = OracleMemoryProvider()
+    ctx.register_memory_provider(provider)
+    if hasattr(ctx, "register_hook"):
+        try:
+            ctx.register_hook("on_skill_lifecycle", provider.on_skill_lifecycle)
+        except Exception as exc:
+            logger.debug("Failed to register on_skill_lifecycle hook: %s", exc)
     if hasattr(ctx, "register_skill"):
         try:
             skill_path = Path(__file__).parent / "skills" / "oracle-import" / "SKILL.md"

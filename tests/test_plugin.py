@@ -84,5 +84,133 @@ class TestOracleMemoryProvider(unittest.TestCase):
                 self.assertEqual(provider.unavailable_reason(), "")
 
 
+class TestSkillLifecycleHook(unittest.TestCase):
+    def test_register_hooks_on_skill_lifecycle(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        mock_ctx.register_memory_provider.assert_called_once()
+        mock_ctx.register_hook.assert_called_with("on_skill_lifecycle", unittest.mock.ANY)
+        cb = mock_ctx.register_hook.call_args[0][1]
+        self.assertTrue(callable(cb))
+
+    def test_on_skill_lifecycle_used_action(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        with patch.object(provider, "_queue_background_insert") as mock_insert:
+            hook_cb(action="used", skill_name="oracle-import", session_id="test-session-123")
+
+            mock_insert.assert_called_once()
+            kwargs = mock_insert.call_args[1]
+            self.assertTrue(kwargs["memory_id"].startswith("skill_"))
+            self.assertEqual(kwargs["session_id"], "test-session-123")
+            self.assertEqual(kwargs["role"], "fact")
+            self.assertEqual(kwargs["target"], "memory")
+            self.assertEqual(
+                kwargs["metadata"],
+                {"kind": "skill_usage", "skill": "oracle-import", "action": "used"},
+            )
+            content = kwargs["content"]
+            self.assertIn("[skill_usage]", content)
+            self.assertIn("[skill:oracle-import]", content)
+            self.assertIn("[action:used]", content)
+            self.assertIn("[session:test-session-123]", content)
+            self.assertIn("Skill 'oracle-import' activated in session 'test-session-123'.", content)
+            self.assertLess(len(content), 200)
+
+    def test_on_skill_lifecycle_loaded_action(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        with patch.object(provider, "_queue_background_insert") as mock_insert:
+            hook_cb(
+                action="loaded",
+                skill_name="test-skill",
+                session_id="session-xyz",
+                ts="2026-10-18T07:49:40Z",
+            )
+
+            mock_insert.assert_called_once()
+            kwargs = mock_insert.call_args[1]
+            expected_content = (
+                "[skill_usage] [skill:test-skill] [action:loaded] [ts:2026-10-18T07:49:40Z] "
+                "[session:session-xyz] Skill 'test-skill' activated in session 'session-xyz'."
+            )
+            self.assertEqual(kwargs["content"], expected_content)
+            self.assertLess(len(kwargs["content"]), 200)
+            self.assertEqual(kwargs["role"], "fact")
+            self.assertEqual(kwargs["session_id"], "session-xyz")
+            self.assertEqual(kwargs["target"], "memory")
+            self.assertEqual(
+                kwargs["metadata"],
+                {"kind": "skill_usage", "skill": "test-skill", "action": "loaded"},
+            )
+
+    def test_on_skill_lifecycle_ignored_actions(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        for ignored in ("created", "archived", "patched", "edited", "unknown"):
+            with patch.object(provider, "_queue_background_insert") as mock_insert:
+                hook_cb(action=ignored, skill_name="test-skill", session_id="s1")
+                mock_insert.assert_not_called()
+
+    def test_on_skill_lifecycle_empty_skill_name(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        with patch.object(provider, "_queue_background_insert") as mock_insert:
+            hook_cb(action="used", skill_name="", session_id="s1")
+            mock_insert.assert_not_called()
+
+    def test_on_skill_lifecycle_failsafe_on_exception(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        with patch.object(provider, "_queue_background_insert", side_effect=RuntimeError("Insert failed")):
+            # Should not raise
+            try:
+                hook_cb(action="used", skill_name="test-skill", session_id="s1")
+            except Exception as e:
+                self.fail(f"on_skill_lifecycle raised an exception unexpectedly: {e}")
+
+    def test_on_skill_lifecycle_dict_argument(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        with patch.object(provider, "_queue_background_insert") as mock_insert:
+            hook_cb({"action": "used", "skill_name": "test-skill", "session_id": "sess-dict"})
+            mock_insert.assert_called_once()
+            kwargs = mock_insert.call_args[1]
+            self.assertEqual(kwargs["session_id"], "sess-dict")
+            self.assertIn("[skill:test-skill]", kwargs["content"])
+
+    def test_on_skill_lifecycle_session_id_fallback(self):
+        mock_ctx = MagicMock()
+        oracle_plugin.register(mock_ctx)
+        provider = mock_ctx.register_memory_provider.call_args[0][0]
+        provider._session_id = "provider-session-default"
+        hook_cb = mock_ctx.register_hook.call_args[0][1]
+
+        with patch.object(provider, "_queue_background_insert") as mock_insert:
+            hook_cb(action="used", skill_name="test-skill")
+            mock_insert.assert_called_once()
+            kwargs = mock_insert.call_args[1]
+            self.assertEqual(kwargs["session_id"], "provider-session-default")
+            self.assertIn("[session:provider-session-default]", kwargs["content"])
+
+
 if __name__ == '__main__':
     unittest.main()
