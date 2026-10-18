@@ -35,33 +35,62 @@ class TestOraclePlugin(unittest.TestCase):
         provider = oracle_plugin.OracleMemoryProvider()
 
         # Test None
-        self.assertEqual(provider._contains_query(None), "memory")
+        self.assertEqual(provider._contains_query(None), "{memory}")
 
         # Test empty string
-        self.assertEqual(provider._contains_query(""), "memory")
+        self.assertEqual(provider._contains_query(""), "{memory}")
 
         # Test whitespace only
-        self.assertEqual(provider._contains_query("   \n\t  "), "memory")
+        self.assertEqual(provider._contains_query("   \n\t  "), "{memory}")
 
         # Test only punctuation
-        self.assertEqual(provider._contains_query("?!.,;:()"), "memory")
+        self.assertEqual(provider._contains_query("?!.,;:()"), "{memory}")
 
         # Test only short words
-        self.assertEqual(provider._contains_query("a to is"), "memory")
+        self.assertEqual(provider._contains_query("a to is"), "{memory}")
 
         # Test valid query
-        self.assertEqual(provider._contains_query("test query"), "test ACCUM query")
+        self.assertEqual(provider._contains_query("test query"), "{test} ACCUM {query}")
 
         # Test hyphen
-        self.assertEqual(provider._contains_query("top-secret info"), "top ACCUM secret ACCUM info")
+        self.assertEqual(provider._contains_query("top-secret info"), "{top} ACCUM {secret} ACCUM {info}")
 
         # Test punctuation
-        self.assertEqual(provider._contains_query("hello, world! how's it going?"), "hello ACCUM world ACCUM how ACCUM going")
+        self.assertEqual(provider._contains_query("hello, world! how's it going?"), "{hello} ACCUM {world} ACCUM {how} ACCUM {going}")
 
         # Test max tokens
         long_query = "one two three four five six seven eight nine ten"
-        expected = "one ACCUM two ACCUM three ACCUM four ACCUM five ACCUM six ACCUM seven ACCUM eight"
+        expected = "{one} ACCUM {two} ACCUM {three} ACCUM {four} ACCUM {five} ACCUM {six} ACCUM {seven} ACCUM {eight}"
         self.assertEqual(provider._contains_query(long_query), expected)
+
+    def test_contains_query_reserved_words(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+
+        # Test queries with reserved words: not, and, or, accum, minus, within
+        # Note: 'or' has length 2, so it is filtered out by the len(t) > 2 length check
+        query = "not and or accum minus within"
+        expected = "{not} ACCUM {and} ACCUM {accum} ACCUM {minus} ACCUM {within}"
+        self.assertEqual(provider._contains_query(query), expected)
+
+        # Test single reserved words
+        self.assertEqual(provider._contains_query("not"), "{not}")
+        self.assertEqual(provider._contains_query("and"), "{and}")
+        self.assertEqual(provider._contains_query("accum"), "{accum}")
+        self.assertEqual(provider._contains_query("minus"), "{minus}")
+        self.assertEqual(provider._contains_query("within"), "{within}")
+        self.assertEqual(provider._contains_query("near"), "{near}")
+
+        # Test short reserved word 'or' falls back to {memory}
+        self.assertEqual(provider._contains_query("or"), "{memory}")
+
+        # Test phrase containing 'or' alongside longer terms
+        self.assertEqual(provider._contains_query("gold or silver"), "{gold} ACCUM {silver}")
+
+        # Test uppercase reserved words are wrapped
+        self.assertEqual(
+            provider._contains_query("NOT AND ACCUM MINUS WITHIN"),
+            "{NOT} ACCUM {AND} ACCUM {ACCUM} ACCUM {MINUS} ACCUM {WITHIN}",
+        )
 
     def test_initialize_handles_magicmock_and_non_strings(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -229,6 +258,113 @@ class TestOraclePlugin(unittest.TestCase):
 
         self.assertEqual(result, [row])
         provider._rerank.assert_not_called()
+
+    def test_execute_hybrid_search_oracle_text_error_fallback(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_cur = MagicMock()
+        mock_cur.arraysize = 64
+        mock_cur.prefetchrows = 64
+
+        # Simulate Oracle Text error on hybrid query, but success on pure vector fallback
+        hybrid_err = Exception("ORA-29902: error in executing ODCIIndexStart() routine (DRG-50901: text query parser syntax error)")
+        vector_fallback_rows = [
+            ("m1", "s1", "a1", "user", "vector fallback content", "memory", 0.0, 0.2)
+        ]
+        mock_cur.execute.side_effect = [hybrid_err, None]
+        mock_cur.fetchall.return_value = vector_fallback_rows
+
+        provider._onnx_mark_failed = MagicMock()
+
+        results = provider._execute_hybrid_search(
+            mock_cur,
+            query="test query with reserved words",
+            vec=None,
+            contains_q="{test} ACCUM {query}",
+            top_k=5,
+            fetch_k=10,
+            tgt_sql="",
+            tgt="any",
+            rerank=False,
+        )
+
+        # Oracle Text errors must NOT trigger ONNX cooldown
+        provider._onnx_mark_failed.assert_not_called()
+        self.assertFalse(provider._onnx_in_cooldown())
+
+        # Must return the vector search fallback results
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["memory_id"], "m1")
+        self.assertEqual(results[0]["content"], "vector fallback content")
+        self.assertAlmostEqual(results[0]["score"], 0.7 * (1.0 - 0.2), places=4)
+
+    def test_execute_hybrid_search_oracle_text_error_variations_do_not_mark_onnx_failed(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        text_error_messages = [
+            "DRG-50901: text query parser syntax error",
+            "ORA-29902: error in executing ODCIIndexStart() routine",
+            "ORA-30600: text query parser error",
+        ]
+
+        for err_msg in text_error_messages:
+            mock_cur = MagicMock()
+            mock_cur.arraysize = 64
+            mock_cur.prefetchrows = 64
+            mock_cur.execute.side_effect = [
+                Exception(err_msg),
+                None,
+            ]
+            mock_cur.fetchall.return_value = [
+                ("m2", "s1", "a1", "user", "recovered", "memory", 0.0, 0.1)
+            ]
+
+            provider._onnx_mark_failed = MagicMock()
+
+            results = provider._execute_hybrid_search(
+                mock_cur,
+                query="query",
+                vec=None,
+                contains_q="{query}",
+                top_k=5,
+                fetch_k=10,
+                tgt_sql="",
+                tgt="any",
+                rerank=False,
+            )
+
+            provider._onnx_mark_failed.assert_not_called()
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["memory_id"], "m2")
+
+    def test_execute_hybrid_search_non_text_error_marks_onnx_failed(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_cur = MagicMock()
+        mock_cur.execute.side_effect = Exception("ORA-40284: model does not exist")
+
+        provider._onnx_mark_failed = MagicMock()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._execute_hybrid_search(
+                mock_cur,
+                query="test query",
+                vec=None,
+                contains_q="{test}",
+                top_k=5,
+                fetch_k=10,
+                tgt_sql="",
+                tgt="any",
+            )
+
+        self.assertIn("In-database ONNX hybrid search failed", str(ctx.exception))
+        provider._onnx_mark_failed.assert_called_once()
 
     def test_fetch_rows_tunes_oracle_fetch_buffers(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -505,7 +641,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.1")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -917,29 +1053,29 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.1")
 
         # 2. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9", plugin_yaml)
-        self.assertIn("version-1.0.9-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.1", plugin_yaml)
+        self.assertIn("version-1.0.9.1-blue.svg", plugin_yaml)
 
         # 3. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9"', pyproject)
+        self.assertIn('version = "1.0.9.1"', pyproject)
 
         # 4. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9", skill_md)
+        self.assertIn("version: 1.0.9.1", skill_md)
 
         # 5. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9-blue.svg", readme)
-        self.assertIn("v1.0.9", readme)
+        self.assertIn("version-1.0.9.1-blue.svg", readme)
+        self.assertIn("v1.0.9.1", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9-blue.svg", install_md)
-        self.assertIn("v1.0.9", install_md)
+        self.assertIn("version-1.0.9.1-blue.svg", install_md)
+        self.assertIn("v1.0.9.1", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp

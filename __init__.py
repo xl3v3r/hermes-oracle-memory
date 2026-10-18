@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9"
+__version__ = "1.0.9.1"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -859,9 +859,10 @@ class OracleMemoryProvider(MemoryProvider):
         cleaned = _CONTAINS_CLEAN_RE.sub(" ", query or "")
         tokens = [t for t in cleaned.split() if len(t) > 2][:8]
         if not tokens:
-            return "memory"
+            return "{memory}"
         # ACCUM ranks a union of terms; AND of every token misses too often.
-        return " ACCUM ".join(tokens)
+        escaped = [f"{{{t}}}" for t in tokens]
+        return " ACCUM ".join(escaped)
 
     # -- writes / reads ------------------------------------------------------
 
@@ -1275,15 +1276,39 @@ class OracleMemoryProvider(MemoryProvider):
                 else:
                     merged[r["memory_id"]] = r
         except Exception as e:
-            logger.warning(
-                "In-database ONNX hybrid search failed (%s); external fallback is disabled",
-                e,
-            )
-            if use_onnx:
+            is_text_err = any(code in str(e) for code in ("DRG-", "ORA-29902", "ORA-30600"))
+            if use_onnx and not is_text_err:
                 self._onnx_mark_failed()
-            raise RuntimeError(
-                f"In-database ONNX hybrid search failed ({e}); external fallback is disabled"
-            ) from e
+
+            if is_text_err:
+                logger.warning(
+                    "Oracle Text error in hybrid search (%s); falling back to pure vector search",
+                    e,
+                )
+                try:
+                    vec_sql, vec_binds = self._build_vector_search_sql(
+                        query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
+                    )
+                    for r in self._fetch_rows(cur, vec_sql, vec_binds):
+                        merged[r["memory_id"]] = r
+                except Exception as vec_err:
+                    logger.warning(
+                        "In-database ONNX vector fallback failed (%s); external fallback is disabled",
+                        vec_err,
+                    )
+                    if use_onnx:
+                        self._onnx_mark_failed()
+                    raise RuntimeError(
+                        f"In-database ONNX vector fallback failed ({vec_err}); external fallback is disabled"
+                    ) from vec_err
+            else:
+                logger.warning(
+                    "In-database ONNX hybrid search failed (%s); external fallback is disabled",
+                    e,
+                )
+                raise RuntimeError(
+                    f"In-database ONNX hybrid search failed ({e}); external fallback is disabled"
+                ) from e
         ranked = sorted(
             merged.values(), key=lambda x: x["score"], reverse=True
         )

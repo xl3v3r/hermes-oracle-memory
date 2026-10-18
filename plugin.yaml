@@ -1,9 +1,9 @@
 name: oracle
-version: 1.0.9
-description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.9 updates are CRITICAL to functionality. Automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version."
+version: 1.0.9.1
+description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version."
 pip_dependencies:
   - oracledb>=4.0.2
 
 # Badges & Criticality Notice
-# [![Version](https://img.shields.io/badge/version-1.0.9-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
-# CRITICALITY NOTICE: v1.0.9 updates are CRITICAL to functionality. Automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+# [![Version](https://img.shields.io/badge/version-1.0.9.1-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
+# CRITICALITY NOTICE: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.

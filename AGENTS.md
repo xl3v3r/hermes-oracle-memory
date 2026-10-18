@@ -24,6 +24,7 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ├── README.md               # Project documentation and usage guide
 ├── RELEASE_NOTES_1.0.8.2.md  # Release notes for v1.0.8.2
 ├── RELEASE_NOTES_1.0.9.md  # Release notes for v1.0.9
+├── RELEASE_NOTES_1.0.9.1.md # Release notes for v1.0.9.1
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration

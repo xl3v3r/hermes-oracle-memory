@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.9-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9 updates are CRITICAL to functionality. Automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.9 updates are CRITICAL to functionality. Automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
 
 ### Recommended — Hermes plugin manager
 
@@ -63,6 +63,19 @@ Embeddings are computed 100% in-house:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.9.1
+
+- **Criticality Notice**: v1.0.9.1 updates are CRITICAL to functionality. Neutralizes Oracle Text reserved keyword query syntax collisions by wrapping tokens in curly braces `{}`, decouples text index errors (`DRG-`, `ORA-29902`, `ORA-30600`) from ONNX model health to prevent spurious cooldown trips, and implements automatic fallback to pure vector search when text index errors occur.
+- **Oracle Text Reserved Word Neutralization**:
+  - `_contains_query` escapes all query tokens with curly braces `{token}` (and returns `"{memory}"` if no valid tokens remain).
+  - Neutralizes Oracle Text query operators (`NOT`, `AND`, `OR`, `ACCUM`, `MINUS`, `NEAR`, `WITHIN`, etc.) so reserved words in memory queries evaluate strictly as literal tokens rather than syntax operators.
+- **Decoupled Oracle Text Errors from ONNX Health**:
+  - `_execute_hybrid_search` discriminates Oracle Text query/index errors (`DRG-`, `ORA-29902`, `ORA-30600`) from true ONNX embedding failures.
+  - Oracle Text errors never mark the ONNX model failed or trigger ONNX cooldown.
+- **Graceful Pure Vector Search Fallback**:
+  - When hybrid search encounters an Oracle Text index error, the provider automatically falls back to pure vector search (`_build_vector_search_sql`) instead of aborting prefetch and killing turn search.
+- **Strict In-House Boundary**: 100% in-database execution within Oracle 26ai ADB with zero external third-party API dependencies.
 
 ## What's new in v1.0.9
 
