@@ -510,6 +510,7 @@ class OracleMemoryProvider(MemoryProvider):
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (chunk_index NUMBER)'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (turn_id VARCHAR2(64))'; END;",
             "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (conv_ref VARCHAR2(512))'; END;",
+            "BEGIN EXECUTE IMMEDIATE 'CREATE INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_SESS_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(session_id)'; EXCEPTION WHEN OTHERS THEN NULL; END;",
         ]
         with self._pool.acquire() as conn, conn.cursor() as cur:
             for sql in stmts:
@@ -1069,7 +1070,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
-        " AND NVL(session_id, 'x') <> 'diagnostic-session-001' "
+        " AND (session_id IS NULL OR session_id <> 'diagnostic-session-001') "
     )
 
     def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
