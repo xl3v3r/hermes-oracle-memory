@@ -1,0 +1,3 @@
+## 2025-02-23 - Avoid N+1 connection pool acquires in chunking loops
+**Learning:** `_chunk_and_store` was causing an N+1 connection pool acquisition pattern by repeatedly calling `_chunk_text`, which acquired a new connection for every single message chunk. This led to severe connection overhead and pool contention when processing large multi-turn conversations (like ShareGPT exports).
+**Action:** Pass down the cursor (`cur`) from the parent calling loop (`_chunk_and_store`) directly to the inner chunking function (`_chunk_text`) to perform all DBMS_VECTOR operations on a single acquired connection pool.
