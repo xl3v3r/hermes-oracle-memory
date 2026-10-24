@@ -1864,17 +1864,26 @@ class OracleMemoryProvider(MemoryProvider):
                     return json.dumps({"result": "Fact stored.", "memory_id": mid})
                 else:
                     mids = []
+                    rows = []
+                    # ⚡ Bolt Optimization:
+                    # Batch array prompts into a single database round-trip via _insert_many.
+                    # This prevents the N+1 blocking query delay that occurs when looping over _insert for each fact.
                     for f in facts_to_add:
                         mid = f"fact_{uuid.uuid4().hex[:16]}"
-                        self._insert(
-                            memory_id=mid,
-                            session_id=self._session_id,
-                            role="fact",
-                            content=f,
-                            target=target,
-                            metadata={"kind": "tool"},
-                        )
                         mids.append(mid)
+                        rows.append({
+                            "memory_id": mid,
+                            "session_id": self._session_id,
+                            "role": "fact",
+                            "content": f,
+                            "target": target,
+                            "metadata": {"kind": "tool"},
+                            "turn_index": None,
+                            "chunk_index": None,
+                            "turn_id": None,
+                            "conv_ref": None,
+                        })
+                    self._insert_many(rows)
                     return json.dumps({
                         "result": f"Batch facts stored ({len(mids)}).",
                         "memory_ids": mids,
