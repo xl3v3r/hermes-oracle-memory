@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.0.9.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 

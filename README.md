@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.9.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+> **CRITICALITY NOTICE**: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.
 
 ### Recommended — Hermes plugin manager
 
@@ -63,6 +63,20 @@ Embeddings are computed 100% in-house:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.9.2
+
+- **Criticality Notice**: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters to prevent ORA-54401 ONNX sequence length violations, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown from 300s to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.
+- **Safe Embedding Input Clamping (`_safe_embed_text`)**:
+  - Clamps text passed to `VECTOR_EMBEDDING` to 1200 characters, preventing sequence length overflow (> 512 tokens) and avoiding `ORA-54401` ONNX tensor broadcast errors during inserts and searches.
+- **Decoupled Shape/Token Errors from ONNX Cooldown**:
+  - `ORA-54401` and `ORA-51815` are tensor dimension/token length violations rather than model infrastructure failures. They no longer call `self._onnx_mark_failed()` or trigger cooldown.
+- **Reduced ONNX Cooldown Interval**:
+  - Lowered `_ONNX_RETRY_AFTER_SECS` from 300s to 60s for rapid recovery from transient database-side model reloads.
+- **Hybrid-to-Text Fallback During Cooldown**:
+  - When the ONNX model is in cooldown, `_execute_hybrid_search` gracefully falls back to Oracle Text search instead of aborting queries.
+- **Zero Turn Loss Defense on Insert**:
+  - When an insert encounters an ONNX shape error, it automatically falls back to inserting the memory row with a `NULL` embedding, keeping turns indexed by Oracle Text.
 
 ## What's new in v1.0.9.1
 

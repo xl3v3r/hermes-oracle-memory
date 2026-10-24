@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.1"
+__version__ = "1.0.9.2"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -37,7 +37,7 @@ _OCI_EMBED_MODEL = "cohere.embed-v4.0"
 _EMBED_CACHE_MAX = 256
 _EMBED_BATCH = 32
 _OCI_RETRY_AFTER_SECS = 300.0
-_ONNX_RETRY_AFTER_SECS = 300.0
+_ONNX_RETRY_AFTER_SECS = 60.0
 _FETCH_ARRAYSIZE = 64
 _EMBED_TIMEOUT_SECS = 10.0
 _EMBED_MAX_RETRIES = 2
@@ -557,6 +557,18 @@ class OracleMemoryProvider(MemoryProvider):
             while len(self._embed_cache) > _EMBED_CACHE_MAX:
                 self._embed_cache.popitem(last=False)
 
+    @staticmethod
+    def _safe_embed_text(text: str | None, max_chars: int = 1200) -> str:
+        """Clamp text length to safely fit within ONNX model's 512-token limit.
+
+        Dense inputs (UUIDs, JSON, code, URLs) can exceed 512 tokens if 4000 characters
+        are passed to VECTOR_EMBEDDING, causing ORA-54401 ONNX broadcast errors.
+        1200 characters safely guarantees token count stays below the 512 sequence limit.
+        """
+        if not text:
+            return ""
+        return text[:max_chars]
+
     def _onnx_in_cooldown(self) -> bool:
         with self._embed_lock:
             failed_at = self._onnx_failed_at
@@ -693,7 +705,7 @@ class OracleMemoryProvider(MemoryProvider):
                         parts.append(
                             f"SELECT /*+ NO_PARALLEL */ {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
                         )
-                        binds.append(t[:4000])
+                        binds.append(self._safe_embed_text(t))
                     cur.execute(" UNION ALL ".join(parts) + " ORDER BY id", binds)
                     for row in cur.fetchall():
                         idx = int(row[0])
@@ -708,11 +720,14 @@ class OracleMemoryProvider(MemoryProvider):
             ]
             self._onnx_mark_ok()
         except Exception as e:
+            err_str = str(e)
+            is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
+            if not is_shape_err:
+                self._onnx_mark_failed()
             logger.warning(
                 "In-database ONNX embed_many failed (%s); external fallback is disabled",
                 e,
             )
-            self._onnx_mark_failed()
             raise RuntimeError(
                 f"In-database ONNX embedding failed ({e}); external fallback is disabled"
             ) from e
@@ -883,6 +898,7 @@ class OracleMemoryProvider(MemoryProvider):
         vec_model = None  # provenance stamp; None means "unknown origin"
         meta = json.dumps(metadata or {})
         txt = (content or "")[:4000]
+        embed_txt = self._safe_embed_text(content)
         onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
             sql = f"""
@@ -899,7 +915,7 @@ class OracleMemoryProvider(MemoryProvider):
                 self._agent_id,
                 role,
                 content,
-                txt,
+                embed_txt,
                 target,
                 meta,
                 txt,
@@ -911,11 +927,49 @@ class OracleMemoryProvider(MemoryProvider):
                     conn.commit()
                 return
             except Exception as e:
+                err_str = str(e)
+                is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
+                if not is_shape_err:
+                    self._onnx_mark_failed()
+                if is_shape_err:
+                    logger.warning(
+                        "In-database ONNX insert hit shape/sequence length error (%s); inserting row with null embedding to prevent turn loss",
+                        e,
+                    )
+                    null_sql = f"""
+                        INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                            (memory_id, session_id, agent_id, role, content, embedding,
+                             created_at, target, metadata, content_txt,
+                             embedding_model, embedding_updated_at)
+                        VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                             NULL, SYSTIMESTAMP)
+                    """
+                    null_binds = (
+                        memory_id,
+                        session_id or self._session_id or "none",
+                        self._agent_id,
+                        role,
+                        content,
+                        target,
+                        meta,
+                        txt,
+                    )
+                    try:
+                        with self._pool.acquire() as conn, conn.cursor() as cur:
+                            cur.execute(null_sql, null_binds)
+                            conn.commit()
+                        return
+                    except Exception as null_e:
+                        logger.error(
+                            "Null-embedding insert fallback failed (%s)", null_e
+                        )
+                        raise RuntimeError(
+                            f"In-database ONNX insert failed ({e}) and fallback insert failed ({null_e})"
+                        ) from null_e
                 logger.warning(
                     "In-database ONNX insert failed (%s); external fallback is disabled",
                     e,
                 )
-                self._onnx_mark_failed()
                 raise RuntimeError(
                     f"In-database ONNX insert failed ({e}); external fallback is disabled"
                 ) from e
@@ -984,13 +1038,14 @@ class OracleMemoryProvider(MemoryProvider):
                 metadata = row.get("metadata")
                 meta = json.dumps(metadata or {})
                 txt = (content or "")[:4000]
+                embed_txt = self._safe_embed_text(content)
                 binds = (
                     memory_id,
                     session_id,
                     self._agent_id,
                     role,
                     content,
-                    txt,
+                    embed_txt,
                     target,
                     meta,
                     txt,
@@ -1007,11 +1062,65 @@ class OracleMemoryProvider(MemoryProvider):
                     conn.commit()
                 return
             except Exception as e:
+                err_str = str(e)
+                is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
+                if not is_shape_err:
+                    self._onnx_mark_failed()
+                if is_shape_err:
+                    logger.warning(
+                        "In-database ONNX insert_many hit shape/sequence length error (%s); inserting rows with null embedding to prevent turn loss",
+                        e,
+                    )
+                    null_sql = f"""
+                        INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                            (memory_id, session_id, agent_id, role, content, embedding,
+                             created_at, target, metadata, content_txt,
+                             embedding_model, embedding_updated_at,
+                             turn_index, chunk_index, turn_id, conv_ref)
+                        VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                             NULL, SYSTIMESTAMP, :9, :10, :11, :12)
+                    """
+                    null_binds_list = []
+                    for row in rows:
+                        memory_id = row.get("memory_id")
+                        session_id = row.get("session_id") or self._session_id or "none"
+                        role = row.get("role")
+                        content = row.get("content")
+                        target = row.get("target")
+                        metadata = row.get("metadata")
+                        meta = json.dumps(metadata or {})
+                        txt = (content or "")[:4000]
+                        binds = (
+                            memory_id,
+                            session_id,
+                            self._agent_id,
+                            role,
+                            content,
+                            target,
+                            meta,
+                            txt,
+                            row.get("turn_index"),
+                            row.get("chunk_index"),
+                            row.get("turn_id"),
+                            row.get("conv_ref"),
+                        )
+                        null_binds_list.append(binds)
+                    try:
+                        with self._pool.acquire() as conn, conn.cursor() as cur:
+                            cur.executemany(null_sql, null_binds_list)
+                            conn.commit()
+                        return
+                    except Exception as null_e:
+                        logger.error(
+                            "Null-embedding insert_many fallback failed (%s)", null_e
+                        )
+                        raise RuntimeError(
+                            f"In-database ONNX insert_many failed ({e}) and fallback insert_many failed ({null_e})"
+                        ) from null_e
                 logger.warning(
                     "In-database ONNX insert_many failed (%s); external fallback is disabled",
                     e,
                 )
-                self._onnx_mark_failed()
                 raise RuntimeError(
                     f"In-database ONNX insert_many failed ({e}); external fallback is disabled"
                 ) from e
@@ -1155,7 +1264,7 @@ class OracleMemoryProvider(MemoryProvider):
                 ORDER BY distance ASC
                 FETCH FIRST :k ROWS ONLY
             """
-            binds = {"qv": query[:4000], "k": fetch_k}
+            binds = {"qv": self._safe_embed_text(query), "k": fetch_k}
         else:
             sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
@@ -1214,7 +1323,7 @@ class OracleMemoryProvider(MemoryProvider):
                 )
             """
             fused_binds: dict = {
-                "qv": query[:4000],
+                "qv": self._safe_embed_text(query),
                 "q": contains_q,
                 "k": fetch_k,
             }
@@ -1258,6 +1367,20 @@ class OracleMemoryProvider(MemoryProvider):
         self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None
     ) -> list:
         merged: dict = {}
+        if self._onnx_in_cooldown():
+            logger.info("ONNX model is in cooldown; executing text search for hybrid query")
+            sql, binds = self._build_text_search_sql(
+                contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+            )
+            for r in self._fetch_rows(cur, sql, binds):
+                merged[r["memory_id"]] = r
+            ranked = sorted(
+                merged.values(), key=lambda x: x["score"], reverse=True
+            )
+            if not rerank or len(ranked) <= 1:
+                return ranked[:top_k]
+            return self._rerank(query, ranked, top_k, cur=cur)
+
         use_onnx = bool(self._onnx_model)
         if not use_onnx and vec is None:
             raise RuntimeError(
@@ -1276,8 +1399,10 @@ class OracleMemoryProvider(MemoryProvider):
                 else:
                     merged[r["memory_id"]] = r
         except Exception as e:
-            is_text_err = any(code in str(e) for code in ("DRG-", "ORA-29902", "ORA-30600"))
-            if use_onnx and not is_text_err:
+            err_str = str(e)
+            is_text_err = any(code in err_str for code in ("DRG-", "ORA-29902", "ORA-30600"))
+            is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
+            if use_onnx and not is_text_err and not is_shape_err:
                 self._onnx_mark_failed()
 
             if is_text_err:
@@ -1296,7 +1421,7 @@ class OracleMemoryProvider(MemoryProvider):
                         "In-database ONNX vector fallback failed (%s); external fallback is disabled",
                         vec_err,
                     )
-                    if use_onnx:
+                    if use_onnx and not any(code in str(vec_err) for code in ("ORA-54401", "ORA-51815")):
                         self._onnx_mark_failed()
                     raise RuntimeError(
                         f"In-database ONNX vector fallback failed ({vec_err}); external fallback is disabled"
@@ -1354,17 +1479,23 @@ class OracleMemoryProvider(MemoryProvider):
                         raise RuntimeError(
                             "In-database ONNX model is not configured; external fallback is disabled"
                         )
+                    if use_onnx and self._onnx_in_cooldown():
+                        raise RuntimeError(
+                            "In-database ONNX embedding model is in cooldown; external fallback is disabled"
+                        )
                     try:
                         sql, binds = self._build_vector_search_sql(
                             query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
                         )
                         rows = self._fetch_rows(cur, sql, binds)
                     except Exception as e:
+                        err_str = str(e)
+                        is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
                         logger.warning(
                             "In-database ONNX vector search failed (%s); external fallback is disabled",
                             e,
                         )
-                        if use_onnx:
+                        if use_onnx and not is_shape_err:
                             self._onnx_mark_failed()
                         raise RuntimeError(
                             f"In-database ONNX vector search failed ({e}); external fallback is disabled"
@@ -1763,6 +1894,7 @@ class OracleMemoryProvider(MemoryProvider):
                         "In-database ONNX embedding model is in cooldown; external fallback is disabled"
                     )
                 txt = content[:4000]
+                embed_txt = self._safe_embed_text(content)
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
                         try:
@@ -1774,14 +1906,17 @@ class OracleMemoryProvider(MemoryProvider):
                                 """  # nosec B608
                             cur.execute(
                                 sql,
-                                (content, txt, txt, self._onnx_model, mid),
+                                (content, embed_txt, txt, self._onnx_model, mid),
                             )
                         except Exception as e:
+                            err_str = str(e)
+                            is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
+                            if not is_shape_err:
+                                self._onnx_mark_failed()
                             logger.warning(
                                 "In-database ONNX update failed (%s); external fallback is disabled",
                                 e,
                             )
-                            self._onnx_mark_failed()
                             raise RuntimeError(
                                 f"In-database ONNX update failed ({e}); external fallback is disabled"
                             ) from e
@@ -2051,6 +2186,9 @@ class OracleMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("oracle pool close: %s", e)
             self._pool = None
+
+
+_safe_embed_text = OracleMemoryProvider._safe_embed_text
 
 
 def register(ctx) -> None:

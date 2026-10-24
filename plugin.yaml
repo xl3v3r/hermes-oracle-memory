@@ -1,9 +1,11 @@
 name: oracle
-version: 1.0.9.1
-description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version."
+version: 1.0.9.2
+description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors."
+provides_hooks:
+  - on_skill_lifecycle
 pip_dependencies:
   - oracledb>=4.0.2
 
 # Badges & Criticality Notice
-# [![Version](https://img.shields.io/badge/version-1.0.9.1-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
-# CRITICALITY NOTICE: v1.0.9.1 updates are CRITICAL to functionality. Neutralize Oracle Text reserved keywords, decouple text index exceptions from ONNX cooldown, hybrid-to-vector fallback, automated on_skill_lifecycle memory hook, updated 9 Oracle 26ai memory rules, local memory deactivation, and zero-drift deployment require this version.
+# [![Version](https://img.shields.io/badge/version-1.0.9.2-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
+# CRITICALITY NOTICE: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.

@@ -641,7 +641,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.2")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1048,34 +1048,188 @@ class TestOraclePlugin(unittest.TestCase):
             res = provider.handle_tool_call("oracle_delete", None)
             self.assertIn("memory_id or session_id required", res)
 
+    def test_onnx_retry_cooldown_is_60_seconds(self):
+        self.assertEqual(oracle_plugin._ONNX_RETRY_AFTER_SECS, 60.0)
+
+    def test_safe_embed_text_truncation(self):
+        self.assertEqual(oracle_plugin._safe_embed_text(None), "")
+        self.assertEqual(oracle_plugin._safe_embed_text(""), "")
+        self.assertEqual(oracle_plugin._safe_embed_text("short text"), "short text")
+        long_text = "x" * 2500
+        truncated = oracle_plugin._safe_embed_text(long_text)
+        self.assertEqual(len(truncated), 1200)
+        self.assertEqual(oracle_plugin.OracleMemoryProvider._safe_embed_text(long_text), truncated)
+
+    def test_execute_hybrid_search_onnx_cooldown_falls_back_to_text_search(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._onnx_failed_at = 9999999999.0  # in cooldown
+
+        mock_cur = MagicMock()
+        mock_cur.arraysize = 64
+        mock_cur.prefetchrows = 64
+        mock_cur.fetchall.return_value = [
+            ("m_cool", "s1", "a1", "user", "cooldown text fallback content", "memory", 5.0, None)
+        ]
+
+        results = provider._execute_hybrid_search(
+            mock_cur,
+            query="test query in cooldown",
+            vec=None,
+            contains_q="{test} ACCUM {query}",
+            top_k=5,
+            fetch_k=10,
+            tgt_sql="",
+            tgt="any",
+            rerank=False,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["memory_id"], "m_cool")
+        self.assertEqual(results[0]["content"], "cooldown text fallback content")
+        sql, binds = mock_cur.execute.call_args[0]
+        self.assertIn("CONTAINS(content, :q, 1) > 0", sql)
+
+    def test_ora_54401_insert_falls_back_to_null_embedding_without_cooldown(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        shape_err = Exception("ORA-54401: ONNX runtime error: Non-zero status code returned while running Add node. 512 by 755")
+        mock_cur.execute.side_effect = [shape_err, None]
+
+        provider._insert(
+            memory_id="m_shape",
+            session_id="s1",
+            role="user",
+            content="very long prompt " * 100,
+            target="memory",
+        )
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.execute.call_count, 2)
+        fallback_sql, fallback_binds = mock_cur.execute.call_args_list[1][0]
+        self.assertIn("NULL", fallback_sql)
+        self.assertNotIn("VECTOR_EMBEDDING", fallback_sql)
+        self.assertEqual(fallback_binds[0], "m_shape")
+
+    def test_ora_54401_insert_many_falls_back_to_null_embedding(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        shape_err = Exception("ORA-54401: ONNX runtime error: input exceeds 512 tokens")
+        mock_cur.executemany.side_effect = [shape_err, None]
+
+        rows = [
+            {"memory_id": "m1", "session_id": "s1", "role": "user", "content": "row1 " * 80},
+            {"memory_id": "m2", "session_id": "s1", "role": "user", "content": "row2 " * 80},
+        ]
+        provider._insert_many(rows)
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.executemany.call_count, 2)
+        fallback_sql, fallback_binds_list = mock_cur.executemany.call_args_list[1][0]
+        self.assertIn("NULL", fallback_sql)
+        self.assertEqual(len(fallback_binds_list), 2)
+        self.assertEqual(fallback_binds_list[0][0], "m1")
+        self.assertEqual(fallback_binds_list[1][0], "m2")
+
+    def test_ora_54401_in_hybrid_search_does_not_mark_onnx_failed(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_cur = MagicMock()
+        mock_cur.execute.side_effect = Exception("ORA-54401: ONNX runtime error: 512 by 755")
+        provider._onnx_mark_failed = MagicMock()
+
+        with self.assertRaises(RuntimeError):
+            provider._execute_hybrid_search(
+                mock_cur,
+                query="overflow query",
+                vec=None,
+                contains_q="{overflow}",
+                top_k=5,
+                fetch_k=10,
+                tgt_sql="",
+                tgt="any",
+            )
+
+        provider._onnx_mark_failed.assert_not_called()
+        self.assertFalse(provider._onnx_in_cooldown())
+
+    def test_ora_54401_in_vector_search_does_not_mark_onnx_failed(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        mock_cur.execute.side_effect = Exception("ORA-54401: ONNX runtime error: 512 by 755")
+        provider._onnx_mark_failed = MagicMock()
+
+        with self.assertRaises(RuntimeError):
+            provider._search("overflow vector query", mode="vector", top_k=5)
+
+        provider._onnx_mark_failed.assert_not_called()
+        self.assertFalse(provider._onnx_in_cooldown())
+
+    def test_vector_search_in_cooldown_raises_runtime_error(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._onnx_failed_at = 9999999999.0  # in cooldown
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        with self.assertRaises(RuntimeError) as ctx:
+            provider._search("test query", mode="vector", top_k=5)
+        self.assertIn("in cooldown", str(ctx.exception))
+
     def test_metadata_version_consistency(self):
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.2")
 
         # 2. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.1", plugin_yaml)
-        self.assertIn("version-1.0.9.1-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.2", plugin_yaml)
+        self.assertIn("version-1.0.9.2-blue.svg", plugin_yaml)
+        self.assertIn("provides_hooks:", plugin_yaml)
+        self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 3. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9.1"', pyproject)
+        self.assertIn('version = "1.0.9.2"', pyproject)
 
         # 4. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.1", skill_md)
+        self.assertIn("version: 1.0.9.2", skill_md)
 
         # 5. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.1-blue.svg", readme)
-        self.assertIn("v1.0.9.1", readme)
+        self.assertIn("version-1.0.9.2-blue.svg", readme)
+        self.assertIn("v1.0.9.2", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.1-blue.svg", install_md)
-        self.assertIn("v1.0.9.1", install_md)
+        self.assertIn("version-1.0.9.2-blue.svg", install_md)
+        self.assertIn("v1.0.9.2", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp
