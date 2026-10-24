@@ -1221,7 +1221,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _build_text_search_sql(
         self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None
-    ) -> Tuple[str, dict]:
+    ) -> "tuple[str, dict]":
         extra_filters = ""
         binds = {"q": contains_q, "k": fetch_k}
         if session_id:
@@ -1246,7 +1246,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _build_vector_search_sql(
         self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
-    ) -> Tuple[str, dict]:
+    ) -> "tuple[str, dict]":
         extra_filters = ""
         if session_id:
             extra_filters += " AND session_id = :sid "
@@ -1288,7 +1288,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _build_hybrid_search_sql(
         self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
-    ) -> Tuple[str, dict]:
+    ) -> "tuple[str, dict]":
         extra_filters = ""
         if session_id:
             extra_filters += " AND session_id = :sid "
@@ -1682,13 +1682,17 @@ class OracleMemoryProvider(MemoryProvider):
         if not self._pool or not isinstance(messages, list) or not messages:
             return
         try:
-            user_bits = [
-                (m.get("content") or "")[:400]
-                for m in messages
-                if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str)
-            ]
+            # OPTIMIZATION: Iterate backwards over messages and break early to achieve O(1) time complexity.
+            user_bits = []
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
+                    user_bits.append((m.get("content") or "")[:400])
+                    if len(user_bits) == 4:
+                        break
+            user_bits.reverse()
+
             sample = " | ".join(
-                b for b in user_bits[-4:] if b and not _is_internal_gateway_turn(b)
+                b for b in user_bits if b and not _is_internal_gateway_turn(b)
             )
             if len(sample) < 20:
                 return
@@ -1828,7 +1832,8 @@ class OracleMemoryProvider(MemoryProvider):
                         pass
 
                 if isinstance(raw_facts, (list, tuple, set)):
-                    facts_to_add = [_extract_fact(f) for f in raw_facts if _extract_fact(f)]
+                    # OPTIMIZATION: Use walrus operator to avoid redundant _extract_fact() calls.
+                    facts_to_add = [extracted for f in raw_facts if (extracted := _extract_fact(f))]
                 elif isinstance(raw_facts, str) and raw_facts.strip():
                     facts_to_add = [raw_facts.strip()]
 
@@ -1842,7 +1847,8 @@ class OracleMemoryProvider(MemoryProvider):
                         except Exception:
                             pass
                     if isinstance(raw_content, (list, tuple, set)):
-                        facts_to_add = [_extract_fact(f) for f in raw_content if _extract_fact(f)]
+                        # OPTIMIZATION: Use walrus operator to avoid redundant _extract_fact() calls.
+                        facts_to_add = [extracted for f in raw_content if (extracted := _extract_fact(f))]
                     elif isinstance(raw_content, str) and raw_content.strip():
                         facts_to_add = [raw_content.strip()]
                     elif raw_content is not None and str(raw_content).strip():
