@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.9.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.3-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.
+> **CRITICALITY NOTICE**: v1.0.9.3 updates are CRITICAL to functionality. Caps individual `oracle_search` query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent `timeouts.tools.concurrent_batch` 60s in `~/.hermes/config.yaml`, and prevents batch deadlocks.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.9.2 updates are CRITICAL to functionality. Clamps embedding text to 1200 characters, decouples ORA-54401/ORA-51815 shape errors from ONNX cooldown, lowers ONNX retry cooldown to 60s, implements fallback to text search during ONNX cooldown, and prevents silent turn loss on insert errors.
+> **CRITICALITY NOTICE**: v1.0.9.3 updates are CRITICAL to functionality. Caps individual `oracle_search` query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent `timeouts.tools.concurrent_batch` 60s in `~/.hermes/config.yaml`, and prevents batch deadlocks.
 
 ### Recommended — Hermes plugin manager
 
@@ -63,6 +63,20 @@ Embeddings are computed 100% in-house:
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.9.3
+
+- **Criticality Notice**: v1.0.9.3 updates are CRITICAL to functionality. Caps individual `oracle_search` query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent `timeouts.tools.concurrent_batch` 60s in `~/.hermes/config.yaml`, and eliminates hanging tool batches.
+- **13-Second Individual Search Query Timeout**:
+  - `oracle_search` round-trip calls are capped at 13.0 seconds (`_SEARCH_TIMEOUT_SECS = 13.0`, `call_timeout = 13000` ms) via Oracle SessionPool and connection settings.
+  - Driver-level abort ensures that slow or blocked database queries fail fast rather than stalling agent batches.
+- **Clean Fallback & Resilient Error Handling**:
+  - Database timeout errors (`DPI-1067`, `ORA-01013`, `TimeoutError`) are caught cleanly and return empty memory results with structured metadata rather than bubbling up as fatal turn-breaking exceptions.
+  - Query timeouts are decoupled from ONNX health monitoring, preventing unwarranted 60-second ONNX cooldown lockouts.
+- **Hermes Batch Timeout Alignment (60s)**:
+  - Aligns with Hermes Agent CLI `timeouts.tools.concurrent_batch: 60` in `~/.hermes/config.yaml`. With query timeout bounded at 13s, parallel tool invocations resolve well within the 60s deadline.
+- **Zero Drift Enforced**:
+  - Full bidirectional parity between repository and local plugin installation with zero modifications to Hermes Agent core repository files.
 
 ## What's new in v1.0.9.2
 

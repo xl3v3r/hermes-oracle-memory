@@ -641,7 +641,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.2")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.3")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -818,7 +818,7 @@ class TestOraclePlugin(unittest.TestCase):
                 pool_kwargs = mock_session_pool.call_args[1]
                 self.assertEqual(pool_kwargs["min"], 2)
                 self.assertEqual(pool_kwargs["max"], 6)
-                self.assertEqual(pool_kwargs["call_timeout"], 30000)
+                self.assertEqual(pool_kwargs["call_timeout"], 13000)
                 self.assertEqual(pool_kwargs["dsn"], "db_low")
 
     def test_dsn_high_descriptor_to_low_normalization(self):
@@ -1200,36 +1200,113 @@ class TestOraclePlugin(unittest.TestCase):
             provider._search("test query", mode="vector", top_k=5)
         self.assertIn("in cooldown", str(ctx.exception))
 
+    def test_search_timeout_constants(self):
+        self.assertEqual(oracle_plugin._SEARCH_TIMEOUT_SECS, 13.0)
+        self.assertEqual(oracle_plugin._SEARCH_TIMEOUT_MS, 13000)
+
+    def test_oracle_search_timeout_clean_fallback(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool.acquire.return_value = mock_conn
+
+        # Simulate timeout in _search
+        provider._search = MagicMock(side_effect=TimeoutError("oracle_search query timed out after 13s: DPI-1067: call timeout of 13000 ms exceeded"))
+        res = provider.handle_tool_call("oracle_search", {"query": "hanging query", "top_k": 8})
+        payload = json.loads(res)
+        self.assertEqual(payload["count"], 0)
+        self.assertTrue(payload["timed_out"])
+        self.assertIn("timed out after 13s", payload["result"])
+
+    def test_oracle_search_db_timeout_error_string_clean_fallback(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool.acquire.return_value = mock_conn
+
+        # Simulate DPI-1067 / ORA-01013 exception
+        provider._search = MagicMock(side_effect=Exception("ORA-01013: user requested cancel of current operation"))
+        res = provider.handle_tool_call("oracle_search", {"query": "hanging query", "top_k": 8})
+        payload = json.loads(res)
+        self.assertEqual(payload["count"], 0)
+        self.assertTrue(payload["timed_out"])
+        self.assertIn("timed out after 13s", payload["result"])
+
+    def test_timeout_in_hybrid_search_does_not_mark_onnx_failed(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        mock_cur.execute.side_effect = Exception("DPI-1067: call timeout of 13000 ms exceeded")
+        provider._onnx_mark_failed = MagicMock()
+
+        with self.assertRaises(TimeoutError):
+            provider._execute_hybrid_search(
+                mock_cur,
+                query="slow query",
+                vec=None,
+                contains_q="{slow}",
+                top_k=5,
+                fetch_k=10,
+                tgt_sql="",
+                tgt="any",
+            )
+
+        provider._onnx_mark_failed.assert_not_called()
+        self.assertFalse(provider._onnx_in_cooldown())
+
+    def test_timeout_in_vector_search_does_not_mark_onnx_failed(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        mock_cur.execute.side_effect = Exception("DPI-1067: call timeout of 13000 ms exceeded")
+        provider._onnx_mark_failed = MagicMock()
+
+        with self.assertRaises(TimeoutError):
+            provider._search("slow vector query", mode="vector", top_k=5)
+
+        provider._onnx_mark_failed.assert_not_called()
+        self.assertFalse(provider._onnx_in_cooldown())
+
     def test_metadata_version_consistency(self):
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.2")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.3")
 
         # 2. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.2", plugin_yaml)
-        self.assertIn("version-1.0.9.2-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.3", plugin_yaml)
+        self.assertIn("version-1.0.9.3-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 3. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9.2"', pyproject)
+        self.assertIn('version = "1.0.9.3"', pyproject)
 
         # 4. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.2", skill_md)
+        self.assertIn("version: 1.0.9.3", skill_md)
 
         # 5. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.2-blue.svg", readme)
-        self.assertIn("v1.0.9.2", readme)
+        self.assertIn("version-1.0.9.3-blue.svg", readme)
+        self.assertIn("v1.0.9.3", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.2-blue.svg", install_md)
-        self.assertIn("v1.0.9.2", install_md)
+        self.assertIn("version-1.0.9.3-blue.svg", install_md)
+        self.assertIn("v1.0.9.3", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp

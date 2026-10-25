@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.2"
+__version__ = "1.0.9.3"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -40,6 +40,8 @@ _OCI_RETRY_AFTER_SECS = 300.0
 _ONNX_RETRY_AFTER_SECS = 60.0
 _FETCH_ARRAYSIZE = 64
 _EMBED_TIMEOUT_SECS = 10.0
+_SEARCH_TIMEOUT_SECS = float(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT", "13.0"))
+_SEARCH_TIMEOUT_MS = int(_SEARCH_TIMEOUT_SECS * 1000)
 _EMBED_MAX_RETRIES = 2
 _RERANK_MAX_DOCS = 8
 _RERANK_ENABLED = (
@@ -405,7 +407,7 @@ class OracleMemoryProvider(MemoryProvider):
                 "getmode": oracledb.POOL_GETMODE_WAIT,
                 "timeout": 5,
                 "wait_timeout": 5,
-                "call_timeout": 30000,
+                "call_timeout": _SEARCH_TIMEOUT_MS,
             }
 
             raw_wallet = get_secret("OCI_WALLET_LOCATION")
@@ -440,6 +442,10 @@ class OracleMemoryProvider(MemoryProvider):
                     pass
 
             def _session_callback(conn: Any, tag: Any = None) -> None:
+                try:
+                    conn.call_timeout = _SEARCH_TIMEOUT_MS
+                except Exception:
+                    pass
                 try:
                     with conn.cursor() as cur:
                         for stmt in (
@@ -1402,8 +1408,22 @@ class OracleMemoryProvider(MemoryProvider):
             err_str = str(e)
             is_text_err = any(code in err_str for code in ("DRG-", "ORA-29902", "ORA-30600"))
             is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-            if use_onnx and not is_text_err and not is_shape_err:
+            is_timeout_err = isinstance(e, TimeoutError) or any(
+                code in err_str
+                for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+            )
+            if use_onnx and not is_text_err and not is_shape_err and not is_timeout_err:
                 self._onnx_mark_failed()
+
+            if is_timeout_err:
+                logger.warning(
+                    "Oracle search query timed out after %ss (%s); failing fast",
+                    _SEARCH_TIMEOUT_SECS,
+                    e,
+                )
+                raise TimeoutError(
+                    f"oracle_search query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s: {e}"
+                ) from e
 
             if is_text_err:
                 logger.warning(
@@ -1417,12 +1437,21 @@ class OracleMemoryProvider(MemoryProvider):
                     for r in self._fetch_rows(cur, vec_sql, vec_binds):
                         merged[r["memory_id"]] = r
                 except Exception as vec_err:
+                    vec_err_str = str(vec_err)
+                    is_vec_timeout = isinstance(vec_err, TimeoutError) or any(
+                        code in vec_err_str
+                        for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                    )
                     logger.warning(
                         "In-database ONNX vector fallback failed (%s); external fallback is disabled",
                         vec_err,
                     )
-                    if use_onnx and not any(code in str(vec_err) for code in ("ORA-54401", "ORA-51815")):
+                    if use_onnx and not is_vec_timeout and not any(code in vec_err_str for code in ("ORA-54401", "ORA-51815")):
                         self._onnx_mark_failed()
+                    if is_vec_timeout:
+                        raise TimeoutError(
+                            f"oracle_search vector fallback query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s: {vec_err}"
+                        ) from vec_err
                     raise RuntimeError(
                         f"In-database ONNX vector fallback failed ({vec_err}); external fallback is disabled"
                     ) from vec_err
@@ -1450,6 +1479,7 @@ class OracleMemoryProvider(MemoryProvider):
         rerank: bool = True,
         session_id: Any = None,
         agent_id: Any = None,
+        timeout: float | None = None,
     ) -> list:
         if not self._pool or not query:
             return []
@@ -1465,13 +1495,36 @@ class OracleMemoryProvider(MemoryProvider):
             )
 
         fetch_k = top_k * 2 if mode == "hybrid" else top_k
+        query_timeout_s = float(timeout) if timeout is not None else _SEARCH_TIMEOUT_SECS
+        query_timeout_ms = int(query_timeout_s * 1000)
         with self._pool.acquire() as conn:
+            try:
+                conn.call_timeout = query_timeout_ms
+            except Exception:
+                pass
             with conn.cursor() as cur:
                 if mode == "text":
-                    sql, binds = self._build_text_search_sql(
-                        contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-                    )
-                    rows = self._fetch_rows(cur, sql, binds)
+                    try:
+                        sql, binds = self._build_text_search_sql(
+                            contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                        )
+                        rows = self._fetch_rows(cur, sql, binds)
+                    except Exception as e:
+                        err_str = str(e)
+                        is_timeout_err = isinstance(e, TimeoutError) or any(
+                            code in err_str
+                            for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                        )
+                        if is_timeout_err:
+                            logger.warning(
+                                "Oracle text search timed out after %ss (%s); failing fast",
+                                query_timeout_s,
+                                e,
+                            )
+                            raise TimeoutError(
+                                f"oracle_search text query timed out after {query_timeout_s:.0f}s: {e}"
+                            ) from e
+                        raise
                 elif mode == "vector":
                     rows = []
                     use_onnx = bool(self._onnx_model)
@@ -1491,12 +1544,20 @@ class OracleMemoryProvider(MemoryProvider):
                     except Exception as e:
                         err_str = str(e)
                         is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
+                        is_timeout_err = isinstance(e, TimeoutError) or any(
+                            code in err_str
+                            for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                        )
                         logger.warning(
                             "In-database ONNX vector search failed (%s); external fallback is disabled",
                             e,
                         )
-                        if use_onnx and not is_shape_err:
+                        if use_onnx and not is_shape_err and not is_timeout_err:
                             self._onnx_mark_failed()
+                        if is_timeout_err:
+                            raise TimeoutError(
+                                f"oracle_search vector query timed out after {query_timeout_s:.0f}s: {e}"
+                            ) from e
                         raise RuntimeError(
                             f"In-database ONNX vector search failed ({e}); external fallback is disabled"
                         ) from e
@@ -1793,19 +1854,40 @@ class OracleMemoryProvider(MemoryProvider):
             args = {}
         try:
             if tool_name == "oracle_search":
-                rows = self._search(
-                    args.get("query") or "",
-                    top_k=int(args.get("top_k") or 8),
-                    mode=args.get("mode") or "hybrid",
-                    target=args.get("target") or "any",
-                    session_id=args.get("session_id"),
-                    agent_id=args.get("agent_id"),
-                )
-                if not rows:
-                    return json.dumps(
-                        {"result": "No relevant memories found.", "count": 0}
+                try:
+                    rows = self._search(
+                        args.get("query") or "",
+                        top_k=int(args.get("top_k") or 8),
+                        mode=args.get("mode") or "hybrid",
+                        target=args.get("target") or "any",
+                        session_id=args.get("session_id"),
+                        agent_id=args.get("agent_id"),
                     )
-                return json.dumps({"results": rows, "count": len(rows)})
+                    if not rows:
+                        return json.dumps(
+                            {"result": "No relevant memories found.", "count": 0}
+                        )
+                    return json.dumps({"results": rows, "count": len(rows)})
+                except Exception as e:
+                    err_str = str(e)
+                    is_timeout = isinstance(e, TimeoutError) or any(
+                        code in err_str
+                        for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout", "TimeoutError")
+                    )
+                    if is_timeout:
+                        logger.warning(
+                            "oracle_search query timed out after %ss (%s); clean fallback to empty results",
+                            _SEARCH_TIMEOUT_SECS,
+                            e,
+                        )
+                        return json.dumps(
+                            {
+                                "result": f"No relevant memories found (oracle_search query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s).",
+                                "count": 0,
+                                "timed_out": True,
+                            }
+                        )
+                    raise
             if tool_name == "oracle_add":
                 raw_facts = args.get("facts")
                 target = args.get("target") or "memory"
