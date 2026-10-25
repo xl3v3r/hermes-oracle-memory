@@ -1227,7 +1227,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _build_text_search_sql(
         self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None
-    ) -> Tuple[str, dict]:
+    ) -> tuple[str, dict]:
         extra_filters = ""
         binds = {"q": contains_q, "k": fetch_k}
         if session_id:
@@ -1252,7 +1252,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _build_vector_search_sql(
         self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
-    ) -> Tuple[str, dict]:
+    ) -> tuple[str, dict]:
         extra_filters = ""
         if session_id:
             extra_filters += " AND session_id = :sid "
@@ -1294,7 +1294,7 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _build_hybrid_search_sql(
         self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
-    ) -> Tuple[str, dict]:
+    ) -> tuple[str, dict]:
         extra_filters = ""
         if session_id:
             extra_filters += " AND session_id = :sid "
@@ -1963,17 +1963,19 @@ class OracleMemoryProvider(MemoryProvider):
                     return json.dumps({"result": "Fact stored.", "memory_id": mid})
                 else:
                     mids = []
+                    rows_to_insert = []
                     for f in facts_to_add:
                         mid = f"fact_{uuid.uuid4().hex[:16]}"
-                        self._insert(
-                            memory_id=mid,
-                            session_id=self._session_id,
-                            role="fact",
-                            content=f,
-                            target=target,
-                            metadata={"kind": "tool"},
-                        )
+                        rows_to_insert.append({
+                            "memory_id": mid,
+                            "session_id": self._session_id,
+                            "role": "fact",
+                            "content": f,
+                            "target": target,
+                            "metadata": {"kind": "tool"},
+                        })
                         mids.append(mid)
+                    self._insert_many(rows_to_insert)
                     return json.dumps({
                         "result": f"Batch facts stored ({len(mids)}).",
                         "memory_ids": mids,
@@ -2156,59 +2158,65 @@ class OracleMemoryProvider(MemoryProvider):
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
 
-    def _chunk_text(self, text: str, max_words: int, overlap: int) -> list:
+    def _chunk_text(self, text: str, max_words: int, overlap: int, cur=None) -> list:
         """Split one text unit into chunks (UTL_TO_CHUNKS in-DB, local fallback)."""
         chunks: list[str] = []
-        if self._pool:
-            with self._pool.acquire() as conn:
-                with conn.cursor() as cur:
+
+        def _execute_chunking(cursor):
+            try:
+                import oracledb
+
+                # oracledb thin mode returns CLOB chunks as str natively;
+                # do not map to DB_TYPE_LONG (silent 32,760-byte truncation).
+                cursor.setinputsizes(oracledb.DB_TYPE_CLOB)
+
+                cursor.execute(
+                    """
+                    SELECT /*+ NO_PARALLEL */ COLUMN_VALUE FROM TABLE(
+                      DBMS_VECTOR.UTL_TO_CHUNKS(
+                        TO_CLOB(:1),
+                        JSON(:2)
+                      )
+                    )
+                    """,
+                    (
+                        text,
+                        json.dumps(
+                            {
+                                "by": "words",
+                                "max": max_words,
+                                "overlap": overlap,
+                                "split": "recursively",
+                            }
+                        ),
+                    ),
+                )
+
+                for row in cursor:
+                    val = row[0]
+                    if not val:
+                        continue
+                    ctext = str(val)
                     try:
-                        import oracledb
-
-                        # oracledb thin mode returns CLOB chunks as str natively;
-                        # do not map to DB_TYPE_LONG (silent 32,760-byte truncation).
-                        cur.setinputsizes(oracledb.DB_TYPE_CLOB)
-
-                        cur.execute(
-                            """
-                            SELECT /*+ NO_PARALLEL */ COLUMN_VALUE FROM TABLE(
-                              DBMS_VECTOR.UTL_TO_CHUNKS(
-                                TO_CLOB(:1),
-                                JSON(:2)
-                              )
-                            )
-                            """,
-                            (
-                                text,
-                                json.dumps(
-                                    {
-                                        "by": "words",
-                                        "max": max_words,
-                                        "overlap": overlap,
-                                        "split": "recursively",
-                                    }
-                                ),
-                            ),
+                        payload = json.loads(ctext)
+                        ctext = (
+                            payload.get("chunk_data")
+                            or payload.get("chunk_text")
+                            or ctext
                         )
+                    except Exception:
+                        pass
+                    if ctext:
+                        chunks.append(str(ctext))
+            except Exception as e:
+                logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
 
-                        for row in cur:
-                            val = row[0]
-                            if not val:
-                                continue
-                            ctext = str(val)
-                            try:
-                                payload = json.loads(ctext)
-                                ctext = (
-                                    payload.get("chunk_data")
-                                    or payload.get("chunk_text")
-                                    or ctext
-                                )
-                            except Exception:
-                                pass
-                            if ctext:
-                                chunks.append(str(ctext))
-                    except Exception as e:
-                        logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
+        if cur:
+            _execute_chunking(cur)
+        elif self._pool:
+            with self._pool.acquire() as conn:
+                with conn.cursor() as cursor:
+                    _execute_chunking(cursor)
         if not chunks:
             words = text.split()
             step = max(1, max_words - overlap)
@@ -2237,35 +2245,38 @@ class OracleMemoryProvider(MemoryProvider):
             turns = [{"text": content}] if content else []
         ids = []
         rows = []
-        for t_index, turn in enumerate(turns):
-            text = (turn.get("text") or "").strip()
-            if not text:
-                continue
-            sender = turn.get("sender") or ""
-            conv_ref = (turn.get("conv_ref") or "")[:512] or None
-            turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
-            for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap)):
-                mid = f"chk_{uuid.uuid4().hex[:16]}"
-                rows.append({
-                    "memory_id": mid,
-                    "session_id": self._session_id,
-                    "role": "chunk",
-                    "content": ch,
-                    "target": "memory",
-                    "metadata": {
-                        "kind": "chunk",
-                        "index": t_index,
-                        "chunk_index": c_index,
-                        "turn_id": turn_id,
-                        "conv_ref": conv_ref,
-                        "sender": sender or None,
-                    },
-                    "turn_index": t_index,
-                    "chunk_index": c_index,
-                    "turn_id": turn_id,
-                    "conv_ref": conv_ref,
-                })
-                ids.append(mid)
+
+        with self._pool.acquire() as conn:
+            with conn.cursor() as cursor:
+                for t_index, turn in enumerate(turns):
+                    text = (turn.get("text") or "").strip()
+                    if not text:
+                        continue
+                    sender = turn.get("sender") or ""
+                    conv_ref = (turn.get("conv_ref") or "")[:512] or None
+                    turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
+                    for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap, cur=cursor)):
+                        mid = f"chk_{uuid.uuid4().hex[:16]}"
+                        rows.append({
+                            "memory_id": mid,
+                            "session_id": self._session_id,
+                            "role": "chunk",
+                            "content": ch,
+                            "target": "memory",
+                            "metadata": {
+                                "kind": "chunk",
+                                "index": t_index,
+                                "chunk_index": c_index,
+                                "turn_id": turn_id,
+                                "conv_ref": conv_ref,
+                                "sender": sender or None,
+                            },
+                            "turn_index": t_index,
+                            "chunk_index": c_index,
+                            "turn_id": turn_id,
+                            "conv_ref": conv_ref,
+                        })
+                        ids.append(mid)
 
         if rows:
             self._insert_many(rows)

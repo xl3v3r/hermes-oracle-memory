@@ -614,7 +614,7 @@ class TestOraclePlugin(unittest.TestCase):
         fake_vec = array.array("f", [0.1] * 768)
         mock_cur.fetchall.return_value = [(0, fake_vec)]
 
-        res1 = provider._embed_many_tagged(["same text"])
+        provider._embed_many_tagged(["same text"])
         res2 = provider._embed_many_tagged(["same text"])
         self.assertEqual(mock_cur.execute.call_count, 1)  # second served from cache
         self.assertEqual(res2[0][1], "BGE_BASE_EN_V1_5")
@@ -679,6 +679,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {"content": "User prefers python3"})
         data = json.loads(res)
@@ -694,6 +695,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": ["Fact 1: server is Linux", "Fact 2: Python 3.12 active"],
@@ -703,13 +705,14 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("Batch facts stored (2)", data["result"])
         self.assertEqual(len(data["memory_ids"]), 2)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        self.assertEqual(provider._insert_many.call_count, 1)
 
     def test_oracle_add_batch_facts_via_content_list(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {
             "content": ["Fact A", "Fact B", "Fact C"],
@@ -717,13 +720,14 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 3)
-        self.assertEqual(provider._insert.call_count, 3)
+        self.assertEqual(provider._insert_many.call_count, 1)
 
     def test_oracle_add_stringified_json_array(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": '["Fact X: parsed from JSON string", "Fact Y: JSON string"]',
@@ -731,26 +735,28 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        self.assertEqual(provider._insert_many.call_count, 1)
 
     def test_oracle_add_content_stringified_json_array(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {
             "content": '["Fact Alpha", "Fact Beta"]',
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        self.assertEqual(provider._insert_many.call_count, 1)
 
     def test_oracle_add_dict_facts(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": [{"fact": "Dict fact 1"}, {"text": "Dict fact 2"}],
@@ -758,11 +764,11 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        self.assertEqual(provider._insert_many.call_count, 1)
         # Invalid target must normalize to "memory"
-        self.assertEqual(provider._insert.call_args_list[0][1]["target"], "memory")
-        self.assertEqual(provider._insert.call_args_list[0][1]["content"], "Dict fact 1")
-        self.assertEqual(provider._insert.call_args_list[1][1]["content"], "Dict fact 2")
+        self.assertEqual(provider._insert_many.call_args_list[0][0][0][0]["target"], "memory")
+        self.assertEqual(provider._insert_many.call_args_list[0][0][0][0]["content"], "Dict fact 1")
+        self.assertEqual(provider._insert_many.call_args_list[0][0][0][1]["content"], "Dict fact 2")
 
     def test_oracle_add_missing_content(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -785,6 +791,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock()
 
         res = provider.handle_tool_call("oracle_add", {"facts": "User prefers Linux"})
         data = json.loads(res)
@@ -828,7 +835,7 @@ class TestOraclePlugin(unittest.TestCase):
             "OCI_DB_DSN": "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=myadb_high.adb.oraclecloud.com)))",
         }
         with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)):
-            with patch("oracledb.SessionPool") as mock_session_pool:
+            with patch("oracledb.SessionPool"):
                 provider = oracle_plugin.OracleMemoryProvider()
                 provider._verify_schema = MagicMock()
                 provider._ensure_schema = MagicMock()
@@ -844,7 +851,7 @@ class TestOraclePlugin(unittest.TestCase):
             "OCI_DB_DSN": "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=MYADB_HIGH.adb.oraclecloud.com)))",
         }
         with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)):
-            with patch("oracledb.SessionPool") as mock_session_pool:
+            with patch("oracledb.SessionPool"):
                 provider = oracle_plugin.OracleMemoryProvider()
                 provider._verify_schema = MagicMock()
                 provider._ensure_schema = MagicMock()
