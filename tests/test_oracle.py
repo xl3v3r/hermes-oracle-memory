@@ -1277,6 +1277,63 @@ class TestOraclePlugin(unittest.TestCase):
         provider._onnx_mark_failed.assert_not_called()
         self.assertFalse(provider._onnx_in_cooldown())
 
+    def test_timeout_in_cooldown_hybrid_search_fails_fast(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._onnx_failed_at = 9999999999.0  # Force cooldown active
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        mock_cur.fetchall.side_effect = Exception("DPI-1067: call timeout of 13000 ms exceeded")
+
+        with self.assertRaises(TimeoutError) as ctx:
+            provider._execute_hybrid_search(
+                mock_cur,
+                query="cooldown slow query",
+                vec=None,
+                contains_q="{cooldown}",
+                top_k=5,
+                fetch_k=10,
+                tgt_sql="",
+                tgt="any",
+            )
+        self.assertIn("timed out after 13s", str(ctx.exception))
+
+    def test_dpi_1040_pool_timeout_clean_fallback(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool.acquire.side_effect = Exception("DPI-1040: connection pool wait timeout of 5000 ms exceeded")
+
+        res = provider.handle_tool_call("oracle_search", {"query": "starved pool query", "top_k": 5})
+        payload = json.loads(res)
+        self.assertEqual(payload["count"], 0)
+        self.assertTrue(payload["timed_out"])
+        self.assertIn("timed out after 13s", payload["result"])
+
+    def test_all_test_scripts_directory_structure(self):
+        from pathlib import Path
+        repo_dir = Path(__file__).resolve().parent.parent
+        tests_dir = repo_dir / "tests"
+        self.assertTrue(tests_dir.is_dir())
+        test_files = list(tests_dir.glob("test_*.py"))
+        self.assertGreaterEqual(len(test_files), 6)
+        # Verify core test scripts exist in tests/
+        expected_scripts = {
+            "test_format_prefetch.py",
+            "test_init.py",
+            "test_oracle.py",
+            "test_oracle_import.py",
+            "test_plugin.py",
+            "test_reembed.py",
+        }
+        found_names = {f.name for f in test_files}
+        self.assertTrue(expected_scripts.issubset(found_names))
+
     def test_metadata_version_consistency(self):
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent

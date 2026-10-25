@@ -36,13 +36,14 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 │   └── verify_provider.py
 ├── skills/                 # Hermes agent skills
 │   └── oracle-import/      # Bulk conversation and archive ingestion skill
-└── tests/                  # Unit test suite (115 tests)
+└── tests/                  # Unit test suite (140+ tests)
     ├── conftest.py         # Test configuration & mocks for Hermes host and DB drivers
     ├── test_format_prefetch.py # Prefetch formatting tests
     ├── test_init.py        # Gateway turn detection and config schema tests
     ├── test_oracle.py      # Core provider unit tests, edge cases, is_available tests
     ├── test_oracle_import.py# Conversation import and chunking tests
-    └── test_plugin.py      # Tool schema and unavailable_reason tests
+    ├── test_plugin.py      # Tool schema and unavailable_reason tests
+    └── test_reembed.py     # Re-embedding and vector upgrade tests
 ```
 
 ---

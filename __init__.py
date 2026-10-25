@@ -1370,16 +1370,33 @@ class OracleMemoryProvider(MemoryProvider):
         return fused_sql, fused_binds
 
     def _execute_hybrid_search(
-        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None, timeout_s: float = _SEARCH_TIMEOUT_SECS
     ) -> list:
         merged: dict = {}
         if self._onnx_in_cooldown():
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")
-            sql, binds = self._build_text_search_sql(
-                contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
-            )
-            for r in self._fetch_rows(cur, sql, binds):
-                merged[r["memory_id"]] = r
+            try:
+                sql, binds = self._build_text_search_sql(
+                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                )
+                for r in self._fetch_rows(cur, sql, binds):
+                    merged[r["memory_id"]] = r
+            except Exception as e:
+                err_str = str(e)
+                is_timeout_err = isinstance(e, TimeoutError) or any(
+                    code in err_str
+                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                )
+                if is_timeout_err:
+                    logger.warning(
+                        "Oracle hybrid text search in cooldown timed out after %ss (%s); failing fast",
+                        timeout_s,
+                        e,
+                    )
+                    raise TimeoutError(
+                        f"oracle_search hybrid text query timed out after {timeout_s:.0f}s: {e}"
+                    ) from e
+                raise
             ranked = sorted(
                 merged.values(), key=lambda x: x["score"], reverse=True
             )
@@ -1410,7 +1427,7 @@ class OracleMemoryProvider(MemoryProvider):
             is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
             is_timeout_err = isinstance(e, TimeoutError) or any(
                 code in err_str
-                for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
             )
             if use_onnx and not is_text_err and not is_shape_err and not is_timeout_err:
                 self._onnx_mark_failed()
@@ -1418,11 +1435,11 @@ class OracleMemoryProvider(MemoryProvider):
             if is_timeout_err:
                 logger.warning(
                     "Oracle search query timed out after %ss (%s); failing fast",
-                    _SEARCH_TIMEOUT_SECS,
+                    timeout_s,
                     e,
                 )
                 raise TimeoutError(
-                    f"oracle_search query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s: {e}"
+                    f"oracle_search query timed out after {timeout_s:.0f}s: {e}"
                 ) from e
 
             if is_text_err:
@@ -1440,7 +1457,7 @@ class OracleMemoryProvider(MemoryProvider):
                     vec_err_str = str(vec_err)
                     is_vec_timeout = isinstance(vec_err, TimeoutError) or any(
                         code in vec_err_str
-                        for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                        for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
                     )
                     logger.warning(
                         "In-database ONNX vector fallback failed (%s); external fallback is disabled",
@@ -1450,7 +1467,7 @@ class OracleMemoryProvider(MemoryProvider):
                         self._onnx_mark_failed()
                     if is_vec_timeout:
                         raise TimeoutError(
-                            f"oracle_search vector fallback query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s: {vec_err}"
+                            f"oracle_search vector fallback query timed out after {timeout_s:.0f}s: {vec_err}"
                         ) from vec_err
                     raise RuntimeError(
                         f"In-database ONNX vector fallback failed ({vec_err}); external fallback is disabled"
@@ -1513,7 +1530,7 @@ class OracleMemoryProvider(MemoryProvider):
                         err_str = str(e)
                         is_timeout_err = isinstance(e, TimeoutError) or any(
                             code in err_str
-                            for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                            for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
                         )
                         if is_timeout_err:
                             logger.warning(
@@ -1546,7 +1563,7 @@ class OracleMemoryProvider(MemoryProvider):
                         is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
                         is_timeout_err = isinstance(e, TimeoutError) or any(
                             code in err_str
-                            for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
+                            for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
                         )
                         logger.warning(
                             "In-database ONNX vector search failed (%s); external fallback is disabled",
@@ -1563,7 +1580,7 @@ class OracleMemoryProvider(MemoryProvider):
                         ) from e
                 else:
                     rows = self._execute_hybrid_search(
-                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id
+                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, timeout_s=query_timeout_s
                     )
         return rows[:top_k]
 
@@ -1872,7 +1889,7 @@ class OracleMemoryProvider(MemoryProvider):
                     err_str = str(e)
                     is_timeout = isinstance(e, TimeoutError) or any(
                         code in err_str
-                        for code in ("DPI-1067", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout", "TimeoutError")
+                        for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout", "TimeoutError")
                     )
                     if is_timeout:
                         logger.warning(
