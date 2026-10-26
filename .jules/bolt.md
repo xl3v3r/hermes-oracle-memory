@@ -1,0 +1,3 @@
+## 2023-10-26 - N+1 Connection Pool Acquisition in Synchronous Tool Execution
+**Learning:** In the Oracle memory provider, iterating over a list of facts and calling `_insert` synchronously for each fact acquires a new connection from the pool for every single item, creating an N+1 connection pool acquisition bottleneck and multiple DB roundtrips.
+**Action:** When executing batch operations (like `oracle_add` with multiple facts), always construct a list of row dictionaries and use `_insert_many` (or similar batch functions) which acquires a single connection in the outer scope and executes a bulk insert.

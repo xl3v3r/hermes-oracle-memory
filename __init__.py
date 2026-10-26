@@ -284,6 +284,8 @@ class OracleMemoryProvider(MemoryProvider):
         self._external_embed_warned = False
         self._init_error = ""
         self._agent_context = "primary"
+        self._onnx_model = ""
+        self._table = "hermes_agent_memory"
 
     @property
     def name(self) -> str:
@@ -1963,17 +1965,22 @@ class OracleMemoryProvider(MemoryProvider):
                     return json.dumps({"result": "Fact stored.", "memory_id": mid})
                 else:
                     mids = []
+                    rows = []
                     for f in facts_to_add:
                         mid = f"fact_{uuid.uuid4().hex[:16]}"
-                        self._insert(
-                            memory_id=mid,
-                            session_id=self._session_id,
-                            role="fact",
-                            content=f,
-                            target=target,
-                            metadata={"kind": "tool"},
-                        )
+                        rows.append({
+                            "memory_id": mid,
+                            "session_id": self._session_id,
+                            "role": "fact",
+                            "content": f,
+                            "target": target,
+                            "metadata": {"kind": "tool"},
+                        })
                         mids.append(mid)
+
+                    # ⚡ Bolt: Use _insert_many for batch insertions to avoid N+1 connection pool acquisitions
+                    self._insert_many(rows)
+
                     return json.dumps({
                         "result": f"Batch facts stored ({len(mids)}).",
                         "memory_ids": mids,
