@@ -1,11 +1,11 @@
 name: oracle
-version: 1.0.9.3
-description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.9.3 updates are CRITICAL to functionality. Caps individual oracle_search query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent timeouts.tools.concurrent_batch 60s, and prevents unconstrained batch hangs."
+version: 1.0.9.3.1
+description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, async batched embeddings, in-database chunking. v1.0.9.3.1 updates are CRITICAL to functionality. Native skill library indexing engine (oracle_sync_skills), byte-safe UTF-8 clamping (_safe_varchar_bytes) to prevent ORA-12899, root VERSION file, 13s oracle_search query timeout cap, and zero drift."
 provides_hooks:
   - on_skill_lifecycle
 pip_dependencies:
   - oracledb>=4.0.2
 
 # Badges & Criticality Notice
-# [![Version](https://img.shields.io/badge/version-1.0.9.3-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
-# CRITICALITY NOTICE: v1.0.9.3 updates are CRITICAL to functionality. Caps individual oracle_search query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent timeouts.tools.concurrent_batch 60s, and prevents unconstrained batch hangs.
+# [![Version](https://img.shields.io/badge/version-1.0.9.3.1-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
+# CRITICALITY NOTICE: v1.0.9.3.1 updates are CRITICAL to functionality. Native skill library indexing engine (oracle_sync_skills), byte-safe UTF-8 clamping (_safe_varchar_bytes) to prevent ORA-12899, root VERSION file, 13s oracle_search query timeout cap, and zero drift.

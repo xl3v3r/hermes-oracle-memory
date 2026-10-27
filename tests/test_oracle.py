@@ -641,7 +641,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.3")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.3.1")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1321,7 +1321,7 @@ class TestOraclePlugin(unittest.TestCase):
         tests_dir = repo_dir / "tests"
         self.assertTrue(tests_dir.is_dir())
         test_files = list(tests_dir.glob("test_*.py"))
-        self.assertGreaterEqual(len(test_files), 6)
+        self.assertGreaterEqual(len(test_files), 7)
         # Verify core test scripts exist in tests/
         expected_scripts = {
             "test_format_prefetch.py",
@@ -1330,40 +1330,62 @@ class TestOraclePlugin(unittest.TestCase):
             "test_oracle_import.py",
             "test_plugin.py",
             "test_reembed.py",
+            "test_sync_skills.py",
         }
         found_names = {f.name for f in test_files}
         self.assertTrue(expected_scripts.issubset(found_names))
+
+        # Verify operational and test scripts exist in scripts/
+        scripts_dir = repo_dir / "scripts"
+        self.assertTrue(scripts_dir.is_dir())
+        expected_op_scripts = {
+            "audit_embeddings.py",
+            "backfill_embeddings.py",
+            "import_conversations_ordered.py",
+            "reembed_embeddings.py",
+            "run_tests.py",
+            "setup_onnx_model.py",
+            "sync_skills.py",
+            "verify_provider.py",
+        }
+        found_op_names = {f.name for f in scripts_dir.glob("*.py")}
+        self.assertTrue(expected_op_scripts.issubset(found_op_names))
 
     def test_metadata_version_consistency(self):
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.3")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.3.1")
 
-        # 2. plugin.yaml
+        # 2. VERSION
+        version_file = repo_dir / "VERSION"
+        self.assertTrue(version_file.is_file())
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.3.1")
+
+        # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.3", plugin_yaml)
-        self.assertIn("version-1.0.9.3-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.3.1", plugin_yaml)
+        self.assertIn("version-1.0.9.3.1-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
-        # 3. pyproject.toml
+        # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9.3"', pyproject)
+        self.assertIn('version = "1.0.9.3.1"', pyproject)
 
-        # 4. skills/oracle-import/SKILL.md
+        # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.3", skill_md)
+        self.assertIn("version: 1.0.9.3.1", skill_md)
 
-        # 5. README.md & INSTALL.md
+        # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.3-blue.svg", readme)
-        self.assertIn("v1.0.9.3", readme)
+        self.assertIn("version-1.0.9.3.1-blue.svg", readme)
+        self.assertIn("v1.0.9.3.1", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.3-blue.svg", install_md)
-        self.assertIn("v1.0.9.3", install_md)
+        self.assertIn("version-1.0.9.3.1-blue.svg", install_md)
+        self.assertIn("v1.0.9.3.1", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp

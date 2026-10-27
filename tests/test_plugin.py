@@ -26,7 +26,7 @@ class TestOracleMemoryProvider(unittest.TestCase):
         provider = oracle_plugin.OracleMemoryProvider()
         schemas = provider.get_tool_schemas()
 
-        expected_names = {"oracle_search", "oracle_add", "oracle_update", "oracle_delete", "oracle_chunk"}
+        expected_names = {"oracle_search", "oracle_add", "oracle_update", "oracle_delete", "oracle_chunk", "oracle_sync_skills"}
         actual_names = {schema["name"] for schema in schemas}
         self.assertEqual(actual_names, expected_names)
 

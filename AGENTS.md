@@ -24,26 +24,31 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ├── README.md               # Project documentation and usage guide
 ├── RELEASE_NOTES_1.0.9.2.md # Release notes for v1.0.9.2
 ├── RELEASE_NOTES_1.0.9.3.md # Release notes for v1.0.9.3
+├── RELEASE_NOTES_1.0.9.3.1.md # Release notes for v1.0.9.3.1
+├── VERSION                 # Canonical project version file (1.0.9.3.1)
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration
-├── scripts/                # Utility scripts (verification, backfill, ONNX setup)
+├── scripts/                # Utility scripts (verification, backfill, ONNX setup, skill sync)
 │   ├── audit_embeddings.py
 │   ├── backfill_embeddings.py
 │   ├── import_conversations_ordered.py
 │   ├── reembed_embeddings.py
+│   ├── run_tests.py
 │   ├── setup_onnx_model.py
+│   ├── sync_skills.py
 │   └── verify_provider.py
 ├── skills/                 # Hermes agent skills
 │   └── oracle-import/      # Bulk conversation and archive ingestion skill
-└── tests/                  # Unit test suite (140+ tests)
+└── tests/                  # Unit test suite (160+ tests)
     ├── conftest.py         # Test configuration & mocks for Hermes host and DB drivers
     ├── test_format_prefetch.py # Prefetch formatting tests
     ├── test_init.py        # Gateway turn detection and config schema tests
     ├── test_oracle.py      # Core provider unit tests, edge cases, is_available tests
     ├── test_oracle_import.py# Conversation import and chunking tests
     ├── test_plugin.py      # Tool schema and unavailable_reason tests
-    └── test_reembed.py     # Re-embedding and vector upgrade tests
+    ├── test_reembed.py     # Re-embedding and vector upgrade tests
+    └── test_sync_skills.py # Native skill library scanner and frontmatter parser tests
 ```
 
 ---

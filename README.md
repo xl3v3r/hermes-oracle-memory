@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.9.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.3.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.3 updates are CRITICAL to functionality. Caps individual `oracle_search` query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent `timeouts.tools.concurrent_batch` 60s in `~/.hermes/config.yaml`, and prevents batch deadlocks.
+> **CRITICALITY NOTICE**: v1.0.9.3.1 updates are CRITICAL to functionality. Native skill library indexing engine (`oracle_sync_skills`), byte-safe UTF-8 clamping (`_safe_varchar_bytes`) to prevent `ORA-12899`, canonical root `VERSION` file, 13-second `oracle_search` query timeout cap, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.9.3 updates are CRITICAL to functionality. Caps individual `oracle_search` query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent `timeouts.tools.concurrent_batch` 60s in `~/.hermes/config.yaml`, and prevents batch deadlocks.
+> **CRITICALITY NOTICE**: v1.0.9.3.1 updates are CRITICAL to functionality. Native skill library indexing engine (`oracle_sync_skills`), byte-safe UTF-8 clamping (`_safe_varchar_bytes`) to prevent `ORA-12899`, canonical root `VERSION` file, 13-second `oracle_search` query timeout cap, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
 
 ### Recommended — Hermes plugin manager
 
@@ -59,10 +59,25 @@ Embeddings are computed 100% in-house:
 | `oracle_update` | replace a fact by `memory_id` |
 | `oracle_delete` | delete by `memory_id` |
 | `oracle_chunk`  | split inline text or a disk file in-database |
+| `oracle_sync_skills` | scan, parse, and index skill libraries (`~/.agents/skills`, `~/.hermes/skills`) into vector memory |
 
 ## Skills
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
+
+## What's new in v1.0.9.3.1
+
+- **Criticality Notice**: v1.0.9.3.1 updates are CRITICAL to functionality. Introduces the native Skill Library Indexing Engine (`oracle_sync_skills` and `scripts/sync_skills.py`), provides byte-safe UTF-8 boundary clamping (`_safe_varchar_bytes`) across all insertion and update paths to prevent `ORA-12899`, establishes a root `VERSION` file, and enforces zero drift across repository, installed plugin, and all Hermes Agent profile environments.
+- **Native Skill Library Indexing Engine**:
+  - `oracle_sync_skills` tool and `scripts/sync_skills.py` scanner automatically discover and index `SKILL.md` libraries across `~/.agents/skills` and `~/.hermes/skills` into vector memory.
+  - Implements YAML frontmatter parsing supporting scalar folding/chomping (`>-`), lists, and nested mappings.
+  - Generates rich semantic memory representations tagged with `agent:skills`, `category:skill`, and `skill:<name>`.
+  - Serial-hinted execution (`/*+ NO_PARALLEL */`) and sequence-length safe embedding text clamping (`1200` chars).
+- **Universal Byte-Safe UTF-8 Clamping (`_safe_varchar_bytes`)**:
+  - Replaces character slicing with byte-level UTF-8 clamping across `_insert`, `_insert_many` (both ONNX and precomputed loops), and `oracle_update`, completely eliminating `ORA-12899: value too large for column`.
+- **Standardized Version Tracking & Script Organization**:
+  - Adds root `VERSION` file tracking `1.0.9.3.1`.
+  - All test and operational scripts are maintained cleanly in the `scripts/` directory.
 
 ## What's new in v1.0.9.3
 

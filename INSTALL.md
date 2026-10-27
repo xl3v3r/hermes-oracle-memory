@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.0.9.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.3.1-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.3 updates are CRITICAL to functionality. Caps individual `oracle_search` query timeout at 13 seconds with clean fallback and fail-fast error handling, synchronizes with Hermes Agent `timeouts.tools.concurrent_batch` 60s in `~/.hermes/config.yaml`, and eliminates hanging tool batches.
+> **CRITICALITY NOTICE**: v1.0.9.3.1 updates are CRITICAL to functionality. Native skill library indexing engine (`oracle_sync_skills`), byte-safe UTF-8 clamping (`_safe_varchar_bytes`) to prevent `ORA-12899`, canonical root `VERSION` file, 13-second `oracle_search` query timeout cap, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 

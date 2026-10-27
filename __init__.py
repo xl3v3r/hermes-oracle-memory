@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.3"
+__version__ = "1.0.9.3.1"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -183,6 +183,29 @@ TOOL_SCHEMAS = [
                 "overlap": {
                     "type": "integer",
                     "description": "Word overlap (default 10).",
+                },
+            },
+        },
+    },
+    {
+        "name": "oracle_sync_skills",
+        "description": "Scan and index all local skills (~/.agents/skills and ~/.hermes/skills) into Oracle 26ai vector memory for semantic search and discovery.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["meta", "full"],
+                    "description": "meta (name+description+triggers) or full (chunk entire body). Default meta.",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Re-index even if already up to date. Default false.",
+                },
+                "dirs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional custom directories to scan for skills.",
                 },
             },
         },
@@ -575,6 +598,19 @@ class OracleMemoryProvider(MemoryProvider):
             return ""
         return text[:max_chars]
 
+    @staticmethod
+    def _safe_varchar_bytes(text: str | None, max_bytes: int = 4000) -> str:
+        """Clamp text to fit within max_bytes in UTF-8 encoding.
+
+        Prevents ORA-12899: value too large for column when inserting into VARCHAR2(4000).
+        """
+        if not text:
+            return ""
+        encoded = text.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return text
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
     def _onnx_in_cooldown(self) -> bool:
         with self._embed_lock:
             failed_at = self._onnx_failed_at
@@ -903,7 +939,7 @@ class OracleMemoryProvider(MemoryProvider):
         vec = embedding if embedding is not None else None
         vec_model = None  # provenance stamp; None means "unknown origin"
         meta = json.dumps(metadata or {})
-        txt = (content or "")[:4000]
+        txt = self._safe_varchar_bytes(content, 4000)
         embed_txt = self._safe_embed_text(content)
         onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
@@ -1043,7 +1079,7 @@ class OracleMemoryProvider(MemoryProvider):
                 target = row.get("target")
                 metadata = row.get("metadata")
                 meta = json.dumps(metadata or {})
-                txt = (content or "")[:4000]
+                txt = self._safe_varchar_bytes(content, 4000)
                 embed_txt = self._safe_embed_text(content)
                 binds = (
                     memory_id,
@@ -1095,7 +1131,7 @@ class OracleMemoryProvider(MemoryProvider):
                         target = row.get("target")
                         metadata = row.get("metadata")
                         meta = json.dumps(metadata or {})
-                        txt = (content or "")[:4000]
+                        txt = self._safe_varchar_bytes(content, 4000)
                         binds = (
                             memory_id,
                             session_id,
@@ -1148,7 +1184,7 @@ class OracleMemoryProvider(MemoryProvider):
             model = row.get("embedding_model")
 
             meta = json.dumps(metadata or {})
-            txt = (content or "")[:4000]
+            txt = self._safe_varchar_bytes(content, 4000)
 
             binds = (
                 memory_id,
@@ -1992,7 +2028,7 @@ class OracleMemoryProvider(MemoryProvider):
                     raise RuntimeError(
                         "In-database ONNX embedding model is in cooldown; external fallback is disabled"
                     )
-                txt = content[:4000]
+                txt = self._safe_varchar_bytes(content, 4000)
                 embed_txt = self._safe_embed_text(content)
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
@@ -2151,6 +2187,12 @@ class OracleMemoryProvider(MemoryProvider):
                 return json.dumps(
                     {"result": "chunked", "count": len(ids), "memory_ids": ids}
                 )
+            if tool_name == "oracle_sync_skills":
+                mode = args.get("mode") or "meta"
+                force = bool(args.get("force", False))
+                dirs = args.get("dirs")
+                res = self.sync_skills(mode=mode, force=force, dirs=dirs)
+                return json.dumps(res)
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
             logger.exception("oracle tool %s failed", tool_name)
@@ -2271,6 +2313,32 @@ class OracleMemoryProvider(MemoryProvider):
             self._insert_many(rows)
         return ids
 
+    def sync_skills(
+        self,
+        mode: str = "meta",
+        force: bool = False,
+        dirs: list[str | Path] | None = None,
+    ) -> dict[str, Any]:
+        """Index local skills from ~/.agents/skills and ~/.hermes/skills into Oracle 26ai vector memory."""
+        if not self._pool:
+            raise RuntimeError(
+                self._init_error or self.unavailable_reason() or "Oracle memory pool not initialized"
+            )
+        try:
+            from scripts.sync_skills import sync_skills_library
+        except ImportError:
+            import importlib.util
+
+            scripts_path = Path(__file__).resolve().parent / "scripts" / "sync_skills.py"
+            if scripts_path.exists():
+                spec = importlib.util.spec_from_file_location("sync_skills", scripts_path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                sync_skills_library = mod.sync_skills_library
+            else:
+                raise ImportError(f"Cannot find sync_skills script at {scripts_path}")
+        return sync_skills_library(provider=self, mode=mode, force=force, dirs=dirs, dry_run=False)
+
     def shutdown(self) -> None:
         # Stop accepting new background writes, then drain in-flight and
         # pending work before closing the pool so no turn is lost to a
@@ -2288,6 +2356,7 @@ class OracleMemoryProvider(MemoryProvider):
 
 
 _safe_embed_text = OracleMemoryProvider._safe_embed_text
+_safe_varchar_bytes = OracleMemoryProvider._safe_varchar_bytes
 
 
 def register(ctx) -> None:
