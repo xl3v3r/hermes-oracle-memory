@@ -2198,20 +2198,65 @@ class OracleMemoryProvider(MemoryProvider):
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
 
-    def _chunk_text(self, text: str, max_words: int, overlap: int) -> list:
+    def _chunk_text(self, text: str, max_words: int, overlap: int, cur: Any = None) -> list:
         """Split one text unit into chunks (UTL_TO_CHUNKS in-DB, local fallback)."""
         chunks: list[str] = []
-        if self._pool:
+
+        # ⚡ Bolt Optimization: Use provided cursor to avoid N+1 pool acquisitions when batching
+        if cur:
+            try:
+                import oracledb
+                cur.setinputsizes(oracledb.DB_TYPE_CLOB)
+                cur.execute(
+                    """
+                    SELECT /*+ NO_PARALLEL */ COLUMN_VALUE FROM TABLE(
+                      DBMS_VECTOR.UTL_TO_CHUNKS(
+                        TO_CLOB(:1),
+                        JSON(:2)
+                      )
+                    )
+                    """,
+                    (
+                        text,
+                        json.dumps(
+                            {
+                                "by": "words",
+                                "max": max_words,
+                                "overlap": overlap,
+                                "split": "recursively",
+                            }
+                        ),
+                    ),
+                )
+                for row in cur:
+                    val = row[0]
+                    if not val:
+                        continue
+                    ctext = str(val)
+                    try:
+                        payload = json.loads(ctext)
+                        ctext = (
+                            payload.get("chunk_data")
+                            or payload.get("chunk_text")
+                            or ctext
+                        )
+                    except Exception:
+                        pass
+                    if ctext:
+                        chunks.append(str(ctext))
+            except Exception as e:
+                logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
+        elif self._pool:
             with self._pool.acquire() as conn:
-                with conn.cursor() as cur:
+                with conn.cursor() as pool_cur:
                     try:
                         import oracledb
 
                         # oracledb thin mode returns CLOB chunks as str natively;
                         # do not map to DB_TYPE_LONG (silent 32,760-byte truncation).
-                        cur.setinputsizes(oracledb.DB_TYPE_CLOB)
+                        pool_cur.setinputsizes(oracledb.DB_TYPE_CLOB)
 
-                        cur.execute(
+                        pool_cur.execute(
                             """
                             SELECT /*+ NO_PARALLEL */ COLUMN_VALUE FROM TABLE(
                               DBMS_VECTOR.UTL_TO_CHUNKS(
@@ -2233,7 +2278,7 @@ class OracleMemoryProvider(MemoryProvider):
                             ),
                         )
 
-                        for row in cur:
+                        for row in pool_cur:
                             val = row[0]
                             if not val:
                                 continue
@@ -2279,35 +2324,58 @@ class OracleMemoryProvider(MemoryProvider):
             turns = [{"text": content}] if content else []
         ids = []
         rows = []
-        for t_index, turn in enumerate(turns):
-            text = (turn.get("text") or "").strip()
-            if not text:
-                continue
-            sender = turn.get("sender") or ""
-            conv_ref = (turn.get("conv_ref") or "")[:512] or None
-            turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
-            for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap)):
-                mid = f"chk_{uuid.uuid4().hex[:16]}"
-                rows.append({
-                    "memory_id": mid,
-                    "session_id": self._session_id,
-                    "role": "chunk",
-                    "content": ch,
-                    "target": "memory",
-                    "metadata": {
-                        "kind": "chunk",
-                        "index": t_index,
+
+        # ⚡ Bolt Optimization: Acquire single connection for all chunks to prevent N+1 acquisitions
+        conn = None
+        cur = None
+        try:
+            conn = self._pool.acquire()
+            cur = conn.cursor()
+        except Exception as e:
+            logger.debug("Failed to acquire pool connection for batch chunking: %s", e)
+
+        try:
+            for t_index, turn in enumerate(turns):
+                text = (turn.get("text") or "").strip()
+                if not text:
+                    continue
+                sender = turn.get("sender") or ""
+                conv_ref = (turn.get("conv_ref") or "")[:512] or None
+                turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
+                for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap, cur)):
+                    mid = f"chk_{uuid.uuid4().hex[:16]}"
+                    rows.append({
+                        "memory_id": mid,
+                        "session_id": self._session_id,
+                        "role": "chunk",
+                        "content": ch,
+                        "target": "memory",
+                        "metadata": {
+                            "kind": "chunk",
+                            "index": t_index,
+                            "chunk_index": c_index,
+                            "turn_id": turn_id,
+                            "conv_ref": conv_ref,
+                            "sender": sender or None,
+                        },
+                        "turn_index": t_index,
                         "chunk_index": c_index,
                         "turn_id": turn_id,
                         "conv_ref": conv_ref,
-                        "sender": sender or None,
-                    },
-                    "turn_index": t_index,
-                    "chunk_index": c_index,
-                    "turn_id": turn_id,
-                    "conv_ref": conv_ref,
-                })
-                ids.append(mid)
+                    })
+                    ids.append(mid)
+
+        finally:
+            if cur:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn and self._pool:
+                try:
+                    self._pool.release(conn)
+                except Exception:
+                    pass
 
         if rows:
             self._insert_many(rows)
