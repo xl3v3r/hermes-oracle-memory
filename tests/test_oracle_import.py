@@ -174,8 +174,9 @@ class TestOracleChunkAndImport(unittest.TestCase):
         mock_pool = MagicMock()
         mock_conn = MagicMock()
         mock_cur = MagicMock()
-        mock_pool.acquire.return_value.__enter__.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        # the function does not use `with` anymore for the cursor/conn
+        mock_pool.acquire.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
         provider._pool = mock_pool
 
         # Table execute yields chunks
