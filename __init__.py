@@ -2198,12 +2198,16 @@ class OracleMemoryProvider(MemoryProvider):
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
 
-    def _chunk_text(self, text: str, max_words: int, overlap: int) -> list:
+    def _chunk_text(self, text: str, max_words: int, overlap: int, conn: Any = None) -> list:
         """Split one text unit into chunks (UTL_TO_CHUNKS in-DB, local fallback)."""
         chunks: list[str] = []
-        if self._pool:
-            with self._pool.acquire() as conn:
-                with conn.cursor() as cur:
+        if self._pool or conn:
+            import contextlib
+
+            # Bolt: Re-use connection to prevent N+1 connection pool acquisitions
+            ctx = contextlib.nullcontext(conn) if conn else self._pool.acquire()
+            with ctx as active_conn:
+                with active_conn.cursor() as cur:
                     try:
                         import oracledb
 
@@ -2279,35 +2283,38 @@ class OracleMemoryProvider(MemoryProvider):
             turns = [{"text": content}] if content else []
         ids = []
         rows = []
-        for t_index, turn in enumerate(turns):
-            text = (turn.get("text") or "").strip()
-            if not text:
-                continue
-            sender = turn.get("sender") or ""
-            conv_ref = (turn.get("conv_ref") or "")[:512] or None
-            turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
-            for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap)):
-                mid = f"chk_{uuid.uuid4().hex[:16]}"
-                rows.append({
-                    "memory_id": mid,
-                    "session_id": self._session_id,
-                    "role": "chunk",
-                    "content": ch,
-                    "target": "memory",
-                    "metadata": {
-                        "kind": "chunk",
-                        "index": t_index,
+        import contextlib
+        # Bolt: Acquire one connection outside the loop to prevent N+1 connection pool acquisitions in _chunk_text
+        with (self._pool.acquire() if self._pool else contextlib.nullcontext()) as conn:
+            for t_index, turn in enumerate(turns):
+                text = (turn.get("text") or "").strip()
+                if not text:
+                    continue
+                sender = turn.get("sender") or ""
+                conv_ref = (turn.get("conv_ref") or "")[:512] or None
+                turn_id = (turn.get("turn_id") or f"t{t_index:05d}")[:64]
+                for c_index, ch in enumerate(self._chunk_text(text, max_words, overlap, conn=conn)):
+                    mid = f"chk_{uuid.uuid4().hex[:16]}"
+                    rows.append({
+                        "memory_id": mid,
+                        "session_id": self._session_id,
+                        "role": "chunk",
+                        "content": ch,
+                        "target": "memory",
+                        "metadata": {
+                            "kind": "chunk",
+                            "index": t_index,
+                            "chunk_index": c_index,
+                            "turn_id": turn_id,
+                            "conv_ref": conv_ref,
+                            "sender": sender or None,
+                        },
+                        "turn_index": t_index,
                         "chunk_index": c_index,
                         "turn_id": turn_id,
                         "conv_ref": conv_ref,
-                        "sender": sender or None,
-                    },
-                    "turn_index": t_index,
-                    "chunk_index": c_index,
-                    "turn_id": turn_id,
-                    "conv_ref": conv_ref,
-                })
-                ids.append(mid)
+                    })
+                    ids.append(mid)
 
         if rows:
             self._insert_many(rows)
