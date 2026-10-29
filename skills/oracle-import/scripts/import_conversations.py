@@ -22,10 +22,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+def _find_plugin_root(start: Path) -> Path:
+    """Locate the plugin root directory containing plugin.yaml and __init__.py."""
+    for parent in (start, *start.parents):
+        if (parent / "plugin.yaml").exists() and (parent / "__init__.py").exists():
+            return parent
+    return start.parent.parent.parent.parent
+
+
 # Add plugin parent directory to path if running directly
-plugin_root = Path(__file__).resolve().parent.parent.parent
+plugin_root = _find_plugin_root(Path(__file__).resolve())
 if str(plugin_root) not in sys.path:
     sys.path.insert(0, str(plugin_root))
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("oracle-import")
@@ -273,15 +282,25 @@ def main() -> int:
     except ImportError:
         try:
             from __init__ import OracleMemoryProvider
-        except ImportError:
+        except (ImportError, Exception):
             init_file = plugin_root / "__init__.py"
-            spec = importlib.util.spec_from_file_location("hermes_oracle_memory", str(init_file))
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                OracleMemoryProvider = mod.OracleMemoryProvider
-            else:
-                logger.error("Failed to load OracleMemoryProvider module")
+            if not init_file.is_file():
+                logger.error("Could not locate plugin __init__.py at: %s", init_file)
+                return 1
+            try:
+                spec = importlib.util.spec_from_file_location("hermes_oracle_memory", str(init_file))
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    OracleMemoryProvider = getattr(mod, "OracleMemoryProvider", None)
+                    if OracleMemoryProvider is None:
+                        logger.error("OracleMemoryProvider class not found in %s", init_file)
+                        return 1
+                else:
+                    logger.error("Failed to create module spec for: %s", init_file)
+                    return 1
+            except Exception as exc:
+                logger.error("Failed to load OracleMemoryProvider from %s: %s", init_file, exc)
                 return 1
 
     provider = OracleMemoryProvider()

@@ -265,5 +265,41 @@ class TestOracleChunkAndImport(unittest.TestCase):
         self.assertIsInstance(ctx.provider, oracle_plugin.OracleMemoryProvider)
 
 
+class TestOracleImportScript(unittest.TestCase):
+    def test_find_plugin_root_from_skill_scripts_dir(self):
+        script_path = Path(import_conversations.__file__).resolve()
+        discovered = import_conversations._find_plugin_root(script_path)
+        self.assertTrue((discovered / "plugin.yaml").is_file())
+        self.assertTrue((discovered / "__init__.py").is_file())
+        self.assertEqual(discovered, Path(root_dir).resolve())
+
+    def test_find_plugin_root_from_scripts_dir(self):
+        scripts_dummy = Path(root_dir).resolve() / "scripts" / "dummy_script.py"
+        discovered = import_conversations._find_plugin_root(scripts_dummy)
+        self.assertEqual(discovered, Path(root_dir).resolve())
+
+    def test_find_plugin_root_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            dummy_path = Path(td) / "level1" / "level2" / "level3" / "script.py"
+            discovered = import_conversations._find_plugin_root(dummy_path)
+            self.assertEqual(discovered, Path(td))
+
+    def test_import_conversations_missing_file_returns_error(self):
+        with patch.object(sys, "argv", ["import_conversations.py", "/nonexistent/path/file.json"]):
+            ret = import_conversations.main()
+            self.assertEqual(ret, 1)
+
+    def test_import_conversations_provider_load_fallback_nonexistent_init(self):
+        with tempfile.NamedTemporaryFile("w+", suffix=".json") as tf:
+            json.dump({"conversations": [{"from": "user", "value": "test"}]}, tf)
+            tf.flush()
+            with patch.object(sys, "argv", ["import_conversations.py", tf.name]):
+                with patch.object(import_conversations, "plugin_root", Path("/nonexistent/plugin/path")):
+                    with patch.dict(sys.modules, {"hermes_oracle_memory": None, "__init__": None}):
+                        ret = import_conversations.main()
+                        self.assertEqual(ret, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+

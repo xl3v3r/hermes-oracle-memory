@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.3.1"
+__version__ = "1.0.9.3.2"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
