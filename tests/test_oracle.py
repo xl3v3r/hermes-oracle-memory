@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -777,7 +778,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.4")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.4.1")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1739,41 +1740,134 @@ class TestOraclePlugin(unittest.TestCase):
         found_op_names = {f.name for f in scripts_dir.glob("*.py")}
         self.assertTrue(expected_op_scripts.issubset(found_op_names))
 
+    def test_apply_weights_recency_decay(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        now = datetime.now(timezone.utc)
+        recent_dt = now - timedelta(days=1)
+        old_dt = now - timedelta(days=180)
+
+        rows = [
+            {"memory_id": "m_old", "role": "fact", "content": "A detailed durable memory fact about infrastructure setup", "score": 0.8, "created_at": old_dt},
+            {"memory_id": "m_recent", "role": "fact", "content": "A detailed durable memory fact about infrastructure setup", "score": 0.8, "created_at": recent_dt},
+        ]
+        weighted = provider._apply_weights(rows)
+        # Recent fact should outrank old fact
+        self.assertEqual(weighted[0]["memory_id"], "m_recent")
+        self.assertEqual(weighted[1]["memory_id"], "m_old")
+        # 1-day old fact maintains ~99.9% score
+        self.assertAlmostEqual(weighted[0]["score"], 0.799, places=2)
+        # 180-day old fact maintains ~88% score (>= floor 0.85)
+        self.assertTrue(weighted[1]["score"] < weighted[0]["score"])
+        self.assertTrue(weighted[1]["score"] >= 0.8 * 0.85)
+
+    def test_apply_weights_role_multiplier(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        rows = [
+            {"memory_id": "m_turn", "role": "turn", "content": "Long enough turn content text to avoid short penalty", "score": 0.8},
+            {"memory_id": "m_fact", "role": "fact", "content": "Long enough fact content text to avoid short penalty", "score": 0.8},
+            {"memory_id": "m_user", "role": "user", "content": "Long enough user content text to avoid short penalty", "score": 0.8},
+        ]
+        weighted = provider._apply_weights(rows)
+        # fact (1.0) > user (0.9) > turn (0.75)
+        self.assertEqual(weighted[0]["memory_id"], "m_fact")
+        self.assertEqual(weighted[0]["score"], 0.8)
+        self.assertEqual(weighted[1]["memory_id"], "m_user")
+        self.assertEqual(weighted[1]["score"], round(0.8 * 0.9, 4))
+        self.assertEqual(weighted[2]["memory_id"], "m_turn")
+        self.assertEqual(weighted[2]["score"], round(0.8 * 0.75, 4))
+
+    def test_apply_weights_telemetry_penalty(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        rows = [
+            {"memory_id": "m_tel", "role": "fact", "content": "[skill_usage] used oracle-import for data", "score": 0.9},
+            {"memory_id": "m_normal", "role": "fact", "content": "Normal fact about python and oracle db", "score": 0.7},
+        ]
+        weighted = provider._apply_weights(rows)
+        self.assertEqual(weighted[0]["memory_id"], "m_normal")
+        self.assertEqual(weighted[1]["memory_id"], "m_tel")
+        self.assertEqual(weighted[1]["score"], round(0.9 * 0.05, 4))
+
+    def test_apply_weights_short_content_penalty(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        rows = [
+            {"memory_id": "m_short", "role": "fact", "content": "short", "score": 0.8},
+            {"memory_id": "m_long", "role": "fact", "content": "This content is definitely longer than 25 characters", "score": 0.8},
+        ]
+        weighted = provider._apply_weights(rows)
+        self.assertEqual(weighted[0]["memory_id"], "m_long")
+        self.assertEqual(weighted[0]["score"], 0.8)
+        self.assertEqual(weighted[1]["memory_id"], "m_short")
+        self.assertEqual(weighted[1]["score"], round(0.8 * 0.9, 4))
+
+    def test_apply_weights_created_at_db_lookup(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        mock_cur = MagicMock()
+        now = datetime.now(timezone.utc)
+        mock_cur.__iter__.return_value = [
+            ("m_old", now - timedelta(days=150)),
+            ("m_new", now - timedelta(days=2)),
+        ]
+        rows = [
+            {"memory_id": "m_old", "role": "fact", "content": "Detailed long content text for older memory", "score": 0.8},
+            {"memory_id": "m_new", "role": "fact", "content": "Detailed long content text for newer memory", "score": 0.8},
+        ]
+        weighted = provider._apply_weights(rows, cur=mock_cur)
+        self.assertEqual(weighted[0]["memory_id"], "m_new")
+        self.assertEqual(weighted[1]["memory_id"], "m_old")
+
+    def test_apply_weights_error_fallback(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        mock_cur = MagicMock()
+        mock_cur.execute.side_effect = Exception("DB error during created_at lookup")
+        rows = [
+            {"memory_id": "m1", "role": "fact", "content": "Normal memory content", "score": 0.8},
+        ]
+        result = provider._apply_weights(rows, cur=mock_cur)
+        self.assertEqual(result, rows)
+        self.assertEqual(result[0]["score"], 0.8)
+
+    def test_junk_filter_excludes_skill_telemetry(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        self.assertIn("NVL(content_txt, 'x') NOT LIKE '[skill%'", provider._JUNK)
+
     def test_metadata_version_consistency(self):
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.4")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.4.1")
 
         # 2. VERSION
         version_file = repo_dir / "VERSION"
         self.assertTrue(version_file.is_file())
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.4")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.4.1")
 
         # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.4", plugin_yaml)
-        self.assertIn("version-1.0.9.4-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.4.1", plugin_yaml)
+        self.assertIn("version-1.0.9.4.1-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9.4"', pyproject)
+        self.assertIn('version = "1.0.9.4.1"', pyproject)
 
         # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.4", skill_md)
+        self.assertIn("version: 1.0.9.4.1", skill_md)
 
         # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.4-blue.svg", readme)
-        self.assertIn("v1.0.9.4", readme)
+        self.assertIn("version-1.0.9.4.1-blue.svg", readme)
+        self.assertIn("v1.0.9.4.1", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.4-blue.svg", install_md)
-        self.assertIn("v1.0.9.4", install_md)
+        self.assertIn("version-1.0.9.4.1-blue.svg", install_md)
+        self.assertIn("v1.0.9.4.1", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp
@@ -1797,14 +1891,24 @@ class TestOraclePlugin(unittest.TestCase):
         import shutil
         edgebot_dir = Path.home() / ".hermes" / "profiles" / "edgebot" / "plugins" / "oracle"
         for dest in [plugin_dir, edgebot_dir]:
-            if dest.exists():
-                for f in ["__init__.py", "CHANGELOG.md", "RELEASE_NOTES_1.0.9.4.md"]:
-                    shutil.copy2(repo_dir / f, dest / f)
+            if dest.exists() and repo_dir.resolve() != dest.resolve():
+                release_notes = [f.name for f in repo_dir.glob("RELEASE_NOTES_*.md")]
+                sync_files = [
+                    "__init__.py", "CHANGELOG.md", "VERSION", "plugin.yaml",
+                    "pyproject.toml", "README.md", "INSTALL.md", "AGENTS.md",
+                ] + release_notes
+                for f in sync_files:
+                    if (repo_dir / f).exists():
+                        shutil.copy2(repo_dir / f, dest / f)
+                skill_file = repo_dir / "skills" / "oracle-import" / "SKILL.md"
+                if skill_file.exists():
+                    (dest / "skills" / "oracle-import").mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(skill_file, dest / "skills" / "oracle-import" / "SKILL.md")
                 shutil.copy2(repo_dir / "scripts" / "verify_provider.py", dest / "scripts" / "verify_provider.py")
                 shutil.copy2(repo_dir / "tests" / "test_oracle.py", dest / "tests" / "test_oracle.py")
 
         for target_dir, target_label in [(plugin_dir, "plugin"), (edgebot_dir, "edgebot")]:
-            if not target_dir.exists():
+            if not target_dir.exists() or repo_dir.resolve() == target_dir.resolve():
                 continue
             for base, other, label in [(repo_dir, target_dir, target_label), (target_dir, repo_dir, "repository")]:
                 for root, dirs, files in os.walk(base):

@@ -12,6 +12,7 @@ import array
 import html
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -28,7 +29,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.4"
+__version__ = "1.0.9.4.1"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -49,6 +50,13 @@ _RERANK_ENABLED = (
     os.environ.get("HERMES_ORACLE_DISABLE_RERANK", "").strip().lower()
     not in ("1", "true", "yes")
 )
+_WEIGHT_RECENCY_FLOOR = float(os.environ.get("HERMES_ORACLE_RECENCY_FLOOR", "0.85"))
+_WEIGHT_RECENCY_SCALE_DAYS = float(os.environ.get("HERMES_ORACLE_RECENCY_SCALE_DAYS", "120"))
+_WEIGHT_ROLE = {"fact": 1.0, "session": 0.9, "turn": 0.75, "assistant": 0.75, "user": 0.9}
+_WEIGHT_TELEMETRY = float(os.environ.get("HERMES_ORACLE_TELEMETRY_WEIGHT", "0.05"))
+_WEIGHT_SHORT_CHARS = 25
+_WEIGHT_SHORT_FACTOR = 0.9
+_TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
 _EXTERNAL_EMBED_KILLSWITCH = (
     os.environ.get("HERMES_ORACLE_DISABLE_EXTERNAL_EMBED", "").strip().lower()
     in ("1", "true", "yes")
@@ -1387,6 +1395,9 @@ class OracleMemoryProvider(MemoryProvider):
         " AND memory_id NOT LIKE 'test_%'"
         " AND NVL(session_id, 'x') <> 'diagnostic-session-001'"
         " AND NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session') "
+        # lifecycle telemetry ([skill_usage], [skill_vectorization_*]) is stored as
+        # role='fact' but is bookkeeping, not memory — keep it out of candidates.
+        " AND NVL(content_txt, 'x') NOT LIKE '[skill%' "
     )
 
     @staticmethod
@@ -1736,6 +1747,90 @@ class OracleMemoryProvider(MemoryProvider):
             return ranked[:top_k]
         return self._rerank(query, ranked, top_k, cur=cur)
 
+    def _apply_weights(self, rows: list[dict[str, Any]], cur: Any = None) -> list[dict[str, Any]]:
+        """Apply retrieval weighting to candidate rows based on recency, role, telemetry, and length."""
+        if not rows:
+            return rows
+
+        created_map: dict[str, Any] = {}
+        try:
+            mids = [r["memory_id"] for r in rows if r.get("memory_id")]
+            if mids:
+                target_cur = cur
+                conn = None
+                try:
+                    if target_cur is None and self._pool:
+                        conn = self._pool.acquire()
+                        target_cur = conn.cursor()
+                    if target_cur is not None:
+                        chunk_size = 500
+                        for i in range(0, len(mids), chunk_size):
+                            chunk = mids[i : i + chunk_size]
+                            in_binds = {f"m_{j}": mid for j, mid in enumerate(chunk)}
+                            bind_placeholders = ", ".join(f":m_{j}" for j in range(len(chunk)))
+                            sql = f"SELECT /*+ NO_PARALLEL */ memory_id, created_at FROM {self._table} WHERE memory_id IN ({bind_placeholders})"  # nosec B608
+                            target_cur.execute(sql, in_binds)
+                            for r_row in target_cur:
+                                if r_row and len(r_row) >= 2 and r_row[1] is not None:
+                                    created_map[str(r_row[0])] = r_row[1]
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug("created_at lookup failed in _apply_weights: %s", e)
+            return rows
+
+        try:
+            now = datetime.now(timezone.utc)
+            for r in rows:
+                base_score = float(r.get("score") if r.get("score") is not None else 0.0)
+                mid = r.get("memory_id")
+                role = str(r.get("role") or "fact").strip().lower()
+                content = str(r.get("content") or "")
+                stripped_content = content.strip()
+
+                # 1. Recency multiplier: 0.85 + 0.15 * e^(-age_days / 120) -> range [0.85, 1.00]
+                recency_mult = 1.0
+                dt = created_map.get(mid) or r.get("created_at")
+                if dt is not None:
+                    if isinstance(dt, str):
+                        try:
+                            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                        except Exception:
+                            dt = None
+                    if isinstance(dt, datetime):
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        age_seconds = max(0.0, (now - dt).total_seconds())
+                        age_days = age_seconds / 86400.0
+                        recency_mult = _WEIGHT_RECENCY_FLOOR + (1.0 - _WEIGHT_RECENCY_FLOOR) * math.exp(
+                            -age_days / _WEIGHT_RECENCY_SCALE_DAYS
+                        )
+
+                # 2. Role multiplier
+                role_mult = _WEIGHT_ROLE.get(role, 1.0)
+
+                # 3. Telemetry multiplier
+                telemetry_mult = 1.0
+                if any(stripped_content.startswith(p) for p in _TELEMETRY_PREFIXES):
+                    telemetry_mult = _WEIGHT_TELEMETRY
+
+                # 4. Short content multiplier (< 25 chars)
+                short_mult = 1.0
+                if len(stripped_content) < _WEIGHT_SHORT_CHARS:
+                    short_mult = _WEIGHT_SHORT_FACTOR
+
+                r["score"] = round(base_score * recency_mult * role_mult * telemetry_mult * short_mult, 4)
+
+            rows.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            return rows
+        except Exception as e:
+            logger.debug("weight calculation failed in _apply_weights: %s", e)
+            return rows
+
     def _search(
         self,
         query: str,
@@ -1841,6 +1936,7 @@ class OracleMemoryProvider(MemoryProvider):
                     rows = self._execute_hybrid_search(
                         cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, timeout_s=query_timeout_s
                     )
+                rows = self._apply_weights(rows, cur)
         return rows[:top_k]
 
     def _rerank(self, query: str, rows: list, top_k: int, cur=None) -> list:
