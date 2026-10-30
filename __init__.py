@@ -55,6 +55,19 @@ _EXTERNAL_EMBED_KILLSWITCH = (
 )
 _MAX_CHUNK_FILE_BYTES = 64 * 1024 * 1024
 _CONTAINS_CLEAN_RE = re.compile(r"[^\w\s]")
+_PREFIX_STOP_WORDS = {
+    "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at",
+    "be", "been", "being", "but", "by", "can", "could", "did", "do", "does",
+    "for", "from", "get", "got", "had", "has", "have", "he", "her", "him", "his",
+    "how", "i", "if", "in", "into", "is", "it", "its", "just", "may", "me", "might",
+    "more", "most", "must", "my", "no", "not", "now", "of", "on", "one", "only",
+    "or", "our", "out", "over", "said", "say", "see", "shall", "she", "should",
+    "so", "some", "such", "than", "that", "the", "their", "them", "then", "there",
+    "these", "they", "this", "those", "through", "to", "too", "two", "under",
+    "up", "us", "use", "used", "using", "very", "was", "way", "we", "were",
+    "what", "when", "where", "which", "while", "who", "whom", "why", "will",
+    "with", "would", "you", "your",
+}
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"^\s*(?:"
     r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
@@ -764,15 +777,53 @@ class OracleMemoryProvider(MemoryProvider):
             self._onnx_mark_ok()
         except Exception as e:
             err_str = str(e)
+            if "ORA-54401" in err_str:
+                logger.info(
+                    "Retrying in-database ONNX embed_many with conservative token clamp (%d chars)",
+                    _CONSERVATIVE_EMBED_CHARS,
+                )
+                try:
+                    db_vecs = [None] * len(miss_texts)
+                    with self._pool.acquire() as conn, conn.cursor() as cur:
+                        for i in range(0, len(miss_texts), _EMBED_BATCH):
+                            batch_texts = miss_texts[i : i + _EMBED_BATCH]
+                            parts = []
+                            binds = []
+                            for j, t in enumerate(batch_texts):
+                                parts.append(
+                                    f"SELECT /*+ NO_PARALLEL */ {j} AS id, VECTOR_EMBEDDING({self._onnx_model} USING :{j + 1} AS DATA) AS vec FROM DUAL"
+                                )
+                                binds.append(self._safe_embed_text(t, _CONSERVATIVE_EMBED_CHARS))
+                            cur.execute(" UNION ALL ".join(parts) + " ORDER BY id", binds)
+                            for row in cur.fetchall():
+                                idx = int(row[0])
+                                vec = row[1] if len(row) > 1 else None
+                                if vec is not None and len(vec) == _EMBED_DIM:
+                                    db_vecs[i + idx] = vec
+                    if any(v is not None for v in db_vecs):
+                        got = db_vecs
+                        got_tags = [
+                            self._onnx_model if v is not None else None for v in got
+                        ]
+                        self._onnx_mark_ok()
+                        for text, vec, model in zip(miss_texts, got, got_tags):
+                            if vec is not None:
+                                self._cache_put(text, vec, model)
+                            for i in unique_indices[text]:
+                                cached[i] = (vec, model)
+                        return [c if c is not None else (None, None) for c in cached]
+                except Exception as retry_e:
+                    err_str = str(retry_e)
+
             is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
             if not is_shape_err:
                 self._onnx_mark_failed()
             logger.warning(
                 "In-database ONNX embed_many failed (%s); external fallback is disabled",
-                e,
+                err_str,
             )
             raise RuntimeError(
-                f"In-database ONNX embedding failed ({e}); external fallback is disabled"
+                f"In-database ONNX embedding failed ({err_str}); external fallback is disabled"
             ) from e
 
         for text, vec, model in zip(miss_texts, got, got_tags):
@@ -1344,16 +1395,28 @@ class OracleMemoryProvider(MemoryProvider):
             return False
         c_clean = str(content).strip().lower()
         q_clean = str(query).strip().lower()
-        c_stripped = re.sub(r"^[\s#*\->\[\]\"'(`:]+", "", c_clean)
-        q_stripped = re.sub(r"^[\s#*\->\[\]\"'(`:]+", "", q_clean)
+        c_stripped = re.sub(r"^(\s*\d+[\.\)]\s*|[\s#*\->\[\]\"'(`:]+)+", "", c_clean)
+        q_stripped = re.sub(r"^(\s*\d+[\.\)]\s*|[\s#*\->\[\]\"'(`:]+)+", "", q_clean)
         if not q_stripped or not c_stripped:
             return False
         if c_stripped.startswith(q_stripped) or c_clean.startswith(q_clean):
-            return True
-        tokens = [t.strip(".,;:!?\"'()[]") for t in q_stripped.split()]
-        first_tok = tokens[0] if tokens else ""
-        if first_tok and len(first_tok) > 2 and c_stripped.startswith(first_tok):
-            return True
+            first_w = q_stripped.split()[0] if q_stripped.split() else ""
+            if len(q_stripped.split()) == 1 and first_w in _PREFIX_STOP_WORDS:
+                return False
+            rem = c_stripped[len(q_stripped):]
+            if not rem or re.match(r"^[\s:;.,_\-—/\]\)#*]", rem):
+                return True
+
+        tokens = [t.strip(".,;:!?\"'()[]{}") for t in q_stripped.split()]
+        title_tokens = [t for t in tokens if len(t) > 2 and t not in _PREFIX_STOP_WORDS]
+        if not title_tokens:
+            return False
+        first_title = title_tokens[0]
+
+        if c_stripped.startswith(first_title):
+            rem = c_stripped[len(first_title):]
+            if not rem or re.match(r"^[\s:;.,_\-—/\]\)#*]", rem):
+                return True
         return False
 
     def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
@@ -1751,6 +1814,9 @@ class OracleMemoryProvider(MemoryProvider):
                         rows = self._fetch_rows(cur, sql, binds)
                         for r in rows:
                             r.pop("dist", None)
+                            if self._is_prefix_match(r.get("content"), query):
+                                r["score"] = round(min(1.0, r["score"] + 0.15), 4)
+                        rows = sorted(rows, key=lambda x: x["score"], reverse=True)
                     except Exception as e:
                         err_str = str(e)
                         is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
@@ -2189,6 +2255,7 @@ class OracleMemoryProvider(MemoryProvider):
                 embed_txt = self._safe_embed_text(content)
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
+                        succeeded = False
                         try:
                             sql = f"""
                                 UPDATE /*+ NO_PARALLEL */ {self._table}
@@ -2200,18 +2267,69 @@ class OracleMemoryProvider(MemoryProvider):
                                 sql,
                                 (content, embed_txt, txt, self._onnx_model, mid),
                             )
+                            succeeded = True
                         except Exception as e:
                             err_str = str(e)
-                            is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                            if not is_shape_err:
-                                self._onnx_mark_failed()
-                            logger.warning(
-                                "In-database ONNX update failed (%s); external fallback is disabled",
-                                e,
-                            )
-                            raise RuntimeError(
-                                f"In-database ONNX update failed ({e}); external fallback is disabled"
-                            ) from e
+                            is_51815 = "ORA-51815" in err_str
+                            is_54401 = "ORA-54401" in err_str
+                            is_shape_err = is_51815 or is_54401
+
+                            # 1. ORA-51815: retry transient snapshot conflicts
+                            if is_51815:
+                                for attempt in range(_EMBED_MAX_RETRIES):
+                                    try:
+                                        time.sleep(0.05 * (attempt + 1))
+                                        cur.execute(sql, (content, embed_txt, txt, self._onnx_model, mid))
+                                        succeeded = True
+                                        break
+                                    except Exception as retry_e:
+                                        err_str = str(retry_e)
+                                        if "ORA-51815" not in err_str:
+                                            is_54401 = "ORA-54401" in err_str
+                                            is_shape_err = is_54401
+                                            break
+
+                            # 2. ORA-54401: retry with conservative token clamp
+                            if not succeeded and is_54401:
+                                conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
+                                try:
+                                    cur.execute(sql, (content, conservative_txt, txt, self._onnx_model, mid))
+                                    succeeded = True
+                                except Exception as retry_e:
+                                    err_str = str(retry_e)
+                                    is_51815 = "ORA-51815" in err_str
+                                    is_54401 = "ORA-54401" in err_str
+                                    is_shape_err = is_51815 or is_54401
+
+                            if not succeeded:
+                                if not is_shape_err:
+                                    self._onnx_mark_failed()
+                                    logger.warning(
+                                        "In-database ONNX update failed (%s); external fallback is disabled",
+                                        err_str,
+                                    )
+                                    raise RuntimeError(
+                                        f"In-database ONNX update failed ({err_str}); external fallback is disabled"
+                                    ) from e
+
+                                # 3. Fallback to NULL embedding and queue background backfill
+                                logger.warning(
+                                    "In-database ONNX update hit shape/sequence length error (%s); updating row with null embedding and queueing backfill",
+                                    err_str,
+                                )
+                                null_upd_sql = f"""
+                                    UPDATE /*+ NO_PARALLEL */ {self._table}
+                                    SET content = :1, embedding = NULL, content_txt = :2,
+                                        embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP
+                                    WHERE memory_id = :3
+                                """  # nosec B608
+                                try:
+                                    cur.execute(null_upd_sql, (content, txt, mid))
+                                    self._queue_embed_backfill(mid, content)
+                                except Exception as null_e:
+                                    raise RuntimeError(
+                                        f"In-database ONNX update failed ({err_str}) and fallback update failed ({null_e})"
+                                    ) from null_e
                         n = cur.rowcount
                     conn.commit()
                 if not n:

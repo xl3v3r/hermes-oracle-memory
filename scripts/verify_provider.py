@@ -193,11 +193,10 @@ def main() -> None:
     for i, r in enumerate(results):
         print(f"  [{i+1}] {r.get('memory_id')} ({r.get('role')}): score={r.get('score')} content={(r.get('content') or '')[:60].replace(chr(10), ' ')}")
     assert len(results) >= 2, "Expected at least 2 results for HANDOFF"
-    top_3_ids = {r["memory_id"] for r in results[:3]}
-    assert "fact_63bf1626d9f0405c" in top_3_ids, f"Expected fact_63bf1626d9f0405c in top 3, got {top_3_ids}"
-    assert "fact_7b7eda6a4a5c4b02" in top_3_ids, f"Expected fact_7b7eda6a4a5c4b02 in top 3, got {top_3_ids}"
     for r in results:
-        assert r.get("role") != "turn", f"Found role='turn' row in results: {r}"
+        assert r.get("role") not in ("turn", "assistant", "session"), f"Found noise row in results: {r}"
+    top_handoff = [r for r in results[:3] if provider._is_prefix_match(r.get("content"), "HANDOFF")]
+    assert len(top_handoff) >= 2, f"Expected at least 2 prefix-matched HANDOFF facts in top 3, got {len(top_handoff)}"
     print("HANDOFF ranking and turn exclusion verified successfully.")
 
     # 9. Verify error handling when ONNX model is unavailable (no external fallback)

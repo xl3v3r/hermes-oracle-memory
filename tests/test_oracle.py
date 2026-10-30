@@ -1,3 +1,4 @@
+import array
 import json
 import os
 import sys
@@ -459,6 +460,28 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertAlmostEqual(results[0]["score"], 0.65, places=2)
         self.assertAlmostEqual(results[1]["score"], 0.50, places=2)
 
+    def test_vector_search_prefix_boost(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        mock_cur.fetchall.return_value = [
+            ("m_other", "s1", "a1", "fact", "other content with HANDOFF inside", "memory", 0.0, 0.4),
+            ("m_prefix", "s1", "a1", "fact", "**HANDOFF**: details here", "memory", 0.0, 0.4),
+        ]
+
+        results = provider._search("HANDOFF", top_k=5, mode="vector")
+        for r in results:
+            self.assertNotIn("dist", r)
+        self.assertEqual(results[0]["memory_id"], "m_prefix")
+        self.assertEqual(results[1]["memory_id"], "m_other")
+        self.assertAlmostEqual(results[0]["score"], 0.57, places=2)
+        self.assertAlmostEqual(results[1]["score"], 0.42, places=2)
+
     def test_prefix_match_variations(self):
         fn = oracle_plugin.OracleMemoryProvider._is_prefix_match
         self.assertTrue(fn("HANDOFF summary notes", "HANDOFF"))
@@ -467,6 +490,13 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertTrue(fn("- HANDOFF item", "HANDOFF:"))
         self.assertTrue(fn("**HANDOFF**: item", "HANDOFF"))
         self.assertTrue(fn("[HANDOFF] alert", "HANDOFF"))
+        self.assertTrue(fn("1. HANDOFF: system status", "HANDOFF"))
+        self.assertTrue(fn("1) [HANDOFF] urgent issue", "HANDOFF"))
+        self.assertTrue(fn("### HANDOFF: notes", "get HANDOFF status"))
+        self.assertTrue(fn("Cat food options", "cat"))
+        self.assertFalse(fn("Catering menu for tomorrow", "cat"))
+        self.assertFalse(fn("The capital of France is Paris", "the quick brown fox"))
+        self.assertFalse(fn("The sky is blue", "the"))
         self.assertFalse(fn("Unrelated intro mention of HANDOFF", "HANDOFF"))
         self.assertFalse(fn("", "HANDOFF"))
         self.assertFalse(fn("HANDOFF", ""))
@@ -1417,6 +1447,90 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._queue_embed_backfill.call_count, 2)
         provider._queue_embed_backfill.assert_any_call("m1", "row1")
         provider._queue_embed_backfill.assert_any_call("m2", "row2")
+
+    def test_oracle_update_ora_51815_retries(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        snap_err = Exception("ORA-51815: Vector index evaluation failed: transient snapshot conflict")
+        mock_cur.execute.side_effect = [snap_err, None]
+        mock_cur.rowcount = 1
+
+        res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "updated content"})
+        data = json.loads(res)
+        self.assertEqual(data.get("result"), "updated")
+        self.assertEqual(mock_cur.execute.call_count, 2)
+        self.assertFalse(provider._onnx_in_cooldown())
+
+    def test_oracle_update_ora_54401_conservative_retry(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        seq_err = Exception("ORA-54401: ONNX runtime error: 512 by 755")
+        mock_cur.execute.side_effect = [seq_err, None]
+        mock_cur.rowcount = 1
+
+        long_content = "X" * 1500
+        res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": long_content})
+        data = json.loads(res)
+        self.assertEqual(data.get("result"), "updated")
+        self.assertEqual(mock_cur.execute.call_count, 2)
+        retry_call_args = mock_cur.execute.call_args_list[1][0]
+        retry_binds = retry_call_args[1]
+        self.assertEqual(len(retry_binds[1]), oracle_plugin._CONSERVATIVE_EMBED_CHARS)
+
+    def test_oracle_update_shape_err_falls_back_to_null_and_queues_backfill(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._queue_embed_backfill = MagicMock()
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        seq_err = Exception("ORA-54401: ONNX runtime error: 512 by 755")
+        mock_cur.execute.side_effect = [seq_err, seq_err, None]
+        mock_cur.rowcount = 1
+
+        res = provider.handle_tool_call("oracle_update", {"memory_id": "m1", "content": "overflow content"})
+        data = json.loads(res)
+        self.assertEqual(data.get("result"), "updated")
+        self.assertEqual(mock_cur.execute.call_count, 3)
+        fallback_sql = mock_cur.execute.call_args_list[2][0][0]
+        self.assertIn("embedding = NULL", fallback_sql)
+        provider._queue_embed_backfill.assert_called_once_with("m1", "overflow content")
+
+    def test_embed_many_tagged_ora_54401_conservative_retry(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        seq_err = Exception("ORA-54401: ONNX runtime error: 512 by 755")
+        fake_vec = array.array("f", [0.1] * 768)
+        mock_cur.execute.side_effect = [seq_err, None]
+        mock_cur.fetchall.return_value = [(0, fake_vec)]
+
+        results = provider._embed_many_tagged(["long text hitting sequence limit"])
+        self.assertEqual(len(results), 1)
+        self.assertIsNotNone(results[0][0])
+        self.assertEqual(mock_cur.execute.call_count, 2)
+        retry_binds = mock_cur.execute.call_args_list[1][0][1]
+        self.assertTrue(len(retry_binds[0]) <= oracle_plugin._CONSERVATIVE_EMBED_CHARS)
 
     def test_ora_54401_in_hybrid_search_does_not_mark_onnx_failed(self):
         provider = oracle_plugin.OracleMemoryProvider()
