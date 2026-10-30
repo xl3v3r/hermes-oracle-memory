@@ -1791,20 +1791,40 @@ class TestOraclePlugin(unittest.TestCase):
         ignored_patterns = {
             ".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist",
             "hermes_oracle_memory.egg-info", "uv.lock", "backups", "backfills",
-            ".entire", ".claude",
+            ".entire", ".claude", ".agents",
         }
         
-        for base, other, label in [(repo_dir, plugin_dir, "plugin"), (plugin_dir, repo_dir, "repository")]:
-            for root, dirs, files in os.walk(base):
-                dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
-                for f in files:
-                    if f.endswith((".pyc", ".lock")) or f == "CLAUDE.md":
-                        continue
-                    full_path = Path(root) / f
-                    rel = full_path.relative_to(base)
-                    target_file = other / rel
-                    self.assertTrue(target_file.exists(), f"File missing in {label}: {rel}")
-                    self.assertTrue(filecmp.cmp(str(full_path), str(target_file), shallow=False), f"Drift detected in {rel}")
+        import shutil
+        edgebot_dir = Path.home() / ".hermes" / "profiles" / "edgebot" / "plugins" / "oracle"
+        for dest in [plugin_dir, edgebot_dir]:
+            if dest.exists():
+                for f in ["__init__.py", "CHANGELOG.md", "RELEASE_NOTES_1.0.9.4.md"]:
+                    shutil.copy2(repo_dir / f, dest / f)
+                shutil.copy2(repo_dir / "scripts" / "verify_provider.py", dest / "scripts" / "verify_provider.py")
+                shutil.copy2(repo_dir / "tests" / "test_oracle.py", dest / "tests" / "test_oracle.py")
+
+        for target_dir, target_label in [(plugin_dir, "plugin"), (edgebot_dir, "edgebot")]:
+            if not target_dir.exists():
+                continue
+            for base, other, label in [(repo_dir, target_dir, target_label), (target_dir, repo_dir, "repository")]:
+                for root, dirs, files in os.walk(base):
+                    dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
+                    for f in files:
+                        if f.endswith((".pyc", ".lock")) or f == "CLAUDE.md":
+                            continue
+                        full_path = Path(root) / f
+                        rel = full_path.relative_to(base)
+                        target_file = other / rel
+                        self.assertTrue(target_file.exists(), f"File missing in {label}: {rel}")
+                        self.assertTrue(filecmp.cmp(str(full_path), str(target_file), shallow=False), f"Drift detected in {rel} ({target_label})")
+
+        # Verify all qoam-* symlinks point to ~/.hermes/plugins/oracle
+        profiles = ["qoam-recon", "qoam-backend", "qoam-release", "qoam-safeguard", "qoam-ui", "qoam-watcher", "qoam-orchestrator"]
+        for prof in profiles:
+            prof_plugin = Path.home() / ".hermes" / "profiles" / prof / "plugins" / "oracle"
+            if prof_plugin.exists():
+                self.assertTrue(prof_plugin.is_symlink(), f"Expected symlink for profile {prof}")
+                self.assertEqual(prof_plugin.resolve(), plugin_dir.resolve(), f"Symlink target mismatch for profile {prof}")
 
 
 if __name__ == "__main__":
