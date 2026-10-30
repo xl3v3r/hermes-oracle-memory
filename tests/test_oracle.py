@@ -366,6 +366,112 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("In-database ONNX hybrid search failed", str(ctx.exception))
         provider._onnx_mark_failed.assert_called_once()
 
+    def test_junk_filter_excludes_turn_and_noise_roles(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", provider._JUNK)
+
+        txt_sql, _ = provider._build_text_search_sql("query", 8, "", "any")
+        self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", txt_sql)
+
+        vec_sql, _ = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True)
+        self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", vec_sql)
+
+        hybrid_sql, _ = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True)
+        self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", hybrid_sql)
+
+    def test_search_sql_role_and_recency_ordering(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        txt_sql, _ = provider._build_text_search_sql("query", 8, "", "any")
+        self.assertIn("ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, txt_score DESC, created_at DESC", txt_sql)
+
+        vec_sql_onnx, _ = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True)
+        self.assertIn("ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC", vec_sql_onnx)
+
+        vec_sql_ext, _ = provider._build_vector_search_sql("query", [0.1] * 768, 8, "", "any", use_onnx=False)
+        self.assertIn("ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC", vec_sql_ext)
+
+        hybrid_sql_onnx, _ = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True)
+        self.assertIn("ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC", hybrid_sql_onnx)
+        self.assertIn("ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, txt_score DESC, created_at DESC", hybrid_sql_onnx)
+
+    def test_execute_hybrid_search_ranking_and_prefix_boost(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_cur = MagicMock()
+        mock_cur.arraysize = 64
+        mock_cur.prefetchrows = 64
+
+        mock_cur.fetchall.return_value = [
+            ("m_hybrid", "s1", "a1", "fact", "some hybrid content", "memory", 0.0, 0.2),
+            ("m_hybrid", "s1", "a1", "fact", "some hybrid content", "memory", 100.0, None),
+            ("m_text_only", "s1", "a1", "fact", "unrelated content mentioning query", "memory", 100.0, None),
+            ("m_prefix", "s1", "a1", "fact", "# HANDOFF project status", "memory", 0.0, 0.2),
+        ]
+
+        results = provider._execute_hybrid_search(
+            mock_cur,
+            query="HANDOFF",
+            vec=None,
+            contains_q="{HANDOFF}",
+            top_k=5,
+            fetch_k=10,
+            tgt_sql="",
+            tgt="any",
+            rerank=False,
+        )
+
+        for r in results:
+            self.assertNotIn("dist", r)
+
+        ids = [r["memory_id"] for r in results]
+        self.assertEqual(ids, ["m_hybrid", "m_prefix", "m_text_only"])
+        self.assertAlmostEqual(results[0]["score"], 0.86, places=2)
+        self.assertAlmostEqual(results[1]["score"], 0.71, places=2)
+        self.assertAlmostEqual(results[2]["score"], 0.30, places=2)
+
+    def test_text_search_prefix_boost(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+
+        mock_cur.fetchall.return_value = [
+            ("m_other", "s1", "a1", "fact", "other content with HANDOFF inside", "memory", 50.0, None),
+            ("m_prefix", "s1", "a1", "fact", "**HANDOFF**: details here", "memory", 50.0, None),
+        ]
+
+        results = provider._search("HANDOFF", top_k=5, mode="text")
+        for r in results:
+            self.assertNotIn("dist", r)
+        self.assertEqual(results[0]["memory_id"], "m_prefix")
+        self.assertEqual(results[1]["memory_id"], "m_other")
+        self.assertAlmostEqual(results[0]["score"], 0.65, places=2)
+        self.assertAlmostEqual(results[1]["score"], 0.50, places=2)
+
+    def test_prefix_match_variations(self):
+        fn = oracle_plugin.OracleMemoryProvider._is_prefix_match
+        self.assertTrue(fn("HANDOFF summary notes", "HANDOFF"))
+        self.assertTrue(fn("# HANDOFF notes", "HANDOFF"))
+        self.assertTrue(fn("### HANDOFF notes", "# HANDOFF"))
+        self.assertTrue(fn("- HANDOFF item", "HANDOFF:"))
+        self.assertTrue(fn("**HANDOFF**: item", "HANDOFF"))
+        self.assertTrue(fn("[HANDOFF] alert", "HANDOFF"))
+        self.assertFalse(fn("Unrelated intro mention of HANDOFF", "HANDOFF"))
+        self.assertFalse(fn("", "HANDOFF"))
+        self.assertFalse(fn("HANDOFF", ""))
+        self.assertFalse(fn(None, "HANDOFF"))
+
     def test_fetch_rows_tunes_oracle_fetch_buffers(self):
         provider = oracle_plugin.OracleMemoryProvider()
         cursor = MagicMock()
@@ -389,8 +495,8 @@ class TestOraclePlugin(unittest.TestCase):
         cursor.arraysize = 1
         # row: memory_id, session_id, agent_id, role, content, target, txt_score, distance
         cursor.fetchall.return_value = [
-            ("m1", "s1", "a1", "user", FakeLob(), "memory", 1.0, 0.25),
-            ("m2", "s2", "a2", "assistant", "already str", "user", 2.0, None),
+            ("m1", "s1", "a1", "user", FakeLob(), "memory", 10.0, 0.25),
+            ("m2", "s2", "a2", "assistant", "already str", "user", 20.0, None),
             ("m3", "s3", "a3", "user", None, "memory", 0.0, 0.9),
         ]
 
@@ -641,7 +747,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.3.2")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.4")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1099,9 +1205,11 @@ class TestOraclePlugin(unittest.TestCase):
         mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
         provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
 
         shape_err = Exception("ORA-54401: ONNX runtime error: Non-zero status code returned while running Add node. 512 by 755")
-        mock_cur.execute.side_effect = [shape_err, None]
+        # Attempt 1: ORA-54401, Attempt 2 (conservative retry): ORA-54401, Attempt 3: null fallback
+        mock_cur.execute.side_effect = [shape_err, shape_err, None]
 
         provider._insert(
             memory_id="m_shape",
@@ -1112,11 +1220,94 @@ class TestOraclePlugin(unittest.TestCase):
         )
 
         self.assertFalse(provider._onnx_in_cooldown())
-        self.assertEqual(mock_cur.execute.call_count, 2)
-        fallback_sql, fallback_binds = mock_cur.execute.call_args_list[1][0]
+        self.assertEqual(mock_cur.execute.call_count, 3)
+        fallback_sql, fallback_binds = mock_cur.execute.call_args_list[2][0]
         self.assertIn("NULL", fallback_sql)
         self.assertNotIn("VECTOR_EMBEDDING", fallback_sql)
         self.assertEqual(fallback_binds[0], "m_shape")
+        provider._queue_embed_backfill.assert_called_once_with("m_shape", "very long prompt " * 100)
+
+    def test_ora_54401_insert_retries_with_conservative_clamp_and_succeeds(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        shape_err = Exception("ORA-54401: ONNX runtime error: input exceeds 512 tokens")
+        mock_cur.execute.side_effect = [shape_err, None]
+
+        provider._insert(
+            memory_id="m_clamp",
+            session_id="s1",
+            role="user",
+            content="token " * 300,
+            target="memory",
+        )
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.execute.call_count, 2)
+        retry_sql, retry_binds = mock_cur.execute.call_args_list[1][0]
+        self.assertIn("VECTOR_EMBEDDING", retry_sql)
+        self.assertLessEqual(len(retry_binds[5]), 400)
+        provider._queue_embed_backfill.assert_not_called()
+
+    def test_ora_51815_insert_retries_and_succeeds(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        snap_err = Exception("ORA-51815: Vector index evaluation failed: transient snapshot conflict")
+        mock_cur.execute.side_effect = [snap_err, None]
+
+        provider._insert(
+            memory_id="m_snap",
+            session_id="s1",
+            role="user",
+            content="snapshot test",
+            target="memory",
+        )
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.execute.call_count, 2)
+        retry_sql, _ = mock_cur.execute.call_args_list[1][0]
+        self.assertIn("VECTOR_EMBEDDING", retry_sql)
+        provider._queue_embed_backfill.assert_not_called()
+
+    def test_ora_51815_insert_falls_back_to_null_embedding_on_exhausted_retries(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        snap_err = Exception("ORA-51815: Vector index evaluation failed")
+        mock_cur.execute.side_effect = [snap_err, snap_err, snap_err, None]
+
+        provider._insert(
+            memory_id="m_snap_fail",
+            session_id="s1",
+            role="user",
+            content="snapshot fail test",
+            target="memory",
+        )
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.execute.call_count, 4)
+        fallback_sql, fallback_binds = mock_cur.execute.call_args_list[3][0]
+        self.assertIn("NULL", fallback_sql)
+        provider._queue_embed_backfill.assert_called_once_with("m_snap_fail", "snapshot fail test")
 
     def test_ora_54401_insert_many_falls_back_to_null_embedding(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1126,6 +1317,37 @@ class TestOraclePlugin(unittest.TestCase):
         mock_conn, mock_cur = self._mocked_conn()
         provider._pool = MagicMock()
         provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        shape_err = Exception("ORA-54401: ONNX runtime error: input exceeds 512 tokens")
+        mock_cur.executemany.side_effect = [shape_err, shape_err, None]
+
+        rows = [
+            {"memory_id": "m1", "session_id": "s1", "role": "user", "content": "row1 " * 80},
+            {"memory_id": "m2", "session_id": "s1", "role": "user", "content": "row2 " * 80},
+        ]
+        provider._insert_many(rows)
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.executemany.call_count, 3)
+        fallback_sql, fallback_binds_list = mock_cur.executemany.call_args_list[2][0]
+        self.assertIn("NULL", fallback_sql)
+        self.assertEqual(len(fallback_binds_list), 2)
+        self.assertEqual(fallback_binds_list[0][0], "m1")
+        self.assertEqual(fallback_binds_list[1][0], "m2")
+        self.assertEqual(provider._queue_embed_backfill.call_count, 2)
+        provider._queue_embed_backfill.assert_any_call("m1", "row1 " * 80)
+        provider._queue_embed_backfill.assert_any_call("m2", "row2 " * 80)
+
+    def test_ora_54401_insert_many_retries_with_conservative_clamp_and_succeeds(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
 
         shape_err = Exception("ORA-54401: ONNX runtime error: input exceeds 512 tokens")
         mock_cur.executemany.side_effect = [shape_err, None]
@@ -1138,11 +1360,63 @@ class TestOraclePlugin(unittest.TestCase):
 
         self.assertFalse(provider._onnx_in_cooldown())
         self.assertEqual(mock_cur.executemany.call_count, 2)
-        fallback_sql, fallback_binds_list = mock_cur.executemany.call_args_list[1][0]
+        retry_sql, retry_binds_list = mock_cur.executemany.call_args_list[1][0]
+        self.assertIn("VECTOR_EMBEDDING", retry_sql)
+        self.assertLessEqual(len(retry_binds_list[0][5]), 400)
+        self.assertLessEqual(len(retry_binds_list[1][5]), 400)
+        provider._queue_embed_backfill.assert_not_called()
+
+    def test_ora_51815_insert_many_retries_and_succeeds(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        snap_err = Exception("ORA-51815: Vector index evaluation failed")
+        mock_cur.executemany.side_effect = [snap_err, None]
+
+        rows = [
+            {"memory_id": "m1", "session_id": "s1", "role": "user", "content": "row1"},
+            {"memory_id": "m2", "session_id": "s1", "role": "user", "content": "row2"},
+        ]
+        provider._insert_many(rows)
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.executemany.call_count, 2)
+        retry_sql, _ = mock_cur.executemany.call_args_list[1][0]
+        self.assertIn("VECTOR_EMBEDDING", retry_sql)
+        provider._queue_embed_backfill.assert_not_called()
+
+    def test_ora_51815_insert_many_falls_back_to_null_embedding_on_exhausted_retries(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+
+        mock_conn, mock_cur = self._mocked_conn()
+        provider._pool = MagicMock()
+        provider._pool.acquire.return_value = mock_conn
+        provider._queue_embed_backfill = MagicMock()
+
+        snap_err = Exception("ORA-51815: Vector index evaluation failed")
+        mock_cur.executemany.side_effect = [snap_err, snap_err, snap_err, None]
+
+        rows = [
+            {"memory_id": "m1", "session_id": "s1", "role": "user", "content": "row1"},
+            {"memory_id": "m2", "session_id": "s1", "role": "user", "content": "row2"},
+        ]
+        provider._insert_many(rows)
+
+        self.assertFalse(provider._onnx_in_cooldown())
+        self.assertEqual(mock_cur.executemany.call_count, 4)
+        fallback_sql, fallback_binds_list = mock_cur.executemany.call_args_list[3][0]
         self.assertIn("NULL", fallback_sql)
-        self.assertEqual(len(fallback_binds_list), 2)
-        self.assertEqual(fallback_binds_list[0][0], "m1")
-        self.assertEqual(fallback_binds_list[1][0], "m2")
+        self.assertEqual(provider._queue_embed_backfill.call_count, 2)
+        provider._queue_embed_backfill.assert_any_call("m1", "row1")
+        provider._queue_embed_backfill.assert_any_call("m2", "row2")
 
     def test_ora_54401_in_hybrid_search_does_not_mark_onnx_failed(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1356,36 +1630,36 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.3.2")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.4")
 
         # 2. VERSION
         version_file = repo_dir / "VERSION"
         self.assertTrue(version_file.is_file())
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.3.2")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.4")
 
         # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.3.2", plugin_yaml)
-        self.assertIn("version-1.0.9.3.2-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.4", plugin_yaml)
+        self.assertIn("version-1.0.9.4-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9.3.2"', pyproject)
+        self.assertIn('version = "1.0.9.4"', pyproject)
 
         # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.3.2", skill_md)
+        self.assertIn("version: 1.0.9.4", skill_md)
 
         # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.3.2-blue.svg", readme)
-        self.assertIn("v1.0.9.3.2", readme)
+        self.assertIn("version-1.0.9.4-blue.svg", readme)
+        self.assertIn("v1.0.9.4", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.3.2-blue.svg", install_md)
-        self.assertIn("v1.0.9.3.2", install_md)
+        self.assertIn("version-1.0.9.4-blue.svg", install_md)
+        self.assertIn("v1.0.9.4", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp
@@ -1403,13 +1677,14 @@ class TestOraclePlugin(unittest.TestCase):
         ignored_patterns = {
             ".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist",
             "hermes_oracle_memory.egg-info", "uv.lock", "backups", "backfills",
+            ".entire", ".claude",
         }
         
         for base, other, label in [(repo_dir, plugin_dir, "plugin"), (plugin_dir, repo_dir, "repository")]:
             for root, dirs, files in os.walk(base):
                 dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
                 for f in files:
-                    if f.endswith((".pyc", ".lock")):
+                    if f.endswith((".pyc", ".lock")) or f == "CLAUDE.md":
                         continue
                     full_path = Path(root) / f
                     rel = full_path.relative_to(base)

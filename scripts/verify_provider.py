@@ -184,6 +184,22 @@ def main() -> None:
     assert len(batch_data.get("memory_ids", [])) == 2, "Expected 2 memory IDs returned"
     print("Batch facts insertion verified.")
 
+    # 8c. Verify ranking and turn exclusion on HANDOFF query
+    print("Testing oracle_search HANDOFF ranking and turn exclusion...")
+    handoff_out = provider.handle_tool_call("oracle_search", {"query": "HANDOFF"})
+    handoff_data = json.loads(handoff_out)
+    results = handoff_data.get("results", [])
+    print(f"HANDOFF returned {len(results)} results:")
+    for i, r in enumerate(results):
+        print(f"  [{i+1}] {r.get('memory_id')} ({r.get('role')}): score={r.get('score')} content={(r.get('content') or '')[:60].replace(chr(10), ' ')}")
+    assert len(results) >= 2, "Expected at least 2 results for HANDOFF"
+    top_3_ids = {r["memory_id"] for r in results[:3]}
+    assert "fact_63bf1626d9f0405c" in top_3_ids, f"Expected fact_63bf1626d9f0405c in top 3, got {top_3_ids}"
+    assert "fact_7b7eda6a4a5c4b02" in top_3_ids, f"Expected fact_7b7eda6a4a5c4b02 in top 3, got {top_3_ids}"
+    for r in results:
+        assert r.get("role") != "turn", f"Found role='turn' row in results: {r}"
+    print("HANDOFF ranking and turn exclusion verified successfully.")
+
     # 9. Verify error handling when ONNX model is unavailable (no external fallback)
     print("Testing strictly in-database error handling when ONNX model is unavailable...")
     orig_onnx = provider._onnx_model

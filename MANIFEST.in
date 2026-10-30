@@ -3,7 +3,7 @@ include VERSION
 include README.md
 include INSTALL.md
 include CHANGELOG.md
-include RELEASE_NOTES_1.0.9.3.2.md
+include RELEASE_NOTES_*.md
 include AGENTS.md
 include LICENSE
 include CLA.md

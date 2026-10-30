@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.9.4] - 2026-10-30
+
+### Fixed & Fortified
+- **Search Ranking & Turn Noise Filtering**:
+  - Prioritizes durable `role='fact'` entries over generic noise and sorts by recency (`created_at DESC`) across all text, vector, and hybrid search SQL queries.
+  - Normalizes text score against standard Oracle Text max score (`min(1.0, txt / 100.0)`).
+  - Implements exact prefix match boosting (`_is_prefix_match`), adding a `+0.15` relevancy boost to memories whose titles or content prefixes match the search query.
+  - Hardens `_JUNK` filter with `NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')` to prevent conversation turn and session noise from polluting retrieval results.
+- **In-Database ONNX Insert Fortification**:
+  - Retries transient snapshot conflicts (`ORA-51815`) in `_insert` and `_insert_many` up to `_EMBED_MAX_RETRIES` with progressive backoff.
+  - Retries sequence length violations (`ORA-54401`) with a conservative token clamp (`_CONSERVATIVE_EMBED_CHARS = 400`), guaranteeing tokens stay safely below 512.
+  - Enqueues rows into `_queue_embed_backfill` on any fallback insert with NULL embedding to guarantee asynchronous background embedding computation without turn loss.
+
+### Added
+- Unit tests covering ORA-54401 conservative token clamp retry and success, ORA-51815 transient snapshot conflict retry and success, and background backfill queueing on null fallback in `tests/test_oracle.py`.
+- Automated live verification checks for prefix ranking and turn noise exclusion in `scripts/verify_provider.py`.
+
+### Changed
+- Bumped version to `1.0.9.4` across `__init__.py`, `VERSION`, `plugin.yaml`, `pyproject.toml`, `skills/oracle-import/SKILL.md`, `README.md`, `INSTALL.md`, and test suites.
+- Enforced 100% zero drift across repository, installed plugin (`~/.hermes/plugins/oracle`), and all bot profile environments (`edgebot`, `qoam-*`).
+- Replaced previous release notes with `RELEASE_NOTES_1.0.9.4.md` per release documentation policy.
+
 ## [1.0.9.3.2] - 2026-10-29
 
 ### Fixed

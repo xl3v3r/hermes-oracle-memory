@@ -28,7 +28,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.3.2"
+__version__ = "1.0.9.4"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -43,6 +43,7 @@ _EMBED_TIMEOUT_SECS = 10.0
 _SEARCH_TIMEOUT_SECS = float(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT", "13.0"))
 _SEARCH_TIMEOUT_MS = int(_SEARCH_TIMEOUT_SECS * 1000)
 _EMBED_MAX_RETRIES = 2
+_CONSERVATIVE_EMBED_CHARS = 400
 _RERANK_MAX_DOCS = 8
 _RERANK_ENABLED = (
     os.environ.get("HERMES_ORACLE_DISABLE_RERANK", "").strip().lower()
@@ -970,51 +971,98 @@ class OracleMemoryProvider(MemoryProvider):
                 return
             except Exception as e:
                 err_str = str(e)
-                is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                if not is_shape_err:
-                    self._onnx_mark_failed()
-                if is_shape_err:
-                    logger.warning(
-                        "In-database ONNX insert hit shape/sequence length error (%s); inserting row with null embedding to prevent turn loss",
-                        e,
-                    )
-                    null_sql = f"""
-                        INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                            (memory_id, session_id, agent_id, role, content, embedding,
-                             created_at, target, metadata, content_txt,
-                             embedding_model, embedding_updated_at)
-                        VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                             NULL, SYSTIMESTAMP)
-                    """
-                    null_binds = (
+                is_51815 = "ORA-51815" in err_str
+                is_54401 = "ORA-54401" in err_str
+                is_shape_err = is_51815 or is_54401
+
+                # 1. ORA-51815: retry transient snapshot conflicts
+                if is_51815:
+                    for attempt in range(_EMBED_MAX_RETRIES):
+                        try:
+                            time.sleep(0.05 * (attempt + 1))
+                            with self._pool.acquire() as conn, conn.cursor() as cur:
+                                cur.execute(sql, binds)
+                                conn.commit()
+                            return
+                        except Exception as retry_e:
+                            err_str = str(retry_e)
+                            if "ORA-51815" not in err_str:
+                                is_54401 = "ORA-54401" in err_str
+                                is_shape_err = is_54401
+                                break
+
+                # 2. ORA-54401: retry with conservative token clamp
+                if is_54401:
+                    conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
+                    conservative_binds = (
                         memory_id,
                         session_id or self._session_id or "none",
                         self._agent_id,
                         role,
                         content,
+                        conservative_txt,
                         target,
                         meta,
                         txt,
+                        self._onnx_model,
                     )
                     try:
                         with self._pool.acquire() as conn, conn.cursor() as cur:
-                            cur.execute(null_sql, null_binds)
+                            cur.execute(sql, conservative_binds)
                             conn.commit()
                         return
-                    except Exception as null_e:
-                        logger.error(
-                            "Null-embedding insert fallback failed (%s)", null_e
-                        )
-                        raise RuntimeError(
-                            f"In-database ONNX insert failed ({e}) and fallback insert failed ({null_e})"
-                        ) from null_e
+                    except Exception as retry_e:
+                        err_str = str(retry_e)
+                        is_51815 = "ORA-51815" in err_str
+                        is_54401 = "ORA-54401" in err_str
+                        is_shape_err = is_51815 or is_54401
+
+                if not is_shape_err:
+                    self._onnx_mark_failed()
+                    logger.warning(
+                        "In-database ONNX insert failed (%s); external fallback is disabled",
+                        err_str,
+                    )
+                    raise RuntimeError(
+                        f"In-database ONNX insert failed ({err_str}); external fallback is disabled"
+                    ) from e
+
+                # 3. Fallback to NULL embedding and queue background backfill
                 logger.warning(
-                    "In-database ONNX insert failed (%s); external fallback is disabled",
-                    e,
+                    "In-database ONNX insert hit shape/sequence length error (%s); inserting row with null embedding to prevent turn loss",
+                    err_str,
                 )
-                raise RuntimeError(
-                    f"In-database ONNX insert failed ({e}); external fallback is disabled"
-                ) from e
+                null_sql = f"""
+                    INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                        (memory_id, session_id, agent_id, role, content, embedding,
+                         created_at, target, metadata, content_txt,
+                         embedding_model, embedding_updated_at)
+                    VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                         NULL, SYSTIMESTAMP)
+                """
+                null_binds = (
+                    memory_id,
+                    session_id or self._session_id or "none",
+                    self._agent_id,
+                    role,
+                    content,
+                    target,
+                    meta,
+                    txt,
+                )
+                try:
+                    with self._pool.acquire() as conn, conn.cursor() as cur:
+                        cur.execute(null_sql, null_binds)
+                        conn.commit()
+                    self._queue_embed_backfill(memory_id, content)
+                    return
+                except Exception as null_e:
+                    logger.error(
+                        "Null-embedding insert fallback failed (%s)", null_e
+                    )
+                    raise RuntimeError(
+                        f"In-database ONNX insert failed ({err_str}) and fallback insert failed ({null_e})"
+                    ) from null_e
 
         if vec is None:
             raise RuntimeError(
@@ -1105,24 +1153,29 @@ class OracleMemoryProvider(MemoryProvider):
                 return
             except Exception as e:
                 err_str = str(e)
-                is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                if not is_shape_err:
-                    self._onnx_mark_failed()
-                if is_shape_err:
-                    logger.warning(
-                        "In-database ONNX insert_many hit shape/sequence length error (%s); inserting rows with null embedding to prevent turn loss",
-                        e,
-                    )
-                    null_sql = f"""
-                        INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                            (memory_id, session_id, agent_id, role, content, embedding,
-                             created_at, target, metadata, content_txt,
-                             embedding_model, embedding_updated_at,
-                             turn_index, chunk_index, turn_id, conv_ref)
-                        VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                             NULL, SYSTIMESTAMP, :9, :10, :11, :12)
-                    """
-                    null_binds_list = []
+                is_51815 = "ORA-51815" in err_str
+                is_54401 = "ORA-54401" in err_str
+                is_shape_err = is_51815 or is_54401
+
+                # 1. ORA-51815: retry transient snapshot conflicts
+                if is_51815:
+                    for attempt in range(_EMBED_MAX_RETRIES):
+                        try:
+                            time.sleep(0.05 * (attempt + 1))
+                            with self._pool.acquire() as conn, conn.cursor() as cur:
+                                cur.executemany(sql, binds_list)
+                                conn.commit()
+                            return
+                        except Exception as retry_e:
+                            err_str = str(retry_e)
+                            if "ORA-51815" not in err_str:
+                                is_54401 = "ORA-54401" in err_str
+                                is_shape_err = is_54401
+                                break
+
+                # 2. ORA-54401: retry with conservative token clamp
+                if is_54401:
+                    conservative_binds_list = []
                     for row in rows:
                         memory_id = row.get("memory_id")
                         session_id = row.get("session_id") or self._session_id or "none"
@@ -1132,40 +1185,101 @@ class OracleMemoryProvider(MemoryProvider):
                         metadata = row.get("metadata")
                         meta = json.dumps(metadata or {})
                         txt = self._safe_varchar_bytes(content, 4000)
+                        conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
                         binds = (
                             memory_id,
                             session_id,
                             self._agent_id,
                             role,
                             content,
+                            conservative_txt,
                             target,
                             meta,
                             txt,
+                            self._onnx_model,
                             row.get("turn_index"),
                             row.get("chunk_index"),
                             row.get("turn_id"),
                             row.get("conv_ref"),
                         )
-                        null_binds_list.append(binds)
+                        conservative_binds_list.append(binds)
                     try:
                         with self._pool.acquire() as conn, conn.cursor() as cur:
-                            cur.executemany(null_sql, null_binds_list)
+                            cur.executemany(sql, conservative_binds_list)
                             conn.commit()
                         return
-                    except Exception as null_e:
-                        logger.error(
-                            "Null-embedding insert_many fallback failed (%s)", null_e
-                        )
-                        raise RuntimeError(
-                            f"In-database ONNX insert_many failed ({e}) and fallback insert_many failed ({null_e})"
-                        ) from null_e
+                    except Exception as retry_e:
+                        err_str = str(retry_e)
+                        is_51815 = "ORA-51815" in err_str
+                        is_54401 = "ORA-54401" in err_str
+                        is_shape_err = is_51815 or is_54401
+
+                if not is_shape_err:
+                    self._onnx_mark_failed()
+                    logger.warning(
+                        "In-database ONNX insert_many failed (%s); external fallback is disabled",
+                        err_str,
+                    )
+                    raise RuntimeError(
+                        f"In-database ONNX insert_many failed ({err_str}); external fallback is disabled"
+                    ) from e
+
+                # 3. Fallback to NULL embedding and queue background backfill
                 logger.warning(
-                    "In-database ONNX insert_many failed (%s); external fallback is disabled",
-                    e,
+                    "In-database ONNX insert_many hit shape/sequence length error (%s); inserting rows with null embedding to prevent turn loss",
+                    err_str,
                 )
-                raise RuntimeError(
-                    f"In-database ONNX insert_many failed ({e}); external fallback is disabled"
-                ) from e
+                null_sql = f"""
+                    INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                        (memory_id, session_id, agent_id, role, content, embedding,
+                         created_at, target, metadata, content_txt,
+                         embedding_model, embedding_updated_at,
+                         turn_index, chunk_index, turn_id, conv_ref)
+                    VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                         NULL, SYSTIMESTAMP, :9, :10, :11, :12)
+                """
+                null_binds_list = []
+                for row in rows:
+                    memory_id = row.get("memory_id")
+                    session_id = row.get("session_id") or self._session_id or "none"
+                    role = row.get("role")
+                    content = row.get("content")
+                    target = row.get("target")
+                    metadata = row.get("metadata")
+                    meta = json.dumps(metadata or {})
+                    txt = self._safe_varchar_bytes(content, 4000)
+                    binds = (
+                        memory_id,
+                        session_id,
+                        self._agent_id,
+                        role,
+                        content,
+                        target,
+                        meta,
+                        txt,
+                        row.get("turn_index"),
+                        row.get("chunk_index"),
+                        row.get("turn_id"),
+                        row.get("conv_ref"),
+                    )
+                    null_binds_list.append(binds)
+                try:
+                    with self._pool.acquire() as conn, conn.cursor() as cur:
+                        cur.executemany(null_sql, null_binds_list)
+                        conn.commit()
+                    for row in rows:
+                        mid = row.get("memory_id")
+                        cnt = row.get("content")
+                        if mid and cnt:
+                            self._queue_embed_backfill(mid, cnt)
+                    return
+                except Exception as null_e:
+                    logger.error(
+                        "Null-embedding insert_many fallback failed (%s)", null_e
+                    )
+                    raise RuntimeError(
+                        f"In-database ONNX insert_many failed ({err_str}) and fallback insert_many failed ({null_e})"
+                    ) from null_e
 
         if any(r.get("embedding") is None for r in rows):
             raise RuntimeError(
@@ -1220,8 +1334,27 @@ class OracleMemoryProvider(MemoryProvider):
 
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
-        " AND NVL(session_id, 'x') <> 'diagnostic-session-001' "
+        " AND NVL(session_id, 'x') <> 'diagnostic-session-001'"
+        " AND NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session') "
     )
+
+    @staticmethod
+    def _is_prefix_match(content: str | None, query: str | None) -> bool:
+        if not content or not query:
+            return False
+        c_clean = str(content).strip().lower()
+        q_clean = str(query).strip().lower()
+        c_stripped = re.sub(r"^[\s#*\->\[\]\"'(`:]+", "", c_clean)
+        q_stripped = re.sub(r"^[\s#*\->\[\]\"'(`:]+", "", q_clean)
+        if not q_stripped or not c_stripped:
+            return False
+        if c_stripped.startswith(q_stripped) or c_clean.startswith(q_clean):
+            return True
+        tokens = [t.strip(".,;:!?\"'()[]") for t in q_stripped.split()]
+        first_tok = tokens[0] if tokens else ""
+        if first_tok and len(first_tok) > 2 and c_stripped.startswith(first_tok):
+            return True
+        return False
 
     def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
         # oracledb thin mode returns CLOB columns as LOB objects; a
@@ -1244,9 +1377,9 @@ class OracleMemoryProvider(MemoryProvider):
             txt = float(row[6] or 0)
             vec_score = max(0.0, min(1.0, 1.0 - dist)) if dist is not None else 0.0
             score = (
-                0.7 * vec_score + 0.3 * min(1.0, txt / 10.0)
+                0.7 * vec_score + 0.3 * min(1.0, txt / 100.0)
                 if dist is not None
-                else min(1.0, txt / 10.0)
+                else min(1.0, txt / 100.0)
             )
             out.append(
                 {
@@ -1257,6 +1390,7 @@ class OracleMemoryProvider(MemoryProvider):
                     "content": content,
                     "target": row[5],
                     "score": round(score, 4),
+                    "dist": dist,
                 }
             )
         return out
@@ -1279,7 +1413,7 @@ class OracleMemoryProvider(MemoryProvider):
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
             {self._JUNK}{tgt_sql}{extra_filters}
-            ORDER BY txt_score DESC
+            ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, txt_score DESC, created_at DESC
             FETCH FIRST :k ROWS ONLY
         """
         if tgt_sql:
@@ -1303,7 +1437,7 @@ class OracleMemoryProvider(MemoryProvider):
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
-                ORDER BY distance ASC
+                ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC
                 FETCH FIRST :k ROWS ONLY
             """
             binds = {"qv": self._safe_embed_text(query), "k": fetch_k}
@@ -1315,7 +1449,7 @@ class OracleMemoryProvider(MemoryProvider):
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
-                ORDER BY distance ASC
+                ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC
                 FETCH FIRST :k ROWS ONLY
             """
             binds = {"v": vec, "k": fetch_k}
@@ -1348,7 +1482,7 @@ class OracleMemoryProvider(MemoryProvider):
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY distance ASC
+                    ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC
                     FETCH FIRST :k ROWS ONLY
                 )
                 UNION ALL
@@ -1360,7 +1494,7 @@ class OracleMemoryProvider(MemoryProvider):
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY txt_score DESC
+                    ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, txt_score DESC, created_at DESC
                     FETCH FIRST :k ROWS ONLY
                 )
             """
@@ -1380,7 +1514,7 @@ class OracleMemoryProvider(MemoryProvider):
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY distance ASC
+                    ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, distance ASC, created_at DESC
                     FETCH FIRST :k ROWS ONLY
                 )
                 UNION ALL
@@ -1392,7 +1526,7 @@ class OracleMemoryProvider(MemoryProvider):
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY txt_score DESC
+                    ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, txt_score DESC, created_at DESC
                     FETCH FIRST :k ROWS ONLY
                 )
             """
@@ -1416,7 +1550,11 @@ class OracleMemoryProvider(MemoryProvider):
                     contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
                 )
                 for r in self._fetch_rows(cur, sql, binds):
+                    r.pop("dist", None)
                     merged[r["memory_id"]] = r
+                for item in merged.values():
+                    if self._is_prefix_match(item.get("content"), query):
+                        item["score"] = round(min(1.0, item["score"] + 0.15), 4)
             except Exception as e:
                 err_str = str(e)
                 is_timeout_err = isinstance(e, TimeoutError) or any(
@@ -1455,8 +1593,13 @@ class OracleMemoryProvider(MemoryProvider):
                     prev["score"] = round(
                         min(1.0, prev["score"] + r["score"] * 0.3), 4
                     )
+                    prev.pop("dist", None)
                 else:
-                    merged[r["memory_id"]] = r
+                    item = dict(r)
+                    if item.get("dist") is None and "dist" in item:
+                        item["score"] = round(item["score"] * 0.3, 4)
+                    item.pop("dist", None)
+                    merged[r["memory_id"]] = item
         except Exception as e:
             err_str = str(e)
             is_text_err = any(code in err_str for code in ("DRG-", "ORA-29902", "ORA-30600"))
@@ -1488,6 +1631,7 @@ class OracleMemoryProvider(MemoryProvider):
                         query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
                     )
                     for r in self._fetch_rows(cur, vec_sql, vec_binds):
+                        r.pop("dist", None)
                         merged[r["memory_id"]] = r
                 except Exception as vec_err:
                     vec_err_str = str(vec_err)
@@ -1516,6 +1660,12 @@ class OracleMemoryProvider(MemoryProvider):
                 raise RuntimeError(
                     f"In-database ONNX hybrid search failed ({e}); external fallback is disabled"
                 ) from e
+
+        for item in merged.values():
+            item.pop("dist", None)
+            if self._is_prefix_match(item.get("content"), query):
+                item["score"] = round(min(1.0, item["score"] + 0.15), 4)
+
         ranked = sorted(
             merged.values(), key=lambda x: x["score"], reverse=True
         )
@@ -1562,6 +1712,11 @@ class OracleMemoryProvider(MemoryProvider):
                             contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
                         )
                         rows = self._fetch_rows(cur, sql, binds)
+                        for r in rows:
+                            r.pop("dist", None)
+                            if self._is_prefix_match(r.get("content"), query):
+                                r["score"] = round(min(1.0, r["score"] + 0.15), 4)
+                        rows = sorted(rows, key=lambda x: x["score"], reverse=True)
                     except Exception as e:
                         err_str = str(e)
                         is_timeout_err = isinstance(e, TimeoutError) or any(
@@ -1594,6 +1749,8 @@ class OracleMemoryProvider(MemoryProvider):
                             query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
                         )
                         rows = self._fetch_rows(cur, sql, binds)
+                        for r in rows:
+                            r.pop("dist", None)
                     except Exception as e:
                         err_str = str(e)
                         is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))

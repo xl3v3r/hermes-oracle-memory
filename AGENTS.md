@@ -22,9 +22,9 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ├── LICENSE                 # Business Source License 1.1
 ├── MANIFEST.in             # Source distribution manifest
 ├── README.md               # Project documentation and usage guide
-├── CHANGELOG.md            # Release changelog (v1.0.9.3.2)
-├── RELEASE_NOTES_1.0.9.3.2.md # Release notes for v1.0.9.3.2
-├── VERSION                 # Canonical project version file (1.0.9.3.2)
+├── CHANGELOG.md            # Release changelog (v1.0.9.4)
+├── RELEASE_NOTES_1.0.9.4.md # Release notes for v1.0.9.4
+├── VERSION                 # Canonical project version file (1.0.9.4)
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration
@@ -83,3 +83,8 @@ All tests in `tests/` must pass cleanly without network access or active databas
 2. **Batched Execution**: Always use `cursor.executemany` for batch database updates (e.g. embedding backfill) to avoid N+1 query overhead.
 3. **Type Safety & Defensive Validation**: Ensure lifecycle methods (`initialize`, `sync_turn`, `prefetch`, `on_memory_write`, `on_session_end`) guard against non-string or `MagicMock` inputs.
 
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->

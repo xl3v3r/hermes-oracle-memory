@@ -1,15 +1,15 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.0.9.3.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.4-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.3.2 updates are CRITICAL to functionality. Standalone bulk import structural discovery (`_find_plugin_root`), fortified provider import fallback with path diagnostics, native skill library indexing engine (`oracle_sync_skills`), byte-safe UTF-8 clamping (`_safe_varchar_bytes`) to prevent `ORA-12899`, canonical root `VERSION` file, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
+> **CRITICALITY NOTICE**: v1.0.9.4 updates are CRITICAL to functionality. Recency & fact-prioritized search ranking, turn noise filtering (`role NOT IN ('turn', 'assistant', 'session')`), prefix match score boosting, fortified ONNX insert path (`ORA-51815` transient snapshot retry, `ORA-54401` conservative token clamp retry, background backfill queueing on null fallback), canonical root `VERSION` file, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, and background persistence — a scalable replacement for local SQLite / Mnemosyne-style memory.
 
 ## Install
 
-> **CRITICALITY NOTICE**: v1.0.9.3.2 updates are CRITICAL to functionality. Standalone bulk import structural discovery (`_find_plugin_root`), fortified provider import fallback with path diagnostics, native skill library indexing engine (`oracle_sync_skills`), byte-safe UTF-8 clamping (`_safe_varchar_bytes`) to prevent `ORA-12899`, canonical root `VERSION` file, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
+> **CRITICALITY NOTICE**: v1.0.9.4 updates are CRITICAL to functionality. Recency & fact-prioritized search ranking, turn noise filtering (`role NOT IN ('turn', 'assistant', 'session')`), prefix match score boosting, fortified ONNX insert path (`ORA-51815` transient snapshot retry, `ORA-54401` conservative token clamp retry, background backfill queueing on null fallback), canonical root `VERSION` file, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
 
 ### Recommended — Hermes plugin manager
 
@@ -65,19 +65,20 @@ Embeddings are computed 100% in-house:
 
 - **`oracle-import`** — bulk-ingest conversation archives (ShareGPT / Claude / ChatGPT / JSON) and large documents into ADB without LLM rate limits or context inflation.
 
-## What's new in v1.0.9.3.2
+## What's new in v1.0.9.4
 
-- **Criticality Notice**: v1.0.9.3.2 updates are CRITICAL to functionality. Restores standalone bulk conversation import via structural plugin root discovery (`_find_plugin_root`), fortifies provider dynamic import fallback with path diagnostics, purges historical release notes files, and guarantees zero drift across repository, installed plugin, and all Hermes Agent profile environments.
-- **Defect 1 Fix: Structural Plugin Root Discovery (`_find_plugin_root`)**:
-  - Replaced fragile 3-level static `.parent` traversal in `skills/oracle-import/scripts/import_conversations.py` with dynamic upward traversal `_find_plugin_root`.
-  - Accurately locates the plugin root directory containing `plugin.yaml` and `__init__.py` whether executed from `skills/oracle-import/scripts/` or `scripts/`, resolving `FileNotFoundError: .../skills/__init__.py`.
-- **Defect 2 Fix: Fortified Provider Dynamic Import Fallback**:
-  - Fortified the provider fallback chain in `skills/oracle-import/scripts/import_conversations.py` to verify file existence and catch all exceptions during dynamic module spec creation and execution.
-  - Replaced raw unhandled exceptions with actionable diagnostic logging specifying the exact failed file path and root cause.
-- **Comprehensive Unit Testing**:
-  - Added dedicated test suite `TestOracleImportScript` in `tests/test_oracle_import.py` validating structural discovery and error handling branches.
+- **Criticality Notice**: v1.0.9.4 updates are CRITICAL to functionality. Introduces recency and fact-prioritized search ranking, turn noise filtering, prefix match score boosting, fortified in-database ONNX insert error handling with snapshot conflict retry (`ORA-51815`) and conservative token clamp retry (`ORA-54401`), background backfill queueing on null fallback, and enforces 100% zero drift across repository, installed plugin, and all Hermes Agent profile environments.
+- **Search Ranking & Turn Noise Filtering**:
+  - Implements fact-first role ordering (`ORDER BY CASE WHEN role = 'fact' THEN 1 ELSE 2 END ASC, ..., created_at DESC`) across all text, vector, and hybrid search SQL queries.
+  - Normalizes text scores against standard Oracle Text max score (`min(1.0, txt / 100.0)`).
+  - Implements exact prefix match detection (`_is_prefix_match`) granting a `+0.15` relevancy score boost to memories whose titles/prefixes match search queries.
+  - Filters out turn noise (`turn`, `assistant`, `session`) from memory recall via `_JUNK` filter.
+- **Fortified ONNX Insertion Paths (`_insert` and `_insert_many`)**:
+  - **`ORA-51815` Transient Snapshot Retry**: Retries transient snapshot conflicts up to `_EMBED_MAX_RETRIES` with progressive backoff before falling back.
+  - **`ORA-54401` Conservative Token Clamp**: Automatically retries sequence length violations with conservative character clamp (`_CONSERVATIVE_EMBED_CHARS = 400`), safely bounding tokens below 512.
+  - **Background Backfill on NULL Fallback**: Any fallback insert with NULL embeddings automatically enqueues rows into `_queue_embed_backfill` to ensure vectors are computed asynchronously in the background without turn loss.
 - **Repository Hygiene & Clean Release Documentation**:
-  - Purged legacy historical release notes files, maintaining clean, dedicated release documentation (`RELEASE_NOTES_1.0.9.3.2.md` and `CHANGELOG.md`).
+  - Clean release notes in `RELEASE_NOTES_1.0.9.4.md` and updated `CHANGELOG.md`.
   - Zero modifications to Hermes Agent core repository files.
 
 

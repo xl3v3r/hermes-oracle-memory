@@ -26,3 +26,7 @@ ewallet.pem
 ewallet.p12
 tnsnames.ora
 
+# Assistant / agent local configs
+.claude/
+CLAUDE.md
+
