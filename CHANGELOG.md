@@ -7,13 +7,15 @@ All notable changes to this project are documented in this file.
 ### Fixed & Fortified
 - **Retrieval Weighting & Re-Ranking**:
   - Implemented dynamic post-retrieval weighting (`_apply_weights`) incorporating exponential recency decay (`0.85 + 0.15 * exp(-age_days / 120)`), role weighting (`fact: 1.0`, `user: 0.9`, `session: 0.9`, `turn: 0.75`, `assistant: 0.75`), telemetry dampening (`0.05` for `[skill_usage]`, `[skill_vectorization*]`), and short content penalty (`< 25 chars -> 0.9`).
-  - Added candidate `created_at` batch PK resolution chunked at 500 records with clean unweighted fallback on database errors.
+  - Added candidate `created_at` batch PK resolution chunked at 500 records with clean unweighted fallback on database errors, robust cursor lifecycle management on pool connection acquisition, and flexible support for `datetime.date`, ISO strings, and unix epoch timestamps.
+  - Hardened sorting against `NoneType` and invalid scores, non-dict elements, and tuple input collections.
   - Hardened `_JUNK` filter across text, vector, and hybrid SQL query builders with `AND NVL(content_txt, 'x') NOT LIKE '[skill%'` to keep lifecycle telemetry out of retrieval candidate sets.
 - **Test Harness Robustness**:
   - Guarded `test_zero_drift_with_installed_plugin` against `repo_dir.resolve() == plugin_dir.resolve()` to prevent `shutil.SameFileError` when tests run directly from the installed plugin directory.
+  - Hardened file synchronization across repository, installed plugin, and `edgebot` profile environments to track and sync all files including `CLAUDE.md`.
 
 ### Added
-- Comprehensive unit tests in `tests/test_oracle.py` verifying recency decay, role weighting, telemetry penalty, short content penalty, batch database lookup, and graceful error fallback.
+- Comprehensive unit tests in `tests/test_oracle.py` verifying recency decay, role weighting, telemetry penalty, short content penalty, batch database lookup, date and unix timestamp support, none/corrupt score sorting resilience, cursor lifecycle, and graceful error fallback.
 
 ### Changed
 - Bumped canonical version to `1.0.9.4.1` across `VERSION`, `__init__.py`, `plugin.yaml`, `pyproject.toml`, `README.md`, `CHANGELOG.md`, `INSTALL.md`, and `skills/oracle-import/SKILL.md`.

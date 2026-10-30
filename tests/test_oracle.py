@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1829,6 +1829,61 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(result, rows)
         self.assertEqual(result[0]["score"], 0.8)
 
+    def test_apply_weights_none_score_and_edge_cases(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        # Row with None score, string score, non-dict item, tuple rows input
+        rows = (
+            {"memory_id": "m_none", "role": "fact", "content": "Fact with None score text longer than 25 chars", "score": None},
+            {"memory_id": "m_str", "role": "fact", "content": "Fact with str score text longer than 25 chars", "score": "0.75"},
+            {"memory_id": "m_bad", "role": "fact", "content": "Fact with bad score text longer than 25 chars", "score": "not_a_number"},
+            "non_dict_noise",
+            None,
+        )
+        weighted = provider._apply_weights(rows)
+        # Should not raise TypeError during sorting and should correctly parse valid rows
+        valid_weighted = [r for r in weighted if isinstance(r, dict)]
+        self.assertEqual(len(valid_weighted), 3)
+        self.assertEqual(valid_weighted[0]["memory_id"], "m_str")
+        self.assertAlmostEqual(valid_weighted[0]["score"], 0.75, places=2)
+        # None and invalid scores default to 0.0
+        self.assertEqual(valid_weighted[1]["score"], 0.0)
+        self.assertEqual(valid_weighted[2]["score"], 0.0)
+
+    def test_apply_weights_date_and_numeric_timestamp(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        now = datetime.now(timezone.utc)
+        # datetime.date object (not datetime)
+        old_date = (now - timedelta(days=200)).date()
+        # Unix epoch float timestamp
+        recent_ts = (now - timedelta(days=2)).timestamp()
+
+        rows = [
+            {"memory_id": "m_date", "role": "fact", "content": "Long enough content to not trigger short penalty", "score": 1.0, "created_at": old_date},
+            {"memory_id": "m_ts", "role": "fact", "content": "Long enough content to not trigger short penalty", "score": 1.0, "created_at": recent_ts},
+        ]
+        weighted = provider._apply_weights(rows)
+        self.assertEqual(weighted[0]["memory_id"], "m_ts")
+        self.assertEqual(weighted[1]["memory_id"], "m_date")
+        self.assertTrue(weighted[0]["score"] > weighted[1]["score"])
+        self.assertTrue(weighted[1]["score"] >= 0.85)
+
+    def test_apply_weights_cursor_and_conn_lifecycle(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_pool.acquire.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cur
+        provider._pool = mock_pool
+
+        mock_cur.__iter__.return_value = [("m1", datetime.now(timezone.utc))]
+        rows = [{"memory_id": "m1", "role": "fact", "content": "Long content string over 25 characters", "score": 0.9}]
+        provider._apply_weights(rows, cur=None)
+
+        mock_cur.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
     def test_junk_filter_excludes_skill_telemetry(self):
         provider = oracle_plugin.OracleMemoryProvider()
         self.assertIn("NVL(content_txt, 'x') NOT LIKE '[skill%'", provider._JUNK)
@@ -1895,7 +1950,7 @@ class TestOraclePlugin(unittest.TestCase):
                 release_notes = [f.name for f in repo_dir.glob("RELEASE_NOTES_*.md")]
                 sync_files = [
                     "__init__.py", "CHANGELOG.md", "VERSION", "plugin.yaml",
-                    "pyproject.toml", "README.md", "INSTALL.md", "AGENTS.md",
+                    "pyproject.toml", "README.md", "INSTALL.md", "AGENTS.md", "CLAUDE.md",
                 ] + release_notes
                 for f in sync_files:
                     if (repo_dir / f).exists():
@@ -1914,7 +1969,7 @@ class TestOraclePlugin(unittest.TestCase):
                 for root, dirs, files in os.walk(base):
                     dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
                     for f in files:
-                        if f.endswith((".pyc", ".lock")) or f == "CLAUDE.md":
+                        if f.endswith((".pyc", ".lock")):
                             continue
                         full_path = Path(root) / f
                         rel = full_path.relative_to(base)

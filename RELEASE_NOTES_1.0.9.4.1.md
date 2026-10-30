@@ -10,13 +10,15 @@
 - **Role Prioritization Multipliers**: Evaluates candidate role types (`fact: 1.0`, `user: 0.9`, `session: 0.9`, `turn: 0.75`, `assistant: 0.75`).
 - **Telemetry Dampening & Noise Filtering**: Penalizes lifecycle logging (`[skill_usage]`, `[skill_vectorization*]`) with a 0.05 multiplier and eliminates telemetry records from search candidate pools via `_JUNK` filter (`AND NVL(content_txt, 'x') NOT LIKE '[skill%'`).
 - **Short Content Adjustment**: Applies a 0.9 factor to low-information content under 25 characters.
-- **Resilient Batch PK Lookup**: Resolves `created_at` timestamps for candidate items in chunked queries of 500 IDs, falling back cleanly to unweighted scores on any database exception.
+- **Resilient Batch PK Lookup**: Resolves `created_at` timestamps for candidate items in chunked queries of 500 IDs, falling back cleanly to unweighted scores on any database exception. Hardened cursor lifecycle handling to prevent connection pool leaks and extended support across `datetime.datetime`, `datetime.date`, unix timestamps, and ISO strings.
+- **Defensive Ranking Resilience**: Guards sorting against `NoneType` and invalid score values, non-dict records, and tuple input collections.
 
 #### 🛡️ Test Harness Hardening
 - **Zero Drift Protection in In-Place Runs**: `tests/test_oracle.py` now guards against `repo_dir.resolve() == plugin_dir.resolve()`, preventing `shutil.SameFileError` when running directly inside `~/.hermes/plugins/oracle`.
+- **Complete Profile Synchronization**: Hardened automated zero drift file sync across canonical repository, installed plugin, and `edgebot` profile to ensure zero omissions (including `CLAUDE.md`).
 
 #### 🧪 Expanded Test Coverage
-- **Retrieval Weighting Unit Tests**: Validates recency decay curves, role multipliers, telemetry penalties, short content adjustments, batch timestamp lookups, and exception fallback behaviors.
+- **Retrieval Weighting Unit Tests**: Validates recency decay curves, role multipliers, telemetry penalties, short content adjustments, batch timestamp lookups, date and epoch timestamp parsing, none/invalid score sorting resilience, cursor lifecycle cleanup, and exception fallback behaviors.
 
 #### 🔄 Complete Zero-Drift Synchronization
 - **Zero Drift Enforcement**: 100% byte-for-byte synchronization across the canonical repository, `~/.hermes/plugins/oracle`, and all bot profile environments (`edgebot`, `qoam-recon`, `qoam-backend`, `qoam-release`, `qoam-safeguard`, `qoam-ui`, `qoam-watcher`, `qoam-orchestrator`).

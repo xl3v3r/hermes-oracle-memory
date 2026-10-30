@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
@@ -1752,9 +1752,12 @@ class OracleMemoryProvider(MemoryProvider):
         if not rows:
             return rows
 
+        if not isinstance(rows, list):
+            rows = list(rows)
+
         created_map: dict[str, Any] = {}
         try:
-            mids = [r["memory_id"] for r in rows if r.get("memory_id")]
+            mids = [str(r["memory_id"]) for r in rows if isinstance(r, dict) and r.get("memory_id")]
             if mids:
                 target_cur = cur
                 conn = None
@@ -1775,6 +1778,11 @@ class OracleMemoryProvider(MemoryProvider):
                                     created_map[str(r_row[0])] = r_row[1]
                 finally:
                     if conn is not None:
+                        if target_cur is not None:
+                            try:
+                                target_cur.close()
+                            except Exception:
+                                pass
                         try:
                             conn.close()
                         except Exception:
@@ -1786,7 +1794,12 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             now = datetime.now(timezone.utc)
             for r in rows:
-                base_score = float(r.get("score") if r.get("score") is not None else 0.0)
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    base_score = float(r.get("score")) if r.get("score") is not None else 0.0
+                except (ValueError, TypeError):
+                    base_score = 0.0
                 mid = r.get("memory_id")
                 role = str(r.get("role") or "fact").strip().lower()
                 content = str(r.get("content") or "")
@@ -1794,13 +1807,30 @@ class OracleMemoryProvider(MemoryProvider):
 
                 # 1. Recency multiplier: 0.85 + 0.15 * e^(-age_days / 120) -> range [0.85, 1.00]
                 recency_mult = 1.0
-                dt = created_map.get(mid) or r.get("created_at")
+                dt = (
+                    created_map.get(str(mid))
+                    if mid is not None
+                    else None
+                ) or (
+                    created_map.get(mid)
+                    if mid is not None
+                    else None
+                ) or r.get("created_at")
+
                 if dt is not None:
                     if isinstance(dt, str):
                         try:
                             dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
                         except Exception:
                             dt = None
+                    elif isinstance(dt, (int, float)):
+                        try:
+                            dt = datetime.fromtimestamp(dt, tz=timezone.utc)
+                        except Exception:
+                            dt = None
+                    elif isinstance(dt, date) and not isinstance(dt, datetime):
+                        dt = datetime.combine(dt, datetime.min.time(), tzinfo=timezone.utc)
+
                     if isinstance(dt, datetime):
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=timezone.utc)
@@ -1815,7 +1845,7 @@ class OracleMemoryProvider(MemoryProvider):
 
                 # 3. Telemetry multiplier
                 telemetry_mult = 1.0
-                if any(stripped_content.startswith(p) for p in _TELEMETRY_PREFIXES):
+                if any(stripped_content.startswith(p) or stripped_content.lower().startswith(p.lower()) for p in _TELEMETRY_PREFIXES):
                     telemetry_mult = _WEIGHT_TELEMETRY
 
                 # 4. Short content multiplier (< 25 chars)
@@ -1825,7 +1855,10 @@ class OracleMemoryProvider(MemoryProvider):
 
                 r["score"] = round(base_score * recency_mult * role_mult * telemetry_mult * short_mult, 4)
 
-            rows.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            rows.sort(
+                key=lambda x: (x.get("score") if isinstance(x, dict) and x.get("score") is not None else 0.0),
+                reverse=True,
+            )
             return rows
         except Exception as e:
             logger.debug("weight calculation failed in _apply_weights: %s", e)
