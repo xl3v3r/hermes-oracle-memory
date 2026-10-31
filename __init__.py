@@ -1495,6 +1495,10 @@ class OracleMemoryProvider(MemoryProvider):
                 if dist is not None
                 else min(1.0, txt / 100.0)
             )
+
+            # Extract created_at if it was included in the projection
+            created_at = row[8] if len(row) > 8 else None
+
             out.append(
                 {
                     "memory_id": row[0],
@@ -1505,6 +1509,7 @@ class OracleMemoryProvider(MemoryProvider):
                     "target": row[5],
                     "score": round(score, 4),
                     "dist": dist,
+                    "created_at": created_at,
                 }
             )
         return out
@@ -1523,7 +1528,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         sql = f"""
             SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                   SCORE(1) AS txt_score, NULL AS distance
+                   SCORE(1) AS txt_score, NULL AS distance, created_at
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
             {self._JUNK}{tgt_sql}{extra_filters}
@@ -1547,7 +1552,7 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance, created_at
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -1559,7 +1564,7 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
+                       VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance, created_at
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -1588,11 +1593,11 @@ class OracleMemoryProvider(MemoryProvider):
         if use_onnx and self._onnx_model:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance, created_at
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -1601,10 +1606,10 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance
+                           SCORE(1) AS txt_score, NULL AS distance, created_at
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -1620,11 +1625,11 @@ class OracleMemoryProvider(MemoryProvider):
         else:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
+                           VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance, created_at
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -1633,10 +1638,10 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance
+                           SCORE(1) AS txt_score, NULL AS distance, created_at
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
