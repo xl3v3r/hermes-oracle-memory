@@ -273,6 +273,28 @@ class TestProviderIntegration(unittest.TestCase):
         self.assertEqual(res["indexed"], 5)
         mock_sync.assert_called_once()
 
+    def test_provider_sync_skills_fallback_loader(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        provider._insert_many = MagicMock()
+        with tempfile.TemporaryDirectory() as td:
+            skill_dir = Path(td) / "test-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: fallback-test\ndescription: Test fallback loader\n---\nBody",
+                encoding="utf-8",
+            )
+            orig_import = __import__
+            def mock_import(name, *args, **kwargs):
+                if "scripts" in name:
+                    raise ImportError("No module named scripts")
+                return orig_import(name, *args, **kwargs)
+
+            with patch("builtins.__import__", side_effect=mock_import):
+                res = provider.sync_skills(mode="meta", dirs=[td])
+                self.assertEqual(res["status"], "success")
+                self.assertEqual(res["scanned"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
