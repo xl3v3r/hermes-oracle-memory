@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.9.4.2] - 2026-10-31
+
+### Fixed & Fortified
+- **Skill Ingest Retrieval Visibility (Defect 1)**:
+  - Replaced over-greedy `[skill%` SQL filter with single-source `_telemetry_sql()` generator derived from `_TELEMETRY_PREFIXES`.
+  - Accurately filters only lifecycle telemetry (`[skill\_usage]%`, `[skill\_vectorization%`) with SQL LIKE wildcard escaping, unblocking full candidate recall of `[skill_ingest]` indexed skills across hybrid, vector, and text search modes.
+- **In-Process Skill Sync Dataclass Introspection (Defect 2)**:
+  - Extracted `_load_module_from_path` helper ensuring dynamic module imports register the module object in `sys.modules` prior to bytecode execution.
+  - Eliminates CPython `@dataclass` introspection failure (`'NoneType' object has no attribute '__dict__'`) when calling `oracle_sync_skills` in-process.
+- **Generic Profile Synchronization & Zero-Drift**:
+  - Dynamically discovers all Hermes Agent profile plugin directories under `Path.home() / ".hermes" / "profiles"` without hardcoding specific profile names.
+  - Generically syncs files to profile directories and validates profile symlinks against `~/.hermes/plugins/oracle`.
+  - Automatically purges obsolete historical release notes from sync destinations.
+
+### Added
+- Unit tests verifying `_telemetry_sql` wildcard escaping and telemetry-only exclusion in `tests/test_oracle.py`.
+- Regression test for `_load_module_from_path` validating CPython dataclass resolution in `tests/test_plugin.py`.
+
+### Changed
+- Bumped canonical version to `1.0.9.4.2` across `VERSION`, `__init__.py`, `plugin.yaml`, `pyproject.toml`, `README.md`, `CHANGELOG.md`, `INSTALL.md`, and `skills/oracle-import/SKILL.md`.
+- Enforced 100% zero drift between `/home/rocky/build/hermes-oracle-memory`, `~/.hermes/plugins/oracle`, and all generic profile plugin directories.
+- Purged previous version release notes (`RELEASE_NOTES_1.0.9.3.2.md`, `RELEASE_NOTES_1.0.9.4.md`, `RELEASE_NOTES_1.0.9.4.1.md`) per single-release documentation policy.
+
 ## [1.0.9.4.1] - 2026-10-30
 
 ### Fixed & Fortified
@@ -9,17 +32,17 @@ All notable changes to this project are documented in this file.
   - Implemented dynamic post-retrieval weighting (`_apply_weights`) incorporating exponential recency decay (`0.85 + 0.15 * exp(-age_days / 120)`), role weighting (`fact: 1.0`, `user: 0.9`, `session: 0.9`, `turn: 0.75`, `assistant: 0.75`), telemetry dampening (`0.05` for `[skill_usage]`, `[skill_vectorization*]`), and short content penalty (`< 25 chars -> 0.9`).
   - Added candidate `created_at` batch PK resolution chunked at 500 records with clean unweighted fallback on database errors, robust cursor lifecycle management on pool connection acquisition, and flexible support for `datetime.date`, ISO strings, and unix epoch timestamps.
   - Hardened sorting against `NoneType` and invalid scores, non-dict elements, and tuple input collections.
-  - Hardened `_JUNK` filter across text, vector, and hybrid SQL query builders with `AND NVL(content_txt, 'x') NOT LIKE '[skill%'` to keep lifecycle telemetry out of retrieval candidate sets.
+  - Hardened `_JUNK` filter across text, vector, and hybrid SQL query builders with telemetry filter to keep lifecycle telemetry out of retrieval candidate sets.
 - **Test Harness Robustness**:
   - Guarded `test_zero_drift_with_installed_plugin` against `repo_dir.resolve() == plugin_dir.resolve()` to prevent `shutil.SameFileError` when tests run directly from the installed plugin directory.
-  - Hardened file synchronization across repository, installed plugin, and `edgebot` profile environments to track and sync all files including `CLAUDE.md`.
+  - Hardened file synchronization across repository, installed plugin, and profile environments to track and sync all files including `CLAUDE.md`.
 
 ### Added
 - Comprehensive unit tests in `tests/test_oracle.py` verifying recency decay, role weighting, telemetry penalty, short content penalty, batch database lookup, date and unix timestamp support, none/corrupt score sorting resilience, cursor lifecycle, and graceful error fallback.
 
 ### Changed
 - Bumped canonical version to `1.0.9.4.1` across `VERSION`, `__init__.py`, `plugin.yaml`, `pyproject.toml`, `README.md`, `CHANGELOG.md`, `INSTALL.md`, and `skills/oracle-import/SKILL.md`.
-- Enforced 100% zero drift between `/home/rocky/build/hermes-oracle-memory`, `~/.hermes/plugins/oracle`, and all bot profile environments (`edgebot`, `qoam-*`).
+- Enforced 100% zero drift between `/home/rocky/build/hermes-oracle-memory`, `~/.hermes/plugins/oracle`, and all profile environments.
 
 ## [1.0.9.4] - 2026-10-30
 
@@ -40,7 +63,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 - Bumped version to `1.0.9.4` across `__init__.py`, `VERSION`, `plugin.yaml`, `pyproject.toml`, `skills/oracle-import/SKILL.md`, `README.md`, `INSTALL.md`, and test suites.
-- Enforced 100% zero drift across repository, installed plugin (`~/.hermes/plugins/oracle`), and all bot profile environments (`edgebot`, `qoam-*`).
+- Enforced 100% zero drift across repository, installed plugin (`~/.hermes/plugins/oracle`), and all profile environments.
 - Replaced previous release notes with `RELEASE_NOTES_1.0.9.4.md` per release documentation policy.
 
 ## [1.0.9.3.2] - 2026-10-29

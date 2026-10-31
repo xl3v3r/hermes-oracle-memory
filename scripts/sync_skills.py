@@ -585,7 +585,7 @@ def sync_skills_library(
     force: bool = False,
     dirs: list[str | Path] | None = None,
     dry_run: bool = False,
-    batch_size: int = 50,
+    batch_size: int = 20,
 ) -> dict[str, Any]:
     """Synchronize discovered skills into Oracle memory database."""
     skills = discover_skills(dirs=dirs)

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import array
 import html
+import importlib.util
 import json
 import logging
 import math
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import uuid
@@ -29,7 +31,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.9.4.1"
+__version__ = "1.0.9.4.2"
 
 _PREFETCH_WAIT_SECS = 0.5
 _EMBED_DIM = 768
@@ -57,6 +59,25 @@ _WEIGHT_TELEMETRY = float(os.environ.get("HERMES_ORACLE_TELEMETRY_WEIGHT", "0.05
 _WEIGHT_SHORT_CHARS = 25
 _WEIGHT_SHORT_FACTOR = 0.9
 _TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
+
+
+def _telemetry_sql(col: str = "NVL(content_txt, 'x')") -> str:
+    """SQL fragment excluding lifecycle telemetry rows only.
+
+    Derived from _TELEMETRY_PREFIXES so the SQL filter and the in-Python
+    weighting pass (see _apply_weights) can never drift apart.
+    """
+    clauses = []
+    for prefix in _TELEMETRY_PREFIXES:
+        esc = (
+            prefix.replace("\\", "\\\\")
+            .replace("_", "\\_")
+            .replace("%", "\\%")
+        )
+        clauses.append(f" AND {col} NOT LIKE '{esc}%' ESCAPE '\\'")
+    return "".join(clauses)
+
+
 _EXTERNAL_EMBED_KILLSWITCH = (
     os.environ.get("HERMES_ORACLE_DISABLE_EXTERNAL_EMBED", "").strip().lower()
     in ("1", "true", "yes")
@@ -296,6 +317,25 @@ def _extract_turn_text(msg: Any) -> str:
         if parts:
             return "\n\n".join(parts)
     return ""
+
+
+def _load_module_from_path(name: str, path: Path):
+    """Import a .py file by path, registering it in sys.modules first.
+
+    dataclasses/pickle resolve cls.__module__ through sys.modules, so the
+    module must be registered *before* exec_module() runs.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return mod
 
 
 class OracleMemoryProvider(MemoryProvider):
@@ -1395,9 +1435,9 @@ class OracleMemoryProvider(MemoryProvider):
         " AND memory_id NOT LIKE 'test_%'"
         " AND NVL(session_id, 'x') <> 'diagnostic-session-001'"
         " AND NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session') "
-        # lifecycle telemetry ([skill_usage], [skill_vectorization_*]) is stored as
-        # role='fact' but is bookkeeping, not memory — keep it out of candidates.
-        " AND NVL(content_txt, 'x') NOT LIKE '[skill%' "
+        # lifecycle telemetry only ([skill_usage], [skill_vectorization_*]).
+        # MUST NOT match skill_ingest rows — those are the skill index.
+        + _telemetry_sql()
     )
 
     @staticmethod
@@ -2731,16 +2771,11 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             from scripts.sync_skills import sync_skills_library
         except ImportError:
-            import importlib.util
-
             scripts_path = Path(__file__).resolve().parent / "scripts" / "sync_skills.py"
-            if scripts_path.exists():
-                spec = importlib.util.spec_from_file_location("sync_skills", scripts_path)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                sync_skills_library = mod.sync_skills_library
-            else:
+            if not scripts_path.exists():
                 raise ImportError(f"Cannot find sync_skills script at {scripts_path}")
+            mod = _load_module_from_path("hermes_oracle_sync_skills", scripts_path)
+            sync_skills_library = mod.sync_skills_library
         return sync_skills_library(provider=self, mode=mode, force=force, dirs=dirs, dry_run=False)
 
     def shutdown(self) -> None:

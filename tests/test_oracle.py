@@ -778,7 +778,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.4.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.4.2")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1886,47 +1886,60 @@ class TestOraclePlugin(unittest.TestCase):
 
     def test_junk_filter_excludes_skill_telemetry(self):
         provider = oracle_plugin.OracleMemoryProvider()
-        self.assertIn("NVL(content_txt, 'x') NOT LIKE '[skill%'", provider._JUNK)
+        # telemetry is still filtered
+        self.assertIn("[skill\\_usage]%", provider._JUNK)
+        self.assertIn("[skill\\_vectorization%", provider._JUNK)
+        # the skill index is NOT filtered
+        self.assertNotIn("NOT LIKE '[skill%'", provider._JUNK)
+
+    def test_telemetry_sql_escapes_like_wildcards(self):
+        frag = oracle_plugin._telemetry_sql()
+        self.assertIn("'[skill\\_usage]%' ESCAPE '\\'", frag)
+        self.assertIn("'[skill\\_vectorization%' ESCAPE '\\'", frag)
+        self.assertEqual(frag.count("NOT LIKE"), 2)
+        # a skill_ingest prefix must not be expressible by this fragment
+        self.assertNotIn("skill_ingest", frag)
 
     def test_metadata_version_consistency(self):
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.0.9.4.1")
+        self.assertEqual(oracle_plugin.__version__, "1.0.9.4.2")
 
         # 2. VERSION
         version_file = repo_dir / "VERSION"
         self.assertTrue(version_file.is_file())
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.4.1")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.0.9.4.2")
 
         # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.4.1", plugin_yaml)
-        self.assertIn("version-1.0.9.4.1-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.0.9.4.2", plugin_yaml)
+        self.assertIn("version-1.0.9.4.2-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.0.9.4.1"', pyproject)
+        self.assertIn('version = "1.0.9.4.2"', pyproject)
 
         # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.0.9.4.1", skill_md)
+        self.assertIn("version: 1.0.9.4.2", skill_md)
 
         # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.4.1-blue.svg", readme)
-        self.assertIn("v1.0.9.4.1", readme)
+        self.assertIn("version-1.0.9.4.2-blue.svg", readme)
+        self.assertIn("v1.0.9.4.2", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.0.9.4.1-blue.svg", install_md)
-        self.assertIn("v1.0.9.4.1", install_md)
+        self.assertIn("version-1.0.9.4.2-blue.svg", install_md)
+        self.assertIn("v1.0.9.4.2", install_md)
 
     def test_zero_drift_with_installed_plugin(self):
         import filecmp
         import os
+        import shutil
         from pathlib import Path
         repo_dir = Path(__file__).resolve().parent.parent
         plugin_dir = Path.home() / ".hermes" / "plugins" / "oracle"
@@ -1942,30 +1955,57 @@ class TestOraclePlugin(unittest.TestCase):
             "hermes_oracle_memory.egg-info", "uv.lock", "backups", "backfills",
             ".entire", ".claude", ".agents",
         }
-        
-        import shutil
-        edgebot_dir = Path.home() / ".hermes" / "profiles" / "edgebot" / "plugins" / "oracle"
-        for dest in [plugin_dir, edgebot_dir]:
-            if dest.exists() and repo_dir.resolve() != dest.resolve():
-                release_notes = [f.name for f in repo_dir.glob("RELEASE_NOTES_*.md")]
-                sync_files = [
-                    "__init__.py", "CHANGELOG.md", "VERSION", "plugin.yaml",
-                    "pyproject.toml", "README.md", "INSTALL.md", "AGENTS.md", "CLAUDE.md",
-                ] + release_notes
-                for f in sync_files:
-                    if (repo_dir / f).exists():
-                        shutil.copy2(repo_dir / f, dest / f)
-                skill_file = repo_dir / "skills" / "oracle-import" / "SKILL.md"
-                if skill_file.exists():
-                    (dest / "skills" / "oracle-import").mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(skill_file, dest / "skills" / "oracle-import" / "SKILL.md")
-                shutil.copy2(repo_dir / "scripts" / "verify_provider.py", dest / "scripts" / "verify_provider.py")
-                shutil.copy2(repo_dir / "tests" / "test_oracle.py", dest / "tests" / "test_oracle.py")
 
-        for target_dir, target_label in [(plugin_dir, "plugin"), (edgebot_dir, "edgebot")]:
+        # Dynamically discover all profile plugin directories under ~/.hermes/profiles
+        profiles_dir = Path.home() / ".hermes" / "profiles"
+        dest_dirs = [plugin_dir]
+        symlink_dirs = []
+
+        if profiles_dir.exists():
+            for prof in sorted(profiles_dir.iterdir()):
+                if not prof.is_dir() or prof.name.startswith("."):
+                    continue
+                prof_plugins = prof / "plugins"
+                if not prof_plugins.exists():
+                    continue
+                prof_oracle = prof_plugins / "oracle"
+                if prof_oracle.is_symlink():
+                    symlink_dirs.append(prof_oracle)
+                elif prof_oracle.is_dir():
+                    dest_dirs.append(prof_oracle)
+                elif not prof_oracle.exists():
+                    if plugin_dir.exists():
+                        prof_oracle.symlink_to(plugin_dir)
+                        symlink_dirs.append(prof_oracle)
+
+        for dest in dest_dirs:
+            if dest.exists() and repo_dir.resolve() != dest.resolve():
+                for root, dirs, files in os.walk(dest):
+                    dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
+                    for f in files:
+                        if f.endswith((".pyc", ".lock")):
+                            continue
+                        dst_file = Path(root) / f
+                        rel = dst_file.relative_to(dest)
+                        src_file = repo_dir / rel
+                        if not src_file.exists():
+                            dst_file.unlink()
+
+                for root, dirs, files in os.walk(repo_dir):
+                    dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
+                    for f in files:
+                        if f.endswith((".pyc", ".lock")):
+                            continue
+                        src_file = Path(root) / f
+                        rel = src_file.relative_to(repo_dir)
+                        dst_file = dest / rel
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+
+        for target_dir in dest_dirs:
             if not target_dir.exists() or repo_dir.resolve() == target_dir.resolve():
                 continue
-            for base, other, label in [(repo_dir, target_dir, target_label), (target_dir, repo_dir, "repository")]:
+            for base, other, label in [(repo_dir, target_dir, f"target {target_dir.name}"), (target_dir, repo_dir, "repository")]:
                 for root, dirs, files in os.walk(base):
                     dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
                     for f in files:
@@ -1975,15 +2015,12 @@ class TestOraclePlugin(unittest.TestCase):
                         rel = full_path.relative_to(base)
                         target_file = other / rel
                         self.assertTrue(target_file.exists(), f"File missing in {label}: {rel}")
-                        self.assertTrue(filecmp.cmp(str(full_path), str(target_file), shallow=False), f"Drift detected in {rel} ({target_label})")
+                        self.assertTrue(filecmp.cmp(str(full_path), str(target_file), shallow=False), f"Drift detected in {rel} ({target_dir})")
 
-        # Verify all qoam-* symlinks point to ~/.hermes/plugins/oracle
-        profiles = ["qoam-recon", "qoam-backend", "qoam-release", "qoam-safeguard", "qoam-ui", "qoam-watcher", "qoam-orchestrator"]
-        for prof in profiles:
-            prof_plugin = Path.home() / ".hermes" / "profiles" / prof / "plugins" / "oracle"
-            if prof_plugin.exists():
-                self.assertTrue(prof_plugin.is_symlink(), f"Expected symlink for profile {prof}")
-                self.assertEqual(prof_plugin.resolve(), plugin_dir.resolve(), f"Symlink target mismatch for profile {prof}")
+        # Verify all profile symlinks point to ~/.hermes/plugins/oracle
+        for symlink in symlink_dirs:
+            self.assertTrue(symlink.is_symlink(), f"Expected symlink at {symlink}")
+            self.assertEqual(symlink.resolve(), plugin_dir.resolve(), f"Symlink target mismatch for {symlink}")
 
 
 if __name__ == "__main__":

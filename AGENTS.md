@@ -22,9 +22,9 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ├── LICENSE                 # Business Source License 1.1
 ├── MANIFEST.in             # Source distribution manifest
 ├── README.md               # Project documentation and usage guide
-├── CHANGELOG.md            # Release changelog (v1.0.9.4.1)
-├── RELEASE_NOTES_1.0.9.4.1.md # Release notes for v1.0.9.4.1
-├── VERSION                 # Canonical project version file (1.0.9.4.1)
+├── CHANGELOG.md            # Release changelog (v1.0.9.4.2)
+├── RELEASE_NOTES_1.0.9.4.2.md # Release notes for v1.0.9.4.2
+├── VERSION                 # Canonical project version file (1.0.9.4.2)
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration

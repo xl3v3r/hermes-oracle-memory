@@ -211,6 +211,28 @@ class TestSkillLifecycleHook(unittest.TestCase):
             self.assertEqual(kwargs["session_id"], "provider-session-default")
             self.assertIn("[session:provider-session-default]", kwargs["content"])
 
+    def test_load_module_from_path_handles_dataclasses(self):
+        import tempfile, textwrap
+        from pathlib import Path
+        src = textwrap.dedent(
+            '''
+            from dataclasses import dataclass
+
+            @dataclass
+            class Thing:
+                name: str
+
+            def ping():
+                return Thing("ok")
+            '''
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "probe_mod.py"
+            p.write_text(src, encoding="utf-8")
+            mod = oracle_plugin._load_module_from_path("probe_mod", p)
+            self.assertEqual(mod.ping().name, "ok")
+            self.assertIn("probe_mod", sys.modules)
+
 
 if __name__ == '__main__':
     unittest.main()

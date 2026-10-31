@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.0.9.4.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9.4.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: v1.0.9.4.1 updates are CRITICAL to functionality. Recency & fact-prioritized search ranking with exponential decay, telemetry filtering, fortified ONNX insert path (`ORA-51815` transient snapshot retry, `ORA-54401` conservative token clamp retry, background backfill queueing on null fallback), canonical root `VERSION` file, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
+> **CRITICALITY NOTICE**: v1.0.9.4.2 updates are CRITICAL to functionality. Skill-path remediation (single-source telemetry SQL filter unblocking skill_ingest recall, isolated dataclass module loader for in-process oracle_sync_skills), generic multi-profile synchronization, and zero drift across repository, installed plugin, and all Hermes Agent profile environments.
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
