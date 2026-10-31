@@ -27,5 +27,5 @@ jobs:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/${{ github.repository }}/blob/master/CLA.md'
           branch: 'master'
-          allowlist: 'bot*,*bot,google-labs-jules[bot],dependabot[bot]'
+          allowlist: 'bot*,*bot,dependabot[bot],google-labs-jules*'
           custom-notsigned-prcomment: 'Thank you for your pull request! Before we can accept your contribution, please read and agree to our [Contributor License Agreement](https://github.com/${{ github.repository }}/blob/master/CLA.md). You can sign it by commenting: <br><br><code>I have read the CLA Document and I hereby sign the CLA</code>'
