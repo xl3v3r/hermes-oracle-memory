@@ -1,0 +1,3 @@
+## 2024-11-07 - Eliminate N+1 connection pool acquisition and DB query in _apply_weights
+**Learning:** The previous implementation of `_apply_weights` executed a secondary DB query to fetch the `created_at` timestamp for each retrieved memory, which can be inefficient as it involves creating a new connection/cursor during the retrieval/ranking stage. This resulted in an N+1 problem on the backend when retrieving facts for weighting.
+**Action:** When working on retrieval stages that need additional metadata for ranking, project the required fields (like `created_at`) directly in the initial `SELECT` statements of the search queries to avoid secondary queries during ranking.
