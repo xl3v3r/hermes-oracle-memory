@@ -278,7 +278,7 @@ class TestOraclePlugin(unittest.TestCase):
         # Simulate Oracle Text error on hybrid query, but success on pure vector fallback
         hybrid_err = Exception("ORA-29902: error in executing ODCIIndexStart() routine (DRG-50901: text query parser syntax error)")
         vector_fallback_rows = [
-            ("m1", "s1", "a1", "user", "vector fallback content", "memory", 0.0, 0.2)
+            ("m1", "s1", "a1", "user", "vector fallback content", "memory", None, 0.0, 0.2)
         ]
         mock_cur.execute.side_effect = [hybrid_err, None]
         mock_cur.fetchall.return_value = vector_fallback_rows
@@ -327,7 +327,7 @@ class TestOraclePlugin(unittest.TestCase):
                 None,
             ]
             mock_cur.fetchall.return_value = [
-                ("m2", "s1", "a1", "user", "recovered", "memory", 0.0, 0.1)
+                ("m2", "s1", "a1", "user", "recovered", "memory", None, 0.0, 0.1)
             ]
 
             provider._onnx_mark_failed = MagicMock()
@@ -431,10 +431,10 @@ class TestOraclePlugin(unittest.TestCase):
         mock_cur.prefetchrows = 64
 
         mock_cur.fetchall.return_value = [
-            ("m_hybrid", "s1", "a1", "fact", "some hybrid content", "memory", 0.0, 0.2),
-            ("m_hybrid", "s1", "a1", "fact", "some hybrid content", "memory", 100.0, None),
-            ("m_text_only", "s1", "a1", "fact", "unrelated content mentioning query", "memory", 100.0, None),
-            ("m_prefix", "s1", "a1", "fact", "# HANDOFF project status", "memory", 0.0, 0.2),
+            ("m_hybrid", "s1", "a1", "fact", "some hybrid content", "memory", None, 0.0, 0.2),
+            ("m_hybrid", "s1", "a1", "fact", "some hybrid content", "memory", None, 100.0, None),
+            ("m_text_only", "s1", "a1", "fact", "unrelated content mentioning query", "memory", None, 100.0, None),
+            ("m_prefix", "s1", "a1", "fact", "# HANDOFF project status", "memory", None, 0.0, 0.2),
         ]
 
         results = provider._execute_hybrid_search(
@@ -468,8 +468,8 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
 
         mock_cur.fetchall.return_value = [
-            ("m_other", "s1", "a1", "fact", "other content with HANDOFF inside", "memory", 50.0, None),
-            ("m_prefix", "s1", "a1", "fact", "**HANDOFF**: details here", "memory", 50.0, None),
+            ("m_other", "s1", "a1", "fact", "other content with HANDOFF inside", "memory", None, 50.0, None),
+            ("m_prefix", "s1", "a1", "fact", "**HANDOFF**: details here", "memory", None, 50.0, None),
         ]
 
         results = provider._search("HANDOFF", top_k=5, mode="text")
@@ -490,8 +490,8 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
 
         mock_cur.fetchall.return_value = [
-            ("m_other", "s1", "a1", "fact", "other content with HANDOFF inside", "memory", 0.0, 0.4),
-            ("m_prefix", "s1", "a1", "fact", "**HANDOFF**: details here", "memory", 0.0, 0.4),
+            ("m_other", "s1", "a1", "fact", "other content with HANDOFF inside", "memory", None, 0.0, 0.4),
+            ("m_prefix", "s1", "a1", "fact", "**HANDOFF**: details here", "memory", None, 0.0, 0.4),
         ]
 
         results = provider._search("HANDOFF", top_k=5, mode="vector")
@@ -545,9 +545,9 @@ class TestOraclePlugin(unittest.TestCase):
         cursor.arraysize = 1
         # row: memory_id, session_id, agent_id, role, content, target, txt_score, distance
         cursor.fetchall.return_value = [
-            ("m1", "s1", "a1", "user", FakeLob(), "memory", 10.0, 0.25),
-            ("m2", "s2", "a2", "assistant", "already str", "user", 20.0, None),
-            ("m3", "s3", "a3", "user", None, "memory", 0.0, 0.9),
+            ("m1", "s1", "a1", "user", FakeLob(), "memory", None, 10.0, 0.25),
+            ("m2", "s2", "a2", "assistant", "already str", "user", None, 20.0, None),
+            ("m3", "s3", "a3", "user", None, "memory", None, 0.0, 0.9),
         ]
 
         rows = provider._fetch_rows(cursor, "SELECT 1", {"k": 8})
@@ -1226,7 +1226,7 @@ class TestOraclePlugin(unittest.TestCase):
         mock_cur.arraysize = 64
         mock_cur.prefetchrows = 64
         mock_cur.fetchall.return_value = [
-            ("m_cool", "s1", "a1", "user", "cooldown text fallback content", "memory", 5.0, None)
+            ("m_cool", "s1", "a1", "user", "cooldown text fallback content", "memory", None, 5.0, None)
         ]
 
         results = provider._execute_hybrid_search(
@@ -2101,8 +2101,8 @@ class TestOraclePlugin(unittest.TestCase):
             ("m_new", now - timedelta(days=2)),
         ]
         rows = [
-            {"memory_id": "m_old", "role": "fact", "content": "Detailed long content text for older memory", "score": 0.8},
-            {"memory_id": "m_new", "role": "fact", "content": "Detailed long content text for newer memory", "score": 0.8},
+            {"memory_id": "m_old", "role": "fact", "content": "Detailed long content text for older memory", "score": 0.8, "created_at": now - timedelta(days=150)},
+            {"memory_id": "m_new", "role": "fact", "content": "Detailed long content text for newer memory", "score": 0.8, "created_at": now - timedelta(days=2)},
         ]
         weighted = provider._apply_weights(rows, cur=mock_cur)
         self.assertEqual(weighted[0]["memory_id"], "m_new")
@@ -2114,11 +2114,11 @@ class TestOraclePlugin(unittest.TestCase):
         mock_cur = MagicMock()
         mock_cur.execute.side_effect = Exception("DB error during created_at lookup")
         rows = [
-            {"memory_id": "m1", "role": "fact", "content": "Normal memory content", "score": 0.8},
+            {"memory_id": "m1", "role": "fact", "content": "Normal memory content", "score": 0.8, "created_at": datetime.now(timezone.utc)},
         ]
         result = provider._apply_weights(rows, cur=mock_cur)
         self.assertEqual(result, rows)
-        self.assertEqual(result[0]["score"], 0.8)
+        self.assertAlmostEqual(result[0]["score"], 0.72, places=2)
 
     def test_apply_weights_none_score_and_edge_cases(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2157,23 +2157,6 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(weighted[1]["memory_id"], "m_date")
         self.assertTrue(weighted[0]["score"] > weighted[1]["score"])
         self.assertTrue(weighted[1]["score"] >= 0.85)
-
-    def test_apply_weights_cursor_and_conn_lifecycle(self):
-        provider = oracle_plugin.OracleMemoryProvider()
-        provider._table = "HERMES_AGENT_MEMORY"
-        mock_pool = MagicMock()
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_pool.acquire.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cur
-        provider._pool = mock_pool
-
-        mock_cur.__iter__.return_value = [("m1", datetime.now(timezone.utc))]
-        rows = [{"memory_id": "m1", "role": "fact", "content": "Long content string over 25 characters", "score": 0.9}]
-        provider._apply_weights(rows, cur=None)
-
-        mock_cur.close.assert_called_once()
-        mock_conn.close.assert_called_once()
 
     def test_junk_filter_excludes_skill_telemetry(self):
         provider = oracle_plugin.OracleMemoryProvider()
