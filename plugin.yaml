@@ -1,5 +1,5 @@
 name: oracle
-version: 1.1.1
+version: 1.1.1.2
 description: "Oracle AI Database 26ai — VECTOR IVF, Oracle Text, fused hybrid recall, shared cross-server skill corpus, live lifecycle ingest, zombie-safe sync."
 provides_hooks:
   - on_skill_lifecycle
@@ -7,5 +7,5 @@ pip_dependencies:
   - oracledb>=4.0.2
 
 # Badges & Criticality Notice
-# [![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
+# [![Version](https://img.shields.io/badge/version-1.1.1.2-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
 # CRITICALITY NOTICE: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.

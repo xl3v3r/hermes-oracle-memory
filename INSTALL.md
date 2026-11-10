@@ -1,11 +1,11 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
 
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1.2) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 
@@ -132,7 +132,7 @@ Configure your database connection, wallet path, and fallback embedding provider
 # =============================================================================
 OCI_DB_USER="<your-db-user>"
 OCI_DB_PASSWORD="<your-db-password>"
-OCI_DB_DSN="(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1521)(HOST=adb.<your-region>.oraclecloud.com))(CONNECT_DATA=(SERVICE_NAME=<service-name>))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
+OCI_DB_DSN="(DESCRIPTION=(RETRY_COUNT=20)(RETRY_DELAY=3)(ADDRESS=(PROTOCOL=tcps)(PORT=1522)(HOST=adb.<your-region>.oraclecloud.com))(CONNECT_DATA=(SERVICE_NAME=<service-name>))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
 
 # =============================================================================
 # mTLS Wallet Configuration (Required for mTLS connections)

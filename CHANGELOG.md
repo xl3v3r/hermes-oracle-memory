@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.1.2] - 2026-11-10
+
+### Fixed
+- **Search-timeout default corrected 10x**: `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now defaults to `13000` (13 s), the true timeout budget used by the read-path fail-fast clamp (`_SEARCH_TIMEOUT_MS`, derived from the `13.0` s `HERMES_ORACLE_SEARCH_TIMEOUT`). The previous `1300` (1.3 s) value was an undetected 10x typo in `initialize()`'s env-read; it was inert in practice because `pool_call_timeout = max(search_ms, ingest_ms)` is always dominated by the 600 s ingest default, but the fingerprint and the pool's declared budget silently disagreed with the documented 13 s.
+- **Single timeout read in `initialize()`**: the ingest/search timeout values are now computed from the environment at one point (below the pool-reuse check) and reused for both the pool fingerprint and the pool construction, eliminating the duplicated env-read block that previously recomputed the same three values inside the `try:` immediately before building `pool_kwargs`.
+
+### Changed
+- **`INSTALL.md`**: the ADB connection sample now uses the real TCP/TLS port (`1522`, the tcps port), replacing the generic `1521` placeholder.
+- **README/INSTALL env tables**: now name the variable the code actually reads — `HERMES_ORACLE_SEARCH_TIMEOUT_MS` (default `13000`) — instead of the undocumented `HERMES_ORACLE_SEARCH_TIMEOUT`/`1300` the code never reads.
+- **Version bumps**: `1.1.1` → `1.1.1.2` across `VERSION`, `plugin.yaml`, `pyproject.toml`, `__init__.py.__version__`, README/INSTALL badges, and both `skills/*/SKILL.md` version pins.
+
+### Notes
+- Single-current-notes convention maintained: this is `RELEASE_NOTES_1.1.1.2.md`; the v1.1.1 notes file was removed.
+- Test suite unchanged at 241 passed / 2 skipped (the timeout tests already encode the corrected 13000 ms values).
+
 ## [1.1.1] - 2026-11-07
 
 ### Changed

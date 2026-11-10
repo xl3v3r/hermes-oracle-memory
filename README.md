@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
@@ -63,7 +63,7 @@ Embeddings are computed 100% in-house:
 | `HERMES_ORACLE_ONNX_MODEL` | `BGE_BASE_EN_V1_5` | In-database ONNX model name |
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
-| `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `1300` | Timeout in milliseconds for interactive recall queries |
+| `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `13000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
 
 ## Tools
 
@@ -175,9 +175,17 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
   ```
   and automatically refreshes optimizer statistics via `DBMS_STATS.GATHER_TABLE_STATS`.
 
+## What's new in v1.1.1.2
+
+Maintenance release — full details in `RELEASE_NOTES_1.1.1.2.md`:
+
+- **Search-timeout default corrected**: `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now defaults to `13000` (13 s), aligned 1:1 with the read-path clamp `_SEARCH_TIMEOUT_MS` (13.0 s) and the documented timeout budget — the previous `1300` (1.3 s) typo is fixed.
+- **Single timeout read in `initialize()`**: the ingest/search timeout values are now read from the environment once and reused for both the pool fingerprint and the pool construction, so a mid-initialization env change can never split them into two divergent values.
+- **Docs accuracy**: `INSTALL.md`'s ADB connection sample now uses the real TCP/TLS port (`1522`, not `1521`), and the README/INSTALL env tables name the variable the code actually reads (`HERMES_ORACLE_SEARCH_TIMEOUT_MS`, default `13000`).
+
 ## What's new in v1.1.1
 
-Sterile distribution release (full details in `RELEASE_NOTES_1.1.1.md`) — no provider behavior change:
+Sterile distribution release (notes superseded by `RELEASE_NOTES_1.1.1.2.md`; details preserved in `CHANGELOG.md`) — no provider behavior change:
 
 - **Identifier scrub**: no fleet hostnames, operator/developer usernames, absolute home/build paths, or production OCI region + service descriptors anywhere in the shipped tree — the plugin installs cleanly on any host without leaking its origin.
 - **Clean install scan**: the tree now clears the Hermes install-time security scanner with a `safe` verdict (0 critical, 0 high — previously a `caution` verdict that required a confirmation prompt on every install/update).
@@ -212,7 +220,7 @@ Maintenance release — fleet-sync hardening (full details in `CHANGELOG.md`):
   - Stale connection detection and automatic re-acquisition for ADB restart recovery.
   - Provider health diagnostic reporting (`health()`).
 - **Separated Ingest Timeout**:
-  - Autonomous ingestion timeout (`HERMES_ORACLE_INGEST_TIMEOUT`, default 600s) decoupled from query search timeouts (`HERMES_ORACLE_SEARCH_TIMEOUT_MS`, default 1300ms) to avoid batch timeouts during vector materialization.
+  - Autonomous ingestion timeout (`HERMES_ORACLE_INGEST_TIMEOUT`, default 600s) decoupled from query search timeouts (`HERMES_ORACLE_SEARCH_TIMEOUT_MS`, default 13000ms) to avoid batch timeouts during vector materialization.
 
 ## Contributing
 

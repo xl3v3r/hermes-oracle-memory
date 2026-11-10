@@ -32,7 +32,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.1"
+__version__ = "1.1.1.2"
 
 VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -668,7 +668,7 @@ class OracleMemoryProvider(MemoryProvider):
             logger.error("Oracle memory: %s", self._init_error)
             return
         ingest_timeout_ms = int(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600")) * 1000
-        search_timeout_ms = int(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT_MS", "1300"))
+        search_timeout_ms = int(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT_MS", "13000"))
         pool_call_timeout = max(search_timeout_ms, ingest_timeout_ms)
         # Timeout config participates in the fingerprint: a long-lived app
         # process must re-create its pool when these env vars change,
@@ -687,10 +687,9 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             import oracledb
 
-            ingest_timeout_ms = int(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600")) * 1000
-            search_timeout_ms = int(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT_MS", "1300"))
-            pool_call_timeout = max(search_timeout_ms, ingest_timeout_ms)
-
+            # Timeout config is read once (below the pool-reuse check above) so the
+            # fingerprint and the actual pool construction can never disagree — an
+            # env change observed mid-initialize is resolved at a single point.
             pool_kwargs: dict[str, Any] = {
                 "user": self._user,
                 "password": password,

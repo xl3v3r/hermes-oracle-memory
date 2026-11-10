@@ -32,7 +32,7 @@ class TestIngestTimeout(unittest.TestCase):
             self.assertIn("call_timeout", kwargs)
             call_timeout = kwargs["call_timeout"]
 
-            # Must be >= search timeout (1300 ms) and equal to ingest timeout (600,000 ms by default)
+            # Must be >= search timeout (13000 ms) and equal to ingest timeout (600,000 ms by default)
             self.assertGreaterEqual(call_timeout, oracle_plugin._SEARCH_TIMEOUT_MS)
             self.assertGreaterEqual(call_timeout, 600000)
 

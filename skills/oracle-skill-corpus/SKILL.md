@@ -1,7 +1,7 @@
 ---
 name: oracle-skill-corpus
 description: Discover and materialize shared cross-server skills from Oracle 26ai ADB memory at runtime without requiring local disk installation.
-version: 1.1.1
+version: 1.1.1.2
 author: Hermes Community
 metadata:
   hermes:
