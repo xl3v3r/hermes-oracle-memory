@@ -1747,6 +1747,7 @@ class OracleMemoryProvider(MemoryProvider):
                     "target": row[5],
                     "score": round(score, 4),
                     "dist": dist,
+                    "created_at": row[8] if len(row) > 8 else None,
                 }
             )
         return out
@@ -1765,7 +1766,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         sql = f"""
             SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                   SCORE(1) AS txt_score, NULL AS distance
+                   SCORE(1) AS txt_score, NULL AS distance, created_at
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
             {self._JUNK}{tgt_sql}{extra_filters}
@@ -1789,7 +1790,8 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
+                       created_at
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -1801,7 +1803,8 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
+                       VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
+                       created_at
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -1830,11 +1833,12 @@ class OracleMemoryProvider(MemoryProvider):
         if use_onnx and self._onnx_model:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance
+                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
+                           created_at
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -1843,10 +1847,10 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance
+                           SCORE(1) AS txt_score, NULL AS distance, created_at
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -1862,11 +1866,12 @@ class OracleMemoryProvider(MemoryProvider):
         else:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance
+                           VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
+                           created_at
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -1875,10 +1880,10 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance
+                       txt_score, distance, created_at
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance
+                           SCORE(1) AS txt_score, NULL AS distance, created_at
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -2104,42 +2109,6 @@ class OracleMemoryProvider(MemoryProvider):
         if not isinstance(rows, list):
             rows = list(rows)
 
-        created_map: dict[str, Any] = {}
-        try:
-            mids = [str(r["memory_id"]) for r in rows if isinstance(r, dict) and r.get("memory_id")]
-            if mids:
-                target_cur = cur
-                conn = None
-                try:
-                    if target_cur is None and self._pool:
-                        conn = self._pool.acquire()
-                        target_cur = conn.cursor()
-                    if target_cur is not None:
-                        chunk_size = 500
-                        for i in range(0, len(mids), chunk_size):
-                            chunk = mids[i : i + chunk_size]
-                            in_binds = {f"m_{j}": mid for j, mid in enumerate(chunk)}
-                            bind_placeholders = ", ".join(f":m_{j}" for j in range(len(chunk)))
-                            sql = f"SELECT /*+ NO_PARALLEL */ memory_id, created_at FROM {self._table} WHERE memory_id IN ({bind_placeholders})"  # nosec B608
-                            target_cur.execute(sql, in_binds)
-                            for r_row in target_cur:
-                                if r_row and len(r_row) >= 2 and r_row[1] is not None:
-                                    created_map[str(r_row[0])] = r_row[1]
-                finally:
-                    if conn is not None:
-                        if target_cur is not None:
-                            try:
-                                target_cur.close()
-                            except Exception:
-                                pass
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-        except Exception as e:
-            logger.debug("created_at lookup failed in _apply_weights: %s", e)
-            return rows
-
         try:
             now = datetime.now(timezone.utc)
             for r in rows:
@@ -2149,22 +2118,13 @@ class OracleMemoryProvider(MemoryProvider):
                     base_score = float(r.get("score")) if r.get("score") is not None else 0.0
                 except (ValueError, TypeError):
                     base_score = 0.0
-                mid = r.get("memory_id")
                 role = str(r.get("role") or "fact").strip().lower()
                 content = str(r.get("content") or "")
                 stripped_content = content.strip()
 
                 # 1. Recency multiplier: 0.85 + 0.15 * e^(-age_days / 120) -> range [0.85, 1.00]
                 recency_mult = 1.0
-                dt = (
-                    created_map.get(str(mid))
-                    if mid is not None
-                    else None
-                ) or (
-                    created_map.get(mid)
-                    if mid is not None
-                    else None
-                ) or r.get("created_at")
+                dt = r.get("created_at")
 
                 if dt is not None:
                     if isinstance(dt, str):
