@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.1.3] - 2026-11-14
+
+### Added
+- **Handoff rows**: `oracle_add` accepts an optional caller-chosen `memory_id` (upsert) and `tags` (stored lower-cased in `metadata.tags`); `oracle_update` can replace tags without re-embedding (`content` now optional); `oracle_search` filters by `tags` with `tag_match` `all`/`any` in every mode.
+- **`oracle_get` tool**: exact read by `memory_id`(s) and/or tags, newest first, with `missing` ids reported; no embedding, so it works during an ONNX cooldown.
+- System-prompt rule 10 (HANDOFFS) describing the `handoff:<project>:<topic>` convention.
+- `tests/test_handoff.py`, timeout-consolidation tests, and a `tests.yml` CI workflow (Python 3.11/3.13, sandboxed `HOME`, version-drift check).
+
+### Fixed
+- **ONNX cooldown misclassification**: session/connection errors (`ORA-00028/01001/01002/03113/03114/03135`, `DPY-4005/4011/4024`), data/constraint errors (`ORA-00001`, `ORA-01400`, `ORA-12899`, …), and non-Oracle Python exceptions no longer start the 60 s process-wide ONNX cooldown.
+- **Stale `call_timeout` on reused connections**: `_CallTimeoutPool` re-applies the default budget on every acquire (writes no longer inherit a read clamp → `DPY-4024`).
+- **Poisoned pooled sessions**: connections that raised a session-level or non-Oracle error are dropped, not returned; search retries once on a broken session.
+- **`on_skill_lifecycle` after provider shutdown**: the hook and background writer route to a live provider in the process instead of failing with `pool not initialized`; `shutdown()` no longer closes the pool under an active writer.
+- **Unbounded pool wait**: pool uses `POOL_GETMODE_TIMEDWAIT` (20 s, `HERMES_ORACLE_POOL_WAIT_TIMEOUT_MS`) instead of blocking forever.
+- **Search timeout env ignored**: `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now drives the per-query clamp (default raised 13 s → 30 s); float values for `HERMES_ORACLE_INGEST_TIMEOUT` no longer crash `initialize()` / `scripts/sync_skills.py`.
+- **Destructive tests**: the drift test no longer copies over `~/.hermes/plugins/oracle` and profile copies (now read-only, opt-in via `HERMES_ORACLE_DRIFT_DIR`); `tests/test_skill_bundles.py` (wrote into `~/.hermes/skills`) removed; the version test no longer deletes files.
+- CLA workflow allowlist syntax (comma-separated).
+
+### Changed
+- `created_at` projected in the search SQL; the secondary per-search query is gone (from PR #3).
+- Pool idle timeout 5 s → 300 s (`HERMES_ORACLE_POOL_IDLE_TIMEOUT`); prefetch wait 0.5 s → 3 s (`HERMES_ORACLE_PREFETCH_WAIT`); pool fingerprint includes both.
+- **Version bumps**: `1.1.1.2` → `1.1.1.3` across `VERSION`, `plugin.yaml`, `pyproject.toml`, `__init__.py.__version__`, README/INSTALL badges, and both `skills/*/SKILL.md` version pins.
+
+### Notes
+- No schema change. Single-current-notes convention maintained: this is `RELEASE_NOTES_1.1.1.3.md`; the v1.1.1.2 notes file was removed.
+- Test suite: 278 passed / 3 skipped.
+
 ## [1.1.1.2] - 2026-11-10
 
 ### Fixed

@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.1.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.3-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
@@ -63,19 +63,36 @@ Embeddings are computed 100% in-house:
 | `HERMES_ORACLE_ONNX_MODEL` | `BGE_BASE_EN_V1_5` | In-database ONNX model name |
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
-| `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `13000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
+| `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `30000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
+| `HERMES_ORACLE_POOL_WAIT_TIMEOUT_MS` | `20000` | Max wait for a pooled connection before the call fails with `DPY-4005` (never blocks forever) |
+| `HERMES_ORACLE_POOL_IDLE_TIMEOUT` | `300` | Seconds an idle pooled session above the pool minimum stays open |
+| `HERMES_ORACLE_PREFETCH_WAIT` | `3` | Seconds a turn waits for background recall before continuing without it (0.1–7) |
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `oracle_search` | hybrid / vector / text recall |
-| `oracle_add` | store a durable fact (embedded + indexed) |
-| `oracle_update` | replace a fact by `memory_id` |
+| `oracle_search` | hybrid / vector / text recall; optional `tags` filter (`tag_match` `all`/`any`) |
+| `oracle_add` | store a durable fact (embedded + indexed); optional stable `memory_id` (upsert) and `tags` |
+| `oracle_get` | exact read by `memory_id`(s) and/or `tags` — no embedding, works during an ONNX cooldown |
+| `oracle_update` | replace a fact's text and/or tags by `memory_id` |
 | `oracle_delete` | delete by `memory_id` |
 | `oracle_chunk` | split inline text or a disk file in-database |
 | `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory |
 | `oracle_load_skill` | load or list skills from the shared Oracle skill corpus at runtime |
+
+### Handoffs between agents and sessions
+
+Give a row a stable `memory_id` and tags, and any other agent or session sharing the database can pick it up by exact key — no semantic search needed:
+
+```text
+oracle_add(memory_id="handoff:billing:migration", tags=["handoff", "project:billing"],
+           content="State: schema migrated on staging. Next: backfill invoices. Blocker: none.")
+oracle_get(tags=["handoff", "project:billing"])          # receiver: newest first
+oracle_update(memory_id="handoff:billing:migration", tags=["handoff", "project:billing", "done"])
+```
+
+Calling `oracle_add` again with the same `memory_id` updates the row in place (tags are kept unless you pass new ones). Tags are lower-cased; ids are 1–128 characters of letters, digits and `_ . : @ / -`.
 
 ## Skills
 
@@ -175,9 +192,19 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
   ```
   and automatically refreshes optimizer statistics via `DBMS_STATS.GATHER_TABLE_STATS`.
 
+## What's new in v1.1.1.3
+
+Reliability + capability release — full details in `RELEASE_NOTES_1.1.1.3.md`:
+
+- **No more false "embedding model is unavailable"**: broken pooled sessions (`ORA-01002`), client timeouts, duplicate ids and other data errors, and Python exceptions no longer start the 60 s ONNX cooldown; poisoned connections are dropped and search retries once.
+- **Skill-lifecycle hook survives provider shutdown** instead of failing every event with `pool not initialized`.
+- **Bounded timeouts**: pool acquire waits at most 20 s (it could hang for minutes), `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now really controls recall (default 30 s), idle sessions are kept 300 s, prefetch waits up to 3 s.
+- **Handoff rows**: stable `memory_id` + `tags` on `oracle_add`, tag filters on `oracle_search`/`oracle_update`, and the new `oracle_get` exact-read tool.
+- **Safe test suite**: tests no longer touch an installed plugin or `~/.hermes/skills`; CI runs them with a sandboxed `HOME`. Do not run the test suite of v1.1.1.2 or older on a host with a live install.
+
 ## What's new in v1.1.1.2
 
-Maintenance release — full details in `RELEASE_NOTES_1.1.1.2.md`:
+Maintenance release (details preserved in `CHANGELOG.md`):
 
 - **Search-timeout default corrected**: `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now defaults to `13000` (13 s), aligned 1:1 with the read-path clamp `_SEARCH_TIMEOUT_MS` (13.0 s) and the documented timeout budget — the previous `1300` (1.3 s) typo is fixed.
 - **Single timeout read in `initialize()`**: the ingest/search timeout values are now read from the environment once and reused for both the pool fingerprint and the pool construction, so a mid-initialization env change can never split them into two divergent values.
@@ -185,7 +212,7 @@ Maintenance release — full details in `RELEASE_NOTES_1.1.1.2.md`:
 
 ## What's new in v1.1.1
 
-Sterile distribution release (notes superseded by `RELEASE_NOTES_1.1.1.2.md`; details preserved in `CHANGELOG.md`) — no provider behavior change:
+Sterile distribution release (details preserved in `CHANGELOG.md`) — no provider behavior change:
 
 - **Identifier scrub**: no fleet hostnames, operator/developer usernames, absolute home/build paths, or production OCI region + service descriptors anywhere in the shipped tree — the plugin installs cleanly on any host without leaking its origin.
 - **Clean install scan**: the tree now clears the Hermes install-time security scanner with a `safe` verdict (0 critical, 0 high — previously a `caution` verdict that required a confirmation prompt on every install/update).

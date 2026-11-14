@@ -32,7 +32,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.1.2"
+__version__ = "1.1.1.3"
 
 VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -274,7 +274,7 @@ class _CallTimeoutPool:
 
     python-oracledb runs session_callback only for newly created connections,
     so a pooled connection whose call_timeout was tightened by a read path
-    (search/health/list -> 13s) kept that clamp when later reused by a write
+    (search/health/list -> search clamp) kept it when later reused by a write
     -> DPY-4024 on inserts, which then tripped the ONNX cooldown
     ("embedding model is unavailable"). Read paths still override after acquire.
     """
