@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +27,7 @@ class TestOracleMemoryProvider(unittest.TestCase):
         provider = oracle_plugin.OracleMemoryProvider()
         schemas = provider.get_tool_schemas()
 
-        expected_names = {"oracle_search", "oracle_add", "oracle_update", "oracle_delete", "oracle_chunk", "oracle_sync_skills", "oracle_load_skill"}
+        expected_names = {"oracle_search", "oracle_add", "oracle_update", "oracle_delete", "oracle_chunk", "oracle_sync_skills", "oracle_load_skill", "oracle_get"}
         actual_names = {schema["name"] for schema in schemas}
         self.assertEqual(actual_names, expected_names)
 
@@ -232,6 +233,156 @@ class TestSkillLifecycleHook(unittest.TestCase):
             mod = oracle_plugin._load_module_from_path("probe_mod", p)
             self.assertEqual(mod.ping().name, "ok")
             self.assertIn("probe_mod", sys.modules)
+
+
+class TestHookSurvivesProviderShutdown(unittest.TestCase):
+    """Hermes re-binds the global on_skill_lifecycle hook to the NEWEST provider
+    instance on every load. When that instance shuts down, skill events from
+    other live sessions must reach a live provider, not fail with
+    'pool not initialized'."""
+
+    def _live(self, sid):
+        p = oracle_plugin.OracleMemoryProvider()
+        p._pool = MagicMock()
+        p._initialized = True
+        p._session_id = sid
+        with oracle_plugin._LIVE_PROVIDERS_LOCK:
+            oracle_plugin._LIVE_PROVIDERS.add(p)
+        return p
+
+    def tearDown(self):
+        with oracle_plugin._LIVE_PROVIDERS_LOCK:
+            oracle_plugin._LIVE_PROVIDERS.clear()
+
+    def test_hook_on_dead_provider_routes_to_live_one(self):
+        a = self._live("sess-A")
+        b = self._live("sess-B")          # hook is bound to b (newest)
+        b._write_stop.set(); b._pool = None   # what shutdown() leaves behind
+        with oracle_plugin._LIVE_PROVIDERS_LOCK:
+            oracle_plugin._LIVE_PROVIDERS.discard(b)
+
+        with patch.object(a, "_queue_background_insert") as a_ins, \
+             patch.object(b, "_insert") as b_insert:
+            b.on_skill_lifecycle(action="loaded", skill_name="probe", session_id="sess-A")
+            a_ins.assert_called_once()
+            self.assertEqual(a_ins.call_args[1]["session_id"], "sess-A")
+            b_insert.assert_not_called()
+
+    def test_fallback_picks_newest_registered_provider(self):
+        provs = []
+        for i in range(6):
+            p = oracle_plugin.OracleMemoryProvider()
+            p._pool = MagicMock(); p._initialized = True; p._session_id = f"s{i}"
+            oracle_plugin._register_live_provider(p)
+            provs.append(p)
+        dead = oracle_plugin.OracleMemoryProvider()
+        self.assertIs(dead._live_provider_for("no-such-session"), provs[-1])
+
+    def test_shutdown_does_not_wait_on_or_leak_pool_for_prefetch(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        pool = MagicMock()
+        p._pool = pool; p._initialized = True
+        pf = MagicMock(); pf.is_alive.return_value = True
+        p._prefetch_thread = pf
+        p.shutdown()
+        pf.join.assert_called_once_with(timeout=3.0)
+        pool.close.assert_called_once()
+        self.assertIsNone(p._pool)
+
+    def test_shutdown_defers_close_while_a_connection_is_out(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        pool = MagicMock()
+        pool.close.side_effect = Exception("DPY-1005: unable to close pool with busy connections")
+        p._pool = pool; p._initialized = True
+        called = threading.Event()
+        closer = MagicMock(side_effect=lambda *a, **k: called.set())
+        with patch.object(oracle_plugin, "_close_pool_when_idle", closer):
+            p.shutdown()
+            self.assertTrue(called.wait(5))
+        closer.assert_called_once_with(pool)
+        pool.close.assert_called_once_with()  # never force-closed inline
+        self.assertIsNone(p._pool)
+
+    def test_shutdown_waits_for_skill_lifecycle_writer(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        pool = MagicMock()
+        p._pool = pool; p._initialized = True
+        w = MagicMock(); w.is_alive.return_value = True  # DELETE done, INSERT pending
+        p._sync_threads = [w]
+        p.shutdown()
+        w.join.assert_called_once()
+        pool.close.assert_not_called()  # busy: never close under a lifecycle writer
+        self.assertIs(p._pool, pool)
+
+    def test_close_pool_when_idle_waits_then_closes_without_force(self):
+        from unittest.mock import call
+        pool = MagicMock()
+        busy = Exception("DPY-1005: unable to close pool with busy connections")
+        pool.close.side_effect = [busy, busy, None]
+        oracle_plugin._close_pool_when_idle(pool, budget=5.0, poll=0.0)
+        self.assertEqual(pool.close.call_args_list, [call(), call(), call()])
+
+    def test_close_pool_when_idle_forces_after_budget(self):
+        from unittest.mock import call
+        pool = MagicMock()
+        oracle_plugin._close_pool_when_idle(pool, budget=0.0, poll=0.0)
+        self.assertEqual(pool.close.call_args_list, [call(force=True)])
+
+    def test_sync_thread_started_under_lock_and_dead_ones_pruned(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        dead = MagicMock(); dead.is_alive.return_value = False
+        p._sync_threads = [dead] * 50
+        live = MagicMock(); live.is_alive.return_value = True
+        live.start.side_effect = lambda: self.assertTrue(p._sync_threads_lock.locked())
+        self.assertTrue(p._start_sync_thread(live))
+        live.start.assert_called_once()
+        self.assertEqual(p._sync_threads, [live])
+
+    def test_sync_thread_refused_once_shutdown_began(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        p._write_stop.set()
+        t = MagicMock()
+        self.assertFalse(p._start_sync_thread(t))
+        t.start.assert_not_called()
+        self.assertEqual(p._sync_threads, [])
+
+    def test_unstarted_thread_cannot_be_pruned_by_concurrent_tracking(self):
+        # Every listed thread was started under the lock, so a concurrent
+        # _start_sync_thread() never drops one that is about to run.
+        p = oracle_plugin.OracleMemoryProvider()
+        gate = threading.Event()
+        first = threading.Thread(target=gate.wait, daemon=True)
+        second = threading.Thread(target=gate.wait, daemon=True)
+        try:
+            self.assertTrue(p._start_sync_thread(first))
+            self.assertTrue(p._start_sync_thread(second))
+            self.assertEqual(p._sync_threads, [first, second])
+        finally:
+            gate.set(); first.join(2); second.join(2)
+
+    def test_queue_on_dead_provider_is_handed_off_not_failed(self):
+        a = self._live("sess-A")
+        b = oracle_plugin.OracleMemoryProvider()
+        b._initialized = True; b._pool = None; b._write_stop.set()
+        with patch.object(a, "_queue_background_insert") as a_ins:
+            b._queue_background_insert(memory_id="m1", session_id="sess-A", role="fact",
+                                       content="c", target="memory", metadata={})
+            a_ins.assert_called_once()
+        self.assertTrue(b._write_queue.empty())
+
+    def test_queue_on_dead_provider_with_no_live_peer_drops_cleanly(self):
+        b = oracle_plugin.OracleMemoryProvider()
+        b._initialized = True; b._pool = None; b._write_stop.set()
+        b._queue_background_insert(memory_id="m1", session_id="s", role="fact",
+                                   content="c", target="memory", metadata={})
+        self.assertTrue(b._write_queue.empty())
+        self.assertIsNone(b._write_worker)
+
+    def test_shutdown_unregisters_provider(self):
+        a = self._live("sess-A")
+        a._write_worker = a._embed_worker = a._prefetch_thread = None
+        a.shutdown()
+        self.assertNotIn(a, list(oracle_plugin._LIVE_PROVIDERS))
 
 
 if __name__ == '__main__':

@@ -22,18 +22,21 @@ from typing import Any, Sequence
 
 logger = logging.getLogger("hermes.oracle_sync_skills")
 
-# Load ~/.hermes/.env if present
-env_file = Path.home() / ".hermes" / ".env"
-if env_file.exists():
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k.strip(), v)
-    except Exception as e:
-        logger.debug("Failed reading %s: %s", env_file, e)
+# CLI only: load the Hermes .env file when run as a script. When the plugin loads this
+# module in-process, Hermes has already loaded the environment, and importing
+# must not have side effects on the host process.
+if __name__ == "__main__":
+    env_file = Path.home() / ".hermes" / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    v = v.strip().strip('"').strip("'")
+                    os.environ.setdefault(k.strip(), v)
+        except Exception as e:
+            logger.debug("Failed reading %s: %s", env_file, e)
 
 
 # --- Interpreter guard -------------------------------------------------------
@@ -76,7 +79,8 @@ def _reexec_with_oracle_driver() -> None:
             os.execve(candidate, [candidate, os.path.abspath(__file__), *sys.argv[1:]], env)
 
 
-_reexec_with_oracle_driver()
+if __name__ == "__main__":  # never re-exec a host process that imported us
+    _reexec_with_oracle_driver()
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -132,8 +136,24 @@ if "tools" not in sys.modules:
         sys.modules["tools.registry"] = reg_mod
 
 repo_root = Path(__file__).resolve().parent.parent
-if str(repo_root) not in sys.path:
+if __name__ == "__main__" and str(repo_root) not in sys.path:
+    # CLI needs the plugin root for `from __init__ import ...`; in-process the
+    # plugin's top-level names must not shadow the host's (tests/, scripts/).
     sys.path.insert(0, str(repo_root))
+
+
+def _ingest_timeout_ms() -> int:
+    """HERMES_ORACLE_INGEST_TIMEOUT (seconds, default 600) as ms, clamped to
+    30-7200 s like the plugin; bad/non-positive values fall back to 600."""
+    raw = (os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT") or "").strip()
+    try:
+        secs = float(raw) if raw else 600.0
+        if not (secs > 0 and secs != float("inf")):
+            raise ValueError
+    except ValueError:
+        logger.warning("ignoring invalid HERMES_ORACLE_INGEST_TIMEOUT=%r; using 600", raw)
+        secs = 600.0
+    return int(min(max(secs, 30.0), 7200.0) * 1000)
 
 
 @dataclass
@@ -878,7 +898,7 @@ def sync_skills_library(
     conn = None  # bound by the context manager; rollback target if enter fails
     try:
         with _ConnContext(target_provider_or_conn, is_direct_conn) as conn:
-            ingest_ms = int(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600")) * 1000
+            ingest_ms = _ingest_timeout_ms()
             try:
                 conn.call_timeout = ingest_ms
             except Exception:

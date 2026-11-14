@@ -1,7 +1,7 @@
 ---
 name: oracle-import
 description: Import conversation archives and documents into Oracle Autonomous AI Database 26ai memory without hitting LLM rate limits.
-version: 1.1.1.2
+version: 1.1.1.3
 author: Hermes Community
 metadata:
   hermes:
@@ -78,6 +78,7 @@ python3 skills/oracle-import/scripts/import_conversations.py ~/sharedconv/conver
 
 ## Pitfalls
 
+- **Secret paths are refused**: `oracle_chunk(file_path=...)` rejects credential and system paths (env files, `auth.json`, SSH/cloud/GPG key directories, `*.pem`/`*.key`, wallets, `/etc`, `/proc`, ...) because chunks land in the shared database. Export or redact first.
 - **NIM HTTP 429 Rate Limits**: Avoid passing file contents directly into chat messages or `oracle_chunk(content=...)`. Always pass `file_path`.
 - **`DPY-6005: Listener refused connection`**: Wallet files missing, unreadable, or TLS certificate mismatch. Check permissions (`chmod 600`) and wallet files.
 - **`DPY-6000: Connection timeout`**: Verify Autonomous Database is in **Available** state in OCI Console and egress on port 1522 is open.

@@ -27,4 +27,4 @@ jobs:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'CLA.md'
           branch: 'master'
-          allowlist: 'bot*|*bot|google-labs-jules[bot]|dependabot[bot]'
+          allowlist: 'google-labs-jules[bot],dependabot[bot],github-actions[bot],*[bot]'

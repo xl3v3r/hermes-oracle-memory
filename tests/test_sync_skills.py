@@ -376,11 +376,15 @@ class TestProviderIntegration(unittest.TestCase):
         # tool_error returns error string or error dictionary
         self.assertTrue("error" in str(res).lower())
 
-    @patch("scripts.sync_skills.sync_skills_library")
-    def test_provider_handle_tool_call_dispatched(self, mock_sync):
+    def test_provider_handle_tool_call_dispatched(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
+        mod = MagicMock()
+        mock_sync = mod.sync_skills_library
         mock_sync.return_value = {"status": "success", "indexed": 5}
+        patcher = patch.object(oracle_plugin, "_sync_skills_module", return_value=mod)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         res = json.loads(provider.handle_tool_call("oracle_sync_skills", {"mode": "meta", "force": True, "batch_size": 25}))
         self.assertEqual(res["status"], "success")
