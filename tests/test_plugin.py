@@ -288,17 +288,51 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
         pool.close.assert_called_once()
         self.assertIsNone(p._pool)
 
-    def test_shutdown_forces_close_when_prefetch_still_holds_a_connection(self):
-        from unittest.mock import call
+    def test_shutdown_defers_close_while_a_connection_is_out(self):
         p = oracle_plugin.OracleMemoryProvider()
         pool = MagicMock()
-        pool.close.side_effect = [Exception("DPY-1005: unable to close pool with busy connections"), None]
+        pool.close.side_effect = Exception("DPY-1005: unable to close pool with busy connections")
         p._pool = pool; p._initialized = True
-        pf = MagicMock(); pf.is_alive.return_value = True
-        p._prefetch_thread = pf
-        p.shutdown()
-        self.assertEqual(pool.close.call_args_list, [call(), call(force=True)])
+        with patch.object(oracle_plugin.threading, "Thread") as th:
+            p.shutdown()
+        self.assertIs(th.call_args.kwargs["target"], oracle_plugin._close_pool_when_idle)
+        self.assertEqual(th.call_args.kwargs["args"], (pool,))
+        th.return_value.start.assert_called_once()
+        pool.close.assert_called_once_with()  # never force-closed inline
         self.assertIsNone(p._pool)
+
+    def test_shutdown_waits_for_skill_lifecycle_writer(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        pool = MagicMock()
+        p._pool = pool; p._initialized = True
+        w = MagicMock(); w.is_alive.return_value = True  # DELETE done, INSERT pending
+        p._sync_threads = [w]
+        p.shutdown()
+        w.join.assert_called_once()
+        pool.close.assert_not_called()  # busy: never close under a lifecycle writer
+        self.assertIs(p._pool, pool)
+
+    def test_close_pool_when_idle_waits_then_closes_without_force(self):
+        from unittest.mock import call
+        pool = MagicMock()
+        busy = Exception("DPY-1005: unable to close pool with busy connections")
+        pool.close.side_effect = [busy, busy, None]
+        oracle_plugin._close_pool_when_idle(pool, budget=5.0, poll=0.0)
+        self.assertEqual(pool.close.call_args_list, [call(), call(), call()])
+
+    def test_close_pool_when_idle_forces_after_budget(self):
+        from unittest.mock import call
+        pool = MagicMock()
+        oracle_plugin._close_pool_when_idle(pool, budget=0.0, poll=0.0)
+        self.assertEqual(pool.close.call_args_list, [call(force=True)])
+
+    def test_lifecycle_thread_list_is_pruned(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        dead = MagicMock(); dead.is_alive.return_value = False
+        p._sync_threads = [dead] * 50
+        live = MagicMock(); live.is_alive.return_value = True
+        p._track_sync_thread(live)
+        self.assertEqual(p._sync_threads, [live])
 
     def test_queue_on_dead_provider_is_handed_off_not_failed(self):
         a = self._live("sess-A")

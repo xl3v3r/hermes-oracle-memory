@@ -49,7 +49,7 @@
   - Skill lookups skip hidden trees (`.archive/`), so archived skills are pruned.
   - Any call timeout drops the pooled session instead of reusing it (stale cursor → `ORA-01002`).
   - Prefetch starts the thread it created under the lock (no double `start()`).
-  - Failed `initialize()` closes the new pool, clears `_initialized`, and unregisters the provider; a same-config re-`initialize()` after a busy `shutdown()` re-arms the writer and registry; `shutdown()` waits at most 3 s for a read-only prefetch, then force-closes the pool rather than leaking it; providers are registered for hooks only after schema setup succeeds.
+  - Failed `initialize()` closes the new pool, clears `_initialized`, and unregisters the provider; a same-config re-`initialize()` after a busy `shutdown()` re-arms the writer and registry; `shutdown()` also waits for skill-lifecycle writers, waits at most 3 s for a read-only prefetch, and closes the pool in the background once a still-borrowed connection returns (never killing it mid-call, never leaking the pool); providers are registered for hooks only after schema setup succeeds.
   - `oracle_get`: string `memory_ids` (single, comma/space list, JSON array) no longer split into characters; `truncated` instead of false `missing` when `limit` cuts results.
   - Upsert racing a concurrent delete returns an error instead of `upserted: true`; `_update_row` and the `oracle_delete` purge use the checked acquire; hook fallback picks the newest provider by registration order.
 - **Tests and CI**: the drift test is read-only and opt-in (`HERMES_ORACLE_DRIFT_DIR=<installed plugin dir>`); `tests/test_skill_bundles.py` is removed; the version test no longer deletes files; new `tests/test_handoff.py` (25 tests) and timeout tests. New `.github/workflows/tests.yml` runs the suite on Python 3.11 and 3.13 with a sandboxed `HOME` plus a version-drift check. CLA workflow allowlist syntax fixed (comma-separated; bot accounts no longer block PRs).
@@ -62,6 +62,7 @@
 - **Never run the test suite of v1.1.1.2 or older on a host with an installed plugin** — see "Destructive test suite" above. From 1.1.1.3, running it with `HOME` pointed at a scratch directory is still recommended.
 
 ### Verification
-- Test suite: 307 passed, 3 skipped (sandboxed `HOME`; installed plugin checksum unchanged before/after); identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The new audit tests fail against the previous code.
+- Test suite: 314 passed, 3 skipped (sandboxed `HOME`; installed plugin checksum unchanged before/after); identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The new audit tests fail against the previous code.
+- Live: `shutdown()` with a borrowed connection returns immediately, defers the close (`DPY-1005` observed), and the pool is closed once the connection is released.
 - `mypy` (3.11) clean on `__init__.py`; `ruff` (F, E9) clean on changed files; syntax-checked for 3.10–3.13. Plugin scanner: no critical/high findings.
 - Live end-to-end against Oracle ADB 26ai: handoff insert, upsert, tag-preserving upsert, `oracle_get` by id/tags (`all`/`any`), tags-only update, tag-filtered search in text/vector/hybrid modes, and cleanup — 15/15 checks pass under the new pool settings.

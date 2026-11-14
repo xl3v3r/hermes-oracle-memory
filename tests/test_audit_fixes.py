@@ -66,15 +66,29 @@ class TestChunkSecretGuard(unittest.TestCase):
             self.assertEqual(oracle_plugin._sensitive_path_reason(Path(f)), "system path", f)
 
     def test_home_and_hermes_home_exempt_from_system_roots_only(self):
+        hh = Path("/var/lib/hermes").resolve()  # /private/var/lib/hermes on macOS
         with patch.object(oracle_plugin.Path, "home", return_value=Path("/root")), \
-                patch.dict(os.environ, {"HERMES_HOME": "/var/lib/hermes"}):
+                patch.dict(os.environ, {"HERMES_HOME": str(hh)}):
             r = oracle_plugin._sensitive_path_reason
             self.assertEqual(r(Path("/root/docs/notes.md")), "")
-            self.assertEqual(r(Path("/var/lib/hermes/skills/x/SKILL.md")), "")
+            self.assertEqual(r(hh / "skills" / "x" / "SKILL.md"), "")
             self.assertNotEqual(r(Path("/root") / ".ssh" / "config"), "")
-            self.assertNotEqual(r(Path("/var/lib/hermes/.env")), "")
-            self.assertEqual(r(Path("/var/lib/postgresql/data")), "system path")
+            self.assertNotEqual(r(hh / ".env"), "")
+            self.assertEqual(r(Path("/var/lib/postgresql/data").resolve()), "system path")
             self.assertEqual(r(Path("/etc/hostname")), "system path")
+
+    def test_misconfigured_home_does_not_exempt_system_roots(self):
+        r = oracle_plugin._sensitive_path_reason
+        for home, probe in (("/etc", "/etc/ssh/ssh_host_ed25519_key"), ("/var", "/var/lib/x"),
+                            ("/var/lib", "/var/lib/x")):
+            with patch.object(oracle_plugin.Path, "home", return_value=Path(home)), \
+                    patch.dict(os.environ, {"HERMES_HOME": home}):
+                self.assertEqual(r(Path(probe)), "system path", home)
+
+    def test_home_lookup_failure_fails_closed(self):
+        with patch.object(oracle_plugin.Path, "home", side_effect=RuntimeError("no home")), \
+                patch.dict(os.environ, {"HERMES_HOME": ""}):
+            self.assertEqual(oracle_plugin._sensitive_path_reason(Path("/root/x")), "system path")
 
     def test_tool_token_stores_refused(self):
         r = oracle_plugin._sensitive_path_reason
@@ -126,10 +140,17 @@ class TestSyncSkillsArgs(unittest.TestCase):
             self.assertEqual(p.sync_skills.call_args[1]["dirs"], [d.resolve()])
 
     def test_root_home_and_secret_dirs_refused(self):
-        for bad in ("/", "/home", str(Path.home()), str(Path.home().parent), str(Path.home() / ".ssh"), "/etc"):
+        for bad in ("/", "/home", str(Path.home()), str(Path.home() / ".ssh"), "/etc"):
             p, out = self._call({"dirs": [bad]})
             self.assertIn("refusing to scan", out, bad)
             p.sync_skills.assert_not_called()
+
+    def test_deep_home_ancestors_refused(self):
+        with patch.object(oracle_plugin.Path, "home", return_value=Path("/srv/users/u")):
+            for bad in ("/srv/users", "/srv/users/u"):
+                p, out = self._call({"dirs": [bad]})
+                self.assertIn("refusing to scan", out, bad)
+                p.sync_skills.assert_not_called()
 
     def test_force_text_false_is_false(self):
         for raw, want in (("false", False), ("0", False), ("true", True), (True, True), (None, False)):

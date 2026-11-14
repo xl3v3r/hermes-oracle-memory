@@ -181,6 +181,33 @@ def _register_live_provider(provider: Any) -> None:
 # oracle_chunk(file_path=...) stores the file in the SHARED database, where any
 # later oracle_search on any host can read it back. A prompt-injected call must
 # not be able to copy credentials there, so refuse well-known secret locations.
+def _is_pool_busy_error(err: BaseException) -> bool:
+    """python-oracledb refuses a non-forced close while connections are out."""
+    return "DPY-1005" in str(err)
+
+
+def _close_pool_when_idle(pool: Any, budget: float | None = None, poll: float = 0.5) -> None:
+    """Close *pool* once every borrowed connection is back. Force only after the
+    longest call budget (+ pool wait) has expired, when any holder has already
+    timed out or finished."""
+    if budget is None:
+        budget = max(_SEARCH_TIMEOUT_SECS, _ingest_timeout_secs()) + _pool_wait_timeout_ms() / 1000.0 + 30.0
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        try:
+            pool.close()
+            return
+        except Exception as e:
+            if not _is_pool_busy_error(e):
+                logger.debug("oracle deferred pool close: %s", e)
+                return
+    try:
+        pool.close(force=True)
+    except Exception as e:
+        logger.warning("oracle deferred pool close (forced) failed: %s", e)
+
+
 _RESERVED_SESSION_IDS = frozenset({"skills", "none", "null"})
 
 _SENSITIVE_DIR_NAMES = frozenset({
@@ -201,24 +228,37 @@ _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".kdbx", ".env", 
 _SENSITIVE_ROOTS = (
     "/proc", "/sys", "/dev", "/etc", "/boot", "/root", "/var/lib", "/run",
     # macOS: resolve() maps /etc and /var to /private/...
-    "/private/etc", "/private/var/root", "/private/var/db", "/private/var/lib",
+    "/private/etc", "/private/var/root", "/private/var/db", "/private/var/lib", "/private/var/run",
 )
+# Sensitive roots that are also a legitimate home directory (Hermes running as root).
+_HOME_LIKE_ROOTS = frozenset({"/root", "/private/var/root"})
 
 
 def _trusted_home_roots() -> list[Path]:
     """The user's home and HERMES_HOME, exempt from the system-root check (but
     not from the credential name checks): when Hermes runs as root its home is
     /root, and service installs may use HERMES_HOME=/var/lib/hermes."""
+    raws = [os.environ.get("HERMES_HOME", "")]
+    try:
+        raws.append(str(Path.home()))
+    except (OSError, RuntimeError, KeyError):  # HOME unset and no pwd entry
+        pass
     out = []
-    for raw in (str(Path.home()), os.environ.get("HERMES_HOME", "")):
+    for raw in raws:
         if not raw:
             continue
         try:
             r = Path(raw).expanduser().resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, KeyError):
             continue
-        if len(r.parts) >= 2:  # never exempt "/"
-            out.append(r)
+        if len(r.parts) < 2:  # never exempt "/"
+            continue
+        # A misconfigured HOME/HERMES_HOME (/etc, /var, /var/lib) must not exempt
+        # a whole system root; /root itself is a real home and stays allowed.
+        if any(Path(sr).is_relative_to(r) and not (str(r) == sr and sr in _HOME_LIKE_ROOTS)
+               for sr in _SENSITIVE_ROOTS):
+            continue
+        out.append(r)
     return out
 
 
@@ -1013,6 +1053,7 @@ class OracleMemoryProvider(MemoryProvider):
         self._in_flight_lifecycle_skills: set[str] = set()
         self._lifecycle_lock = threading.Lock()
         self._sync_threads: list[threading.Thread] = []
+        self._sync_threads_lock = threading.Lock()
         self._table = "hermes_agent_memory"
         self._onnx_model = "BGE_BASE_EN_V1_5"
 
@@ -3536,7 +3577,7 @@ class OracleMemoryProvider(MemoryProvider):
                             self._in_flight_lifecycle_skills.discard(skill_name)
 
                 thread = threading.Thread(target=do_lifecycle_upsert, daemon=True, name=f"oracle-lifecycle-{skill_name}")
-                self._sync_threads.append(thread)
+                self._track_sync_thread(thread)
                 thread.start()
             except Exception as e:
                 logger.debug("on_skill_lifecycle ingest error: %s", e)
@@ -3591,7 +3632,7 @@ class OracleMemoryProvider(MemoryProvider):
                         logger.info("on_skill_lifecycle: archived and pruned skill '%s' for host '%s'", skill_name, host_id)
 
                     thread = threading.Thread(target=do_archive_delete, daemon=True, name="oracle-lifecycle-archive")
-                    self._sync_threads.append(thread)
+                    self._track_sync_thread(thread)
                     thread.start()
             except Exception as e:
                 logger.debug("on_skill_lifecycle archive error: %s", e)
@@ -4474,6 +4515,14 @@ class OracleMemoryProvider(MemoryProvider):
             if t and t.is_alive():
                 t.join(timeout=30.0)
                 busy = busy or t.is_alive()
+        # Skill-lifecycle writers DELETE a skill's rows and then re-INSERT them;
+        # closing the pool between the two steps would drop the skill everywhere.
+        with self._sync_threads_lock:
+            sync_threads = [t for t in self._sync_threads if t.is_alive()]
+        deadline = time.monotonic() + 30.0
+        for t in sync_threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+            busy = busy or t.is_alive()
         # Prefetch only reads; do not hold shutdown (or leak the pool) for it.
         pf = self._prefetch_thread
         if pf and pf.is_alive():
@@ -4484,19 +4533,27 @@ class OracleMemoryProvider(MemoryProvider):
             # row with "pool not initialized". Leave the pool to process exit.
             logger.warning("oracle shutdown: worker still busy after 30s; pool left open")
             return
-        if self._pool is not None:
+        pool, self._pool = self._pool, None
+        if pool is not None:
             try:
-                self._pool.close()
+                pool.close()
             except Exception as e:
-                # Writers are idle here, so a busy connection belongs to a read
-                # (prefetch still in its search): force the close rather than
-                # leak the pool and its ADB sessions.
-                logger.info("oracle pool close: %s; forcing", e)
-                try:
-                    self._pool.close(force=True)
-                except Exception as e2:
-                    logger.warning("oracle pool forced close failed: %s", e2)
-            self._pool = None
+                if not _is_pool_busy_error(e):
+                    logger.debug("oracle pool close: %s", e)
+                    return
+                # A connection is still checked out (a prefetch read or a tool
+                # call on another thread). Never kill it mid-call, and never leak
+                # the pool: close it once the connection comes back.
+                logger.info("oracle pool close deferred until busy connections return: %s", e)
+                threading.Thread(
+                    target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
+                ).start()
+
+    def _track_sync_thread(self, thread: threading.Thread) -> None:
+        """Remember a skill-lifecycle writer so shutdown() can wait for it."""
+        with self._sync_threads_lock:
+            self._sync_threads = [t for t in self._sync_threads if t.is_alive()]
+            self._sync_threads.append(thread)
 
 
 _safe_embed_text = OracleMemoryProvider._safe_embed_text
