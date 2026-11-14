@@ -282,6 +282,29 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._execute_hybrid_search.call_count, 1)
         provider._pool.drop.assert_not_called()
 
+    def test_search_does_not_retry_pool_or_call_timeouts(self):
+        for msg in (
+            "DPY-4005: timed out waiting for the connection pool to return a connection",
+            "DPI-1040: connection pool wait timeout of 20000 ms exceeded",
+            "DPI-1067: call timeout of 30000 ms exceeded with ORA-3156",
+            "DPY-4024: call timeout of 30000 ms exceeded",
+        ):
+            provider = oracle_plugin.OracleMemoryProvider()
+            provider._onnx_model = "BGE_BASE_EN_V1_5"
+            provider._pool = MagicMock()
+            provider._execute_hybrid_search = MagicMock(side_effect=Exception(msg))
+            with self.assertRaises(Exception):
+                provider._search("q")
+            self.assertEqual(provider._execute_hybrid_search.call_count, 1, msg)
+
+    def test_search_still_retries_broken_session_once(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        provider._execute_hybrid_search = MagicMock(side_effect=[Exception("ORA-01002: fetch out of sequence"), []])
+        self.assertEqual(provider._search("q"), [])
+        self.assertEqual(provider._execute_hybrid_search.call_count, 2)
+
     def test_search_does_not_client_embed_when_onnx_is_configured(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._onnx_model = "BGE_BASE_EN_V1_5"
@@ -1935,7 +1958,7 @@ class TestOraclePlugin(unittest.TestCase):
         payload = json.loads(res)
         self.assertEqual(payload["count"], 0)
         self.assertTrue(payload["timed_out"])
-        self.assertIn("timed out after 13s", payload["result"])
+        self.assertIn(f"timed out after {oracle_plugin._SEARCH_TIMEOUT_SECS:.0f}s", payload["result"])
 
     def test_oracle_search_db_timeout_error_string_clean_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1949,7 +1972,7 @@ class TestOraclePlugin(unittest.TestCase):
         payload = json.loads(res)
         self.assertEqual(payload["count"], 0)
         self.assertTrue(payload["timed_out"])
-        self.assertIn("timed out after 13s", payload["result"])
+        self.assertIn(f"timed out after {oracle_plugin._SEARCH_TIMEOUT_SECS:.0f}s", payload["result"])
 
     def test_timeout_in_hybrid_search_does_not_mark_onnx_failed(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2019,7 +2042,7 @@ class TestOraclePlugin(unittest.TestCase):
                 tgt_sql="",
                 tgt="any",
             )
-        self.assertIn("timed out after 13s", str(ctx.exception))
+        self.assertIn(f"timed out after {oracle_plugin._SEARCH_TIMEOUT_SECS:.0f}s", str(ctx.exception))
 
     def test_dpi_1040_pool_timeout_clean_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2032,7 +2055,7 @@ class TestOraclePlugin(unittest.TestCase):
         payload = json.loads(res)
         self.assertEqual(payload["count"], 0)
         self.assertTrue(payload["timed_out"])
-        self.assertIn("timed out after 13s", payload["result"])
+        self.assertIn(f"timed out after {oracle_plugin._SEARCH_TIMEOUT_SECS:.0f}s", payload["result"])
 
     def test_all_test_scripts_directory_structure(self):
         from pathlib import Path

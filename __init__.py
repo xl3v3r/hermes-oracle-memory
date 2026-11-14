@@ -118,6 +118,14 @@ _SESSION_ERROR_MARKERS = (
 )
 _ORA_CODE_RE = re.compile(r"\bORA-\d{5}\b")
 
+# Client/pool timeouts: the caller's budget is already spent, so never retry.
+# (DPI-1040 / DPY-4005 = pool wait exceeded; DPI-1067 / DPY-4024 = call timeout.)
+_TIMEOUT_MARKERS = ("timed out", "timeout", "DPI-1040", "DPI-1067", "DPY-4005", "DPY-4024")
+
+
+def _is_timeout_error(err: Any) -> bool:
+    return isinstance(err, TimeoutError) or any(m in str(err) for m in _TIMEOUT_MARKERS)
+
 # Row/data/constraint errors: the statement was wrong for this row (duplicate
 # caller-chosen memory_id, value too large, bad JSON), not the ONNX model.
 _DATA_ERROR_MARKERS = (
@@ -2818,7 +2826,7 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             return self._search_once(query, *args, **kwargs)
         except Exception as e:
-            if isinstance(e, TimeoutError) or "timed out" in str(e):
+            if _is_timeout_error(e):
                 raise
             if not (_is_session_error(e) or not _ORA_CODE_RE.search(str(e))):
                 raise
