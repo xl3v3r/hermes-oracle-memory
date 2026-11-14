@@ -834,9 +834,10 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn('"result": "updated"', result)
         sql, binds = mock_cur.execute.call_args[0]
         self.assertIn("embedding_model", sql)
-        # binds are positional by order of appearance: model is :4, memory_id :5
-        self.assertEqual(binds[3], "BGE_BASE_EN_V1_5")
-        self.assertEqual(binds[4], "m1")
+        # 1.1.1.3: named binds (the optional metadata.tags clause needs :tags)
+        self.assertEqual(binds["m"], "BGE_BASE_EN_V1_5")
+        self.assertEqual(binds["id"], "m1")
+        self.assertNotIn("tags", binds)  # content-only update leaves metadata alone
 
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
@@ -1236,7 +1237,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
         res = provider.handle_tool_call("oracle_search", {"query": "test", "session_id": "s1", "agent_id": "a1"})
         self.assertIn("m1", res)
-        provider._search.assert_called_with("test", top_k=8, mode="hybrid", target="any", session_id="s1", agent_id="a1")
+        provider._search.assert_called_with("test", top_k=8, mode="hybrid", target="any", session_id="s1", agent_id="a1", tags=None, tag_match="all")
 
     def test_handle_tool_call_non_dict_args(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1551,7 +1552,7 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(mock_cur.execute.call_count, 2)
         retry_call_args = mock_cur.execute.call_args_list[1][0]
         retry_binds = retry_call_args[1]
-        self.assertEqual(len(retry_binds[1]), oracle_plugin._CONSERVATIVE_EMBED_CHARS)
+        self.assertEqual(len(retry_binds["e"]), oracle_plugin._CONSERVATIVE_EMBED_CHARS)
 
     def test_oracle_update_shape_err_falls_back_to_null_and_queues_backfill(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1683,8 +1684,10 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._queue_embed_backfill.call_count, 2)
 
     def test_insert_real_data_bug_still_hard_fails(self):
-        # A true data bug must NOT be masked by the transient gate: it should
-        # mark the model failed (global cooldown) and raise RuntimeError.
+        # A true data bug (duplicate memory_id) must NOT be masked by the
+        # transient/NULL-embedding fallback: it raises to the caller. Since
+        # 1.1.1.3 it no longer trips the global ONNX cooldown -- the model is
+        # fine, only this row is wrong (and caller-chosen ids make it routine).
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
@@ -1696,7 +1699,7 @@ class TestOraclePlugin(unittest.TestCase):
         dup_err = Exception("ORA-00001: unique constraint (MEMORY_ID) violated")
         mock_cur.execute.side_effect = dup_err
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(Exception) as ctx:
             provider._insert(
                 memory_id="m_dup",
                 session_id="s1",
@@ -1704,7 +1707,9 @@ class TestOraclePlugin(unittest.TestCase):
                 content="duplicate",
                 target="memory",
             )
-        self.assertTrue(provider._onnx_in_cooldown())
+        self.assertIn("ORA-00001", str(ctx.exception))
+        self.assertEqual(mock_cur.execute.call_count, 1)  # no NULL-embedding retry
+        self.assertFalse(provider._onnx_in_cooldown())
 
     def test_embed_many_tagged_ora_54401_conservative_retry(self):
         provider = oracle_plugin.OracleMemoryProvider()

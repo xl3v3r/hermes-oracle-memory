@@ -86,6 +86,18 @@ _SESSION_ERROR_MARKERS = (
 )
 _ORA_CODE_RE = re.compile(r"\bORA-\d{5}\b")
 
+# Row/data/constraint errors: the statement was wrong for this row (duplicate
+# caller-chosen memory_id, value too large, bad JSON), not the ONNX model.
+_DATA_ERROR_MARKERS = (
+    "ORA-00001",  # unique constraint (duplicate memory_id)
+    "ORA-00942",  # table or view does not exist
+    "ORA-01400",  # cannot insert NULL
+    "ORA-01438",  # value larger than precision
+    "ORA-02290", "ORA-02291", "ORA-02292",  # check / FK constraints
+    "ORA-12899",  # value too large for column
+    "ORA-40441",  # JSON syntax error
+)
+
 
 def _is_session_error(err: Any) -> bool:
     """True when *err* indicates a bad connection/session or client timeout."""
@@ -101,6 +113,8 @@ def _is_onnx_model_failure(err: Any) -> bool:
         return True  # legacy callers without context keep the old behaviour
     if _is_session_error(err):
         return False
+    if any(m in str(err) for m in _DATA_ERROR_MARKERS):
+        return False
     return bool(_ORA_CODE_RE.search(str(err)))
 
 
@@ -112,6 +126,123 @@ import weakref as _weakref
 
 _LIVE_PROVIDERS: "_weakref.WeakSet[Any]" = _weakref.WeakSet()
 _LIVE_PROVIDERS_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Handoff rows: caller-chosen stable memory_id and/or tags (1.1.1.3)
+# ---------------------------------------------------------------------------
+# A stable id lets one agent write "handoff:<project>:<topic>" and the next one
+# read/overwrite exactly that row; tags (metadata.tags, lower-cased) let a reader
+# pull every row of a handoff set without vector search or the ONNX model.
+_MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/\-]{0,127}$")
+_MAX_TAGS = 32
+_MAX_TAG_LEN = 64
+_GET_DEFAULT_LIMIT = 20
+_GET_MAX_LIMIT = 100
+
+
+def _normalize_memory_id(value: Any) -> str:
+    """Validate a caller-supplied memory_id (1-128 chars, [A-Za-z0-9_.:@/-], no
+    leading punctuation). Raises ValueError with a model-readable message."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("memory_id must be a non-empty string")
+    mid = value.strip()
+    if not _MEMORY_ID_RE.match(mid):
+        raise ValueError(
+            "memory_id must be 1-128 chars of letters, digits, and _ . : @ / - "
+            "and start with a letter or digit"
+        )
+    return mid
+
+
+def _normalize_tags(value: Any) -> list[str]:
+    """Accept a list, a JSON-array string, or a comma-separated string. Tags are
+    stripped, lower-cased, de-duplicated (order kept). Raises ValueError when a
+    tag is empty/too long, contains control characters, or there are too many."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                value = parsed
+            else:
+                value = raw.strip("[]").split(",")
+        else:
+            value = raw.split(",") if raw else []
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError("tags must be a list of strings")
+    out: list[str] = []
+    for item in value:
+        if item is None:
+            continue
+        tag = " ".join(str(item).split()).lower()
+        if not tag:
+            continue
+        if len(tag) > _MAX_TAG_LEN:
+            raise ValueError(f"tag too long (max {_MAX_TAG_LEN} chars): {tag[:20]}...")
+        if any(ord(ch) < 32 for ch in tag):
+            raise ValueError("tags must not contain control characters")
+        if tag not in out:
+            out.append(tag)
+    if len(out) > _MAX_TAGS:
+        raise ValueError(f"too many tags (max {_MAX_TAGS})")
+    return out
+
+
+def _tag_filter_sql(tags: Any, match: str = "all", prefix: str = "tg") -> tuple[str, dict]:
+    """SQL predicate (leading ' AND ') matching metadata.tags. Tag values are bound
+    through JSON_EXISTS ... PASSING, never interpolated.
+
+    The path is applied to JSON_QUERY(metadata, '$.tags') rather than to the
+    column itself on purpose: a JSON search index on metadata (<TABLE>_JSON_IDX
+    on existing installs) would otherwise answer the predicate, and that index
+    syncs asynchronously -- a handoff row written and read back within ~2 s was
+    not found. Wrapping the column makes Oracle evaluate the tags on the rows
+    themselves (read-your-writes)."""
+    norm = _normalize_tags(tags)
+    if not norm:
+        return "", {}
+    binds: dict[str, str] = {}
+    preds: list[str] = []
+    for i, tag in enumerate(norm):
+        name = f"{prefix}{i}"
+        binds[name] = tag
+        preds.append(
+            f"JSON_EXISTS(JSON_QUERY(metadata, '$.tags' RETURNING JSON), '$[*]?(@ == ${name})' "
+            f"PASSING :{name} AS \"{name}\")"
+        )
+    joiner = " OR " if str(match or "all").lower() == "any" else " AND "
+    return " AND (" + joiner.join(preds) + ") ", binds
+
+
+def _lob_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "read"):
+        value = value.read()
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _metadata_dict(value: Any) -> dict:
+    if value is None:
+        return {}
+    if hasattr(value, "read"):
+        value = value.read()
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return {}
+    return dict(value) if isinstance(value, dict) else {}
 
 
 class _CallTimeoutPool:
@@ -278,6 +409,16 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": "Restrict search to a specific agent ID.",
                 },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only rows carrying these tags (case-insensitive), e.g. [\"handoff\", \"project:x\"].",
+                },
+                "tag_match": {
+                    "type": "string",
+                    "enum": ["all", "any"],
+                    "description": "all (default) = row has every tag; any = at least one.",
+                },
             },
             "required": ["query"],
         },
@@ -288,7 +429,9 @@ TOOL_SCHEMAS = [
             "Primary sink for persistent facts in Oracle 26ai (unlimited storage, embedded + Text + JSON indexed). "
             "Call oracle_add as the primary store whenever storing durable facts, preferences, corrections, "
             "decisions, environment details, or batch knowledge. Do NOT use local 1600-char memory for facts "
-            "that belong in Oracle. Accepts a single fact string, list of facts, or 'facts' array."
+            "that belong in Oracle. Accepts a single fact string, list of facts, or 'facts' array. "
+            "Pass memory_id (e.g. handoff:<project>:<topic>) to write a stable, addressable row: an existing "
+            "row with that id is updated in place (upsert). Pass tags to group rows for oracle_get."
         ),
         "parameters": {
             "type": "object",
@@ -307,19 +450,66 @@ TOOL_SCHEMAS = [
                     "enum": ["memory", "user"],
                     "description": "memory = environment/conventions/projects; user = who they are/preferences.",
                 },
+                "memory_id": {
+                    "type": "string",
+                    "description": "Optional stable id (1-128 chars: letters, digits, _ . : @ / -). Upserts; single fact only.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional tags stored in metadata.tags (lower-cased), e.g. [\"handoff\", \"project:x\"].",
+                },
             },
         },
     },
     {
         "name": "oracle_update",
-        "description": "Replace the text of an existing Oracle memory by memory_id (e.g. chk_* or fact_*) from oracle_search. Never use the local memory tool to edit Oracle entries.",
+        "description": "Replace the text and/or tags of an existing Oracle memory by memory_id (e.g. chk_* or fact_*, or a caller-chosen handoff id). Never use the local memory tool to edit Oracle entries.",
         "parameters": {
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string"},
-                "content": {"type": "string", "description": "New text."},
+                "content": {"type": "string", "description": "New text (optional when tags is given)."},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Replace the row's tags with this list ([] clears them).",
+                },
             },
-            "required": ["memory_id", "content"],
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "oracle_get",
+        "description": (
+            "Exact read of Oracle memories by memory_id(s) and/or tags, newest first. No embedding or "
+            "vector search, so it works while the ONNX model is cooling down. Use it to pick up a handoff: "
+            "oracle_get(memory_id='handoff:<project>:<topic>') or oracle_get(tags=['handoff','project:<name>'])."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "One exact memory_id."},
+                "memory_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Several exact memory_ids (max 100).",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Rows carrying these tags (case-insensitive).",
+                },
+                "tag_match": {
+                    "type": "string",
+                    "enum": ["all", "any"],
+                    "description": "all (default) = row has every tag; any = at least one.",
+                },
+                "session_id": {"type": "string", "description": "Restrict to a session ID."},
+                "agent_id": {"type": "string", "description": "Restrict to an agent ID."},
+                "target": {"type": "string", "enum": ["memory", "user"], "description": "Restrict to a target."},
+                "limit": {"type": "integer", "description": "Max rows (default 20, max 100)."},
+            },
         },
     },
     {
@@ -487,7 +677,9 @@ _PROMPT_BODY = (
     "go to Oracle via oracle_add. Use a stable memory_id, compact content (<~200 chars), and tags. "
     "No local fallback — if Oracle is unreachable, facts are not stored.\n\n"
     "3. MEMORY_ID LIFECYCLE: oracle_search before oracle_add to avoid duplicates. "
-    "If memory_id exists, use oracle_update(memory_id, ...). Use oracle_delete(memory_id) for obsolete or incorrect facts.\n\n"
+    "If memory_id exists, use oracle_update(memory_id, ...). Use oracle_delete(memory_id) for obsolete or incorrect facts. "
+    "oracle_add(memory_id=..., tags=[...]) writes a stable, addressable row (upsert); oracle_get(memory_id=... or tags=[...]) "
+    "reads rows back exactly, without vector search.\n\n"
     "4. STORAGE TIERS: oracle_add for atomic facts/batch lists; oracle_chunk for documents/logs/conversation exports; "
     "skill_manage for task-specific procedures; no TODO state stored anywhere.\n\n"
     "5. ORACLE-ONLY STORE: There is no local memory. MEMORY.md and all local files are off-limits for facts. "
@@ -500,7 +692,10 @@ _PROMPT_BODY = (
     "and oracle_delete the wal_ staging entry.\n\n"
     "8. SESSION SCOPING: Tag every Oracle entry: [\"global\"], [\"user:<id>\"], [\"session:<id>\"], "
     "[\"project:<name>\"], [\"session_learn\"], or [\"pending\", \"wal\"] for staging.\n\n"
-    "9. VALIDATION BEFORE WRITE: Confirm durability, dedupe via search, keep content compact, normalize terminology."
+    "9. VALIDATION BEFORE WRITE: Confirm durability, dedupe via search, keep content compact, normalize terminology.\n\n"
+    "10. HANDOFFS: To hand work to another agent or session, oracle_add(memory_id=\"handoff:<project>:<topic>\", "
+    "tags=[\"handoff\", \"project:<name>\"], content=<state, next steps, blockers>). The receiver calls "
+    "oracle_get(tags=[\"handoff\", \"project:<name>\"]) (or the exact memory_id), then oracle_update or oracle_delete it."
 )
 
 
@@ -1404,6 +1599,10 @@ class OracleMemoryProvider(MemoryProvider):
                 return
             except Exception as e:
                 err_str = str(e)
+                if "ORA-00001" in err_str:
+                    # Duplicate memory_id: not a model problem, and the
+                    # NULL-embedding fallback would hit the same constraint.
+                    raise
                 is_51815 = "ORA-51815" in err_str
                 is_54401 = "ORA-54401" in err_str
                 is_shape_err = is_51815 or is_54401
@@ -1531,6 +1730,229 @@ class OracleMemoryProvider(MemoryProvider):
 
         if vec is None:
             self._queue_embed_backfill(memory_id, content)
+
+    def _update_row(self, mid: str, content: str | None, tags: list[str] | None = None) -> int:
+        """Update a row's content (re-embedded in-database) and/or replace its
+        metadata.tags. Returns the number of rows updated (0 = not found)."""
+        if not self._pool:
+            raise RuntimeError(self._init_error or "pool not initialized")
+        meta_set = ""
+        meta_binds: dict[str, Any] = {}
+        if tags is not None:
+            meta_set = ", metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{}')), SET '$.tags' = JSON(:tags))"
+            meta_binds = {"tags": json.dumps(list(tags))}
+        if content is None:
+            if tags is None:
+                return 0
+            sql = f"""
+                UPDATE /*+ NO_PARALLEL */ {self._table}
+                SET metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')), SET '$.tags' = JSON(:tags))
+                WHERE memory_id = :id
+            """  # nosec B608
+            with self._pool.acquire() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, {"id": mid, **meta_binds})
+                    n = cur.rowcount
+                conn.commit()
+            return n
+        if not self._onnx_model:
+            raise RuntimeError(
+                "In-database ONNX model is not configured; external fallback is disabled"
+            )
+        if self._onnx_in_cooldown():
+            raise RuntimeError(
+                "In-database ONNX embedding model is in cooldown; external fallback is disabled"
+            )
+        txt = self._safe_varchar_bytes(content, 4000)
+        embed_txt = self._safe_embed_text(content)
+        with self._pool.acquire() as conn:
+            with conn.cursor() as cur:
+                succeeded = False
+                try:
+                    sql = f"""
+                        UPDATE /*+ NO_PARALLEL */ {self._table}
+                        SET content = :c, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :e AS DATA), content_txt = :t,
+                            embedding_model = :m, embedding_updated_at = SYSTIMESTAMP{meta_set}
+                        WHERE memory_id = :id
+                        """  # nosec B608
+                    cur.execute(
+                        sql,
+                        {"c": content, "e": embed_txt, "t": txt, "m": self._onnx_model, "id": mid, **meta_binds},
+                    )
+                    succeeded = True
+                except Exception as e:
+                    err_str = str(e)
+                    is_51815 = "ORA-51815" in err_str
+                    is_54401 = "ORA-54401" in err_str
+                    is_shape_err = is_51815 or is_54401
+
+                    # 1. ORA-51815: retry transient snapshot conflicts
+                    if is_51815:
+                        for attempt in range(_EMBED_MAX_RETRIES):
+                            try:
+                                time.sleep(0.05 * (attempt + 1))
+                                cur.execute(sql, {"c": content, "e": embed_txt, "t": txt, "m": self._onnx_model, "id": mid, **meta_binds})
+                                succeeded = True
+                                break
+                            except Exception as retry_e:
+                                err_str = str(retry_e)
+                                if "ORA-51815" not in err_str:
+                                    is_54401 = "ORA-54401" in err_str
+                                    is_shape_err = is_54401
+                                    break
+
+                    # 2. ORA-54401: retry with conservative token clamp
+                    if not succeeded and is_54401:
+                        conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
+                        try:
+                            cur.execute(sql, {"c": content, "e": conservative_txt, "t": txt, "m": self._onnx_model, "id": mid, **meta_binds})
+                            succeeded = True
+                        except Exception as retry_e:
+                            err_str = str(retry_e)
+                            is_51815 = "ORA-51815" in err_str
+                            is_54401 = "ORA-54401" in err_str
+                            is_shape_err = is_51815 or is_54401
+
+                    if not succeeded:
+                        if not is_shape_err and not self._is_onnx_transient(err_str):
+                            self._onnx_mark_failed(err_str)
+                            logger.warning(
+                                "In-database ONNX update failed (%s); external fallback is disabled",
+                                err_str,
+                            )
+                            raise RuntimeError(
+                                f"In-database ONNX update failed ({err_str}); external fallback is disabled"
+                            ) from e
+
+                        # 3. Fallback to NULL embedding and queue background backfill
+                        #    (also for transient server conditions — keep
+                        #    consistent with the _insert/_insert_many ladders:
+                        #    no 60 s global cooldown + lost write for a
+                        #    one-off ORA-01013/04031-class glitch)
+                        logger.warning(
+                            "In-database ONNX update hit transient/shape error (%s); updating row with null embedding and queueing backfill",
+                            err_str,
+                        )
+                        null_upd_sql = f"""
+                            UPDATE /*+ NO_PARALLEL */ {self._table}
+                            SET content = :c, embedding = NULL, content_txt = :t,
+                                embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
+                            WHERE memory_id = :id
+                        """  # nosec B608
+                        try:
+                            cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
+                            self._queue_embed_backfill(mid, content)
+                        except Exception as null_e:
+                            raise RuntimeError(
+                                f"In-database ONNX update failed ({err_str}) and fallback update failed ({null_e})"
+                            ) from null_e
+                n = cur.rowcount
+            conn.commit()
+        return n
+
+    def _upsert_fact(
+        self,
+        mid: str,
+        content: str,
+        *,
+        target: str = "memory",
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """oracle_add with a caller-chosen memory_id: update the row when it exists
+        (content re-embedded; tags replaced only when given), otherwise insert it."""
+        n = self._update_row(mid, content, tags=tags)
+        if n:
+            out: dict[str, Any] = {"result": "Fact updated (upsert).", "memory_id": mid, "upserted": True}
+        else:
+            try:
+                self._insert(
+                    memory_id=mid,
+                    session_id=self._session_id,
+                    role="fact",
+                    content=content,
+                    target=target,
+                    metadata=metadata or {"kind": "tool"},
+                )
+                out = {"result": "Fact stored.", "memory_id": mid, "upserted": False}
+            except Exception as e:
+                if "ORA-00001" not in str(e):
+                    raise
+                # Lost a race with a concurrent writer of the same id: update instead.
+                self._update_row(mid, content, tags=tags)
+                out = {"result": "Fact updated (upsert).", "memory_id": mid, "upserted": True}
+        if tags:
+            out["tags"] = tags
+        return out
+
+    def _get_rows(
+        self,
+        *,
+        memory_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+        tag_match: str = "all",
+        session_id: Any = None,
+        agent_id: Any = None,
+        target: str | None = None,
+        limit: int = _GET_DEFAULT_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Exact lookup by memory_id(s) and/or tags (no embedding, no ONNX): the
+        read side of a handoff. Newest first."""
+        if not self._pool:
+            raise RuntimeError(self._init_error or "pool not initialized")
+        where = ""
+        binds: dict[str, Any] = {}
+        if memory_ids:
+            names = []
+            for i, m in enumerate(memory_ids):
+                binds[f"m{i}"] = m
+                names.append(f":m{i}")
+            where += f" AND memory_id IN ({', '.join(names)}) "
+        if session_id:
+            where += " AND session_id = :sid "
+            binds["sid"] = session_id
+        if agent_id:
+            where += " AND agent_id = :aid "
+            binds["aid"] = agent_id
+        if target in ("memory", "user"):
+            where += " AND target = :tgt "
+            binds["tgt"] = target
+        tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
+        if not memory_ids and not tag_sql and not session_id:
+            raise ValueError("oracle_get needs memory_id, memory_ids, tags, or session_id")
+        where += tag_sql
+        binds.update(tag_binds)
+        binds["lim"] = max(1, min(int(limit or _GET_DEFAULT_LIMIT), _GET_MAX_LIMIT))
+        sql = f"""
+            SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, target, content,
+                   metadata, created_at, embedding_updated_at
+            FROM {self._table}
+            WHERE 1 = 1 {where}
+            ORDER BY COALESCE(embedding_updated_at, created_at) DESC, memory_id
+            FETCH FIRST :lim ROWS ONLY
+        """  # nosec B608 - table name validated at init; all values are bound
+        out: list[dict[str, Any]] = []
+        with self._acquire_checked() as conn:
+            conn.call_timeout = _SEARCH_TIMEOUT_MS
+            with conn.cursor() as cur:
+                cur.execute(sql, binds)
+                for row in cur.fetchall():
+                    meta = _metadata_dict(row[6])
+                    out.append(
+                        {
+                            "memory_id": row[0],
+                            "session_id": row[1],
+                            "agent_id": row[2],
+                            "role": row[3],
+                            "target": row[4],
+                            "content": _lob_text(row[5]),
+                            "tags": list(meta.get("tags") or []),
+                            "kind": meta.get("kind"),
+                            "created_at": row[7],
+                            "updated_at": row[8] or row[7],
+                        }
+                    )
+        return out
 
     def _insert_many(
         self,
@@ -1849,7 +2271,8 @@ class OracleMemoryProvider(MemoryProvider):
         return out
 
     def _build_text_search_sql(
-        self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None
+        self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None,
+        tags: Any = None, tag_match: str = "all",
     ) -> tuple[str, dict]:
         extra_filters = ""
         binds = {"q": contains_q, "k": fetch_k}
@@ -1859,6 +2282,9 @@ class OracleMemoryProvider(MemoryProvider):
         if agent_id:
             extra_filters += " AND agent_id = :aid "
             binds["aid"] = agent_id
+        tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
+        extra_filters += tag_sql
+        binds.update(tag_binds)
 
         sql = f"""
             SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
@@ -1874,13 +2300,16 @@ class OracleMemoryProvider(MemoryProvider):
         return sql, binds
 
     def _build_vector_search_sql(
-        self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
+        self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None,
+        tags: Any = None, tag_match: str = "all",
     ) -> tuple[str, dict]:
         extra_filters = ""
         if session_id:
             extra_filters += " AND session_id = :sid "
         if agent_id:
             extra_filters += " AND agent_id = :aid "
+        tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
+        extra_filters += tag_sql
 
         if use_onnx and self._onnx_model:
             sql = f"""
@@ -1915,16 +2344,20 @@ class OracleMemoryProvider(MemoryProvider):
             binds["sid"] = session_id
         if agent_id:
             binds["aid"] = agent_id
+        binds.update(tag_binds)
         return sql, binds
 
     def _build_hybrid_search_sql(
-        self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None
+        self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None,
+        tags: Any = None, tag_match: str = "all",
     ) -> tuple[str, dict]:
         extra_filters = ""
         if session_id:
             extra_filters += " AND session_id = :sid "
         if agent_id:
             extra_filters += " AND agent_id = :aid "
+        tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
+        extra_filters += tag_sql
 
         if use_onnx and self._onnx_model:
             fused_sql = f"""
@@ -1994,17 +2427,19 @@ class OracleMemoryProvider(MemoryProvider):
             fused_binds["sid"] = session_id
         if agent_id:
             fused_binds["aid"] = agent_id
+        fused_binds.update(tag_binds)
         return fused_sql, fused_binds
 
     def _execute_hybrid_search(
-        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None, timeout_s: float = _SEARCH_TIMEOUT_SECS
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None, timeout_s: float = _SEARCH_TIMEOUT_SECS,
+        tags: Any = None, tag_match: str = "all",
     ) -> list:
         merged: dict = {}
         if self._onnx_in_cooldown():
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")
             try:
                 sql, binds = self._build_text_search_sql(
-                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
@@ -2041,7 +2476,7 @@ class OracleMemoryProvider(MemoryProvider):
                 "In-database ONNX model is not configured; external fallback is disabled"
             )
         fused_sql, fused_binds = self._build_hybrid_search_sql(
-            query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
+            query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
         )
 
         degraded_to_text = False
@@ -2102,7 +2537,7 @@ class OracleMemoryProvider(MemoryProvider):
                     for vec_attempt in range(_51815_RETRIES):
                         try:
                             vec_sql, vec_binds = self._build_vector_search_sql(
-                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
+                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                             )
                             for r in self._fetch_rows(cur, vec_sql, vec_binds):
                                 r.pop("dist", None)
@@ -2157,7 +2592,7 @@ class OracleMemoryProvider(MemoryProvider):
             merged.clear()
             try:
                 sql, binds = self._build_text_search_sql(
-                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
@@ -2355,6 +2790,8 @@ class OracleMemoryProvider(MemoryProvider):
         session_id: Any = None,
         agent_id: Any = None,
         timeout: float | None = None,
+        tags: Any = None,
+        tag_match: str = "all",
     ) -> list:
         if not self._pool or not query:
             return []
@@ -2385,7 +2822,7 @@ class OracleMemoryProvider(MemoryProvider):
                 if mode == "text":
                     try:
                         sql, binds = self._build_text_search_sql(
-                            contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id
+                            contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                         )
                         rows = self._fetch_rows(cur, sql, binds)
                         for r in rows:
@@ -2422,7 +2859,7 @@ class OracleMemoryProvider(MemoryProvider):
                         )
                     try:
                         sql, binds = self._build_vector_search_sql(
-                            query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id
+                            query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                         )
                         for attempt in range(_51815_RETRIES):
                             try:
@@ -2460,7 +2897,7 @@ class OracleMemoryProvider(MemoryProvider):
                         ) from e
                 else:
                     rows = self._execute_hybrid_search(
-                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, timeout_s=query_timeout_s
+                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match, timeout_s=query_timeout_s
                     )
                 rows = self._apply_weights(rows, cur)
         return rows[:top_k]
@@ -3252,6 +3689,10 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             if tool_name == "oracle_search":
                 try:
+                    search_tags = _normalize_tags(args.get("tags"))
+                except ValueError as ve:
+                    return tool_error(str(ve))
+                try:
                     rows = self._search(
                         args.get("query") or "",
                         top_k=int(args.get("top_k") or 8),
@@ -3259,12 +3700,14 @@ class OracleMemoryProvider(MemoryProvider):
                         target=args.get("target") or "any",
                         session_id=args.get("session_id"),
                         agent_id=args.get("agent_id"),
+                        tags=search_tags or None,
+                        tag_match=str(args.get("tag_match") or "all"),
                     )
                     if not rows:
                         return json.dumps(
                             {"result": "No relevant memories found.", "count": 0}
                         )
-                    return json.dumps({"results": rows, "count": len(rows)})
+                    return json.dumps({"results": rows, "count": len(rows)}, default=_json_default)
                 except Exception as e:
                     err_str = str(e)
                     is_timeout = isinstance(e, TimeoutError) or any(
@@ -3330,6 +3773,29 @@ class OracleMemoryProvider(MemoryProvider):
                 if not facts_to_add:
                     return tool_error("Missing required parameter: content or facts")
 
+                try:
+                    add_tags = _normalize_tags(args.get("tags"))
+                    req_mid = args.get("memory_id")
+                    req_mid = _normalize_memory_id(req_mid) if req_mid not in (None, "") else None
+                except ValueError as ve:
+                    return tool_error(str(ve))
+                add_meta: dict[str, Any] = {"kind": "tool"}
+                if add_tags:
+                    add_meta["tags"] = add_tags
+
+                if req_mid is not None:
+                    if len(facts_to_add) != 1:
+                        return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
+                    return json.dumps(
+                        self._upsert_fact(
+                            req_mid,
+                            facts_to_add[0],
+                            target=target,
+                            tags=add_tags if args.get("tags") is not None else None,
+                            metadata=add_meta,
+                        )
+                    )
+
                 if len(facts_to_add) == 1:
                     mid = f"fact_{uuid.uuid4().hex[:16]}"
                     self._insert(
@@ -3338,9 +3804,12 @@ class OracleMemoryProvider(MemoryProvider):
                         role="fact",
                         content=facts_to_add[0],
                         target=target,
-                        metadata={"kind": "tool"},
+                        metadata=add_meta,
                     )
-                    return json.dumps({"result": "Fact stored.", "memory_id": mid})
+                    out = {"result": "Fact stored.", "memory_id": mid}
+                    if add_tags:
+                        out["tags"] = add_tags
+                    return json.dumps(out)
                 else:
                     mids = []
                     for f in facts_to_add:
@@ -3351,7 +3820,7 @@ class OracleMemoryProvider(MemoryProvider):
                             role="fact",
                             content=f,
                             target=target,
-                            metadata={"kind": "tool"},
+                            metadata=add_meta,
                         )
                         mids.append(mid)
                     return json.dumps({
@@ -3362,104 +3831,51 @@ class OracleMemoryProvider(MemoryProvider):
             if tool_name == "oracle_update":
                 mid = args.get("memory_id")
                 content = (args.get("content") or "").strip()
-                if not mid or not content:
-                    return tool_error("memory_id and content required")
-                if not self._onnx_model:
-                    raise RuntimeError(
-                        "In-database ONNX model is not configured; external fallback is disabled"
-                    )
-                if self._onnx_in_cooldown():
-                    raise RuntimeError(
-                        "In-database ONNX embedding model is in cooldown; external fallback is disabled"
-                    )
-                txt = self._safe_varchar_bytes(content, 4000)
-                embed_txt = self._safe_embed_text(content)
-                with self._pool.acquire() as conn:
-                    with conn.cursor() as cur:
-                        succeeded = False
-                        try:
-                            sql = f"""
-                                UPDATE /*+ NO_PARALLEL */ {self._table}
-                                SET content = :1, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :2 AS DATA), content_txt = :3,
-                                    embedding_model = :4, embedding_updated_at = SYSTIMESTAMP
-                                WHERE memory_id = :5
-                                """  # nosec B608
-                            cur.execute(
-                                sql,
-                                (content, embed_txt, txt, self._onnx_model, mid),
-                            )
-                            succeeded = True
-                        except Exception as e:
-                            err_str = str(e)
-                            is_51815 = "ORA-51815" in err_str
-                            is_54401 = "ORA-54401" in err_str
-                            is_shape_err = is_51815 or is_54401
-
-                            # 1. ORA-51815: retry transient snapshot conflicts
-                            if is_51815:
-                                for attempt in range(_EMBED_MAX_RETRIES):
-                                    try:
-                                        time.sleep(0.05 * (attempt + 1))
-                                        cur.execute(sql, (content, embed_txt, txt, self._onnx_model, mid))
-                                        succeeded = True
-                                        break
-                                    except Exception as retry_e:
-                                        err_str = str(retry_e)
-                                        if "ORA-51815" not in err_str:
-                                            is_54401 = "ORA-54401" in err_str
-                                            is_shape_err = is_54401
-                                            break
-
-                            # 2. ORA-54401: retry with conservative token clamp
-                            if not succeeded and is_54401:
-                                conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
-                                try:
-                                    cur.execute(sql, (content, conservative_txt, txt, self._onnx_model, mid))
-                                    succeeded = True
-                                except Exception as retry_e:
-                                    err_str = str(retry_e)
-                                    is_51815 = "ORA-51815" in err_str
-                                    is_54401 = "ORA-54401" in err_str
-                                    is_shape_err = is_51815 or is_54401
-
-                            if not succeeded:
-                                if not is_shape_err and not self._is_onnx_transient(err_str):
-                                    self._onnx_mark_failed(err_str)
-                                    logger.warning(
-                                        "In-database ONNX update failed (%s); external fallback is disabled",
-                                        err_str,
-                                    )
-                                    raise RuntimeError(
-                                        f"In-database ONNX update failed ({err_str}); external fallback is disabled"
-                                    ) from e
-
-                                # 3. Fallback to NULL embedding and queue background backfill
-                                #    (also for transient server conditions — keep
-                                #    consistent with the _insert/_insert_many ladders:
-                                #    no 60 s global cooldown + lost write for a
-                                #    one-off ORA-01013/04031-class glitch)
-                                logger.warning(
-                                    "In-database ONNX update hit transient/shape error (%s); updating row with null embedding and queueing backfill",
-                                    err_str,
-                                )
-                                null_upd_sql = f"""
-                                    UPDATE /*+ NO_PARALLEL */ {self._table}
-                                    SET content = :1, embedding = NULL, content_txt = :2,
-                                        embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP
-                                    WHERE memory_id = :3
-                                """  # nosec B608
-                                try:
-                                    cur.execute(null_upd_sql, (content, txt, mid))
-                                    self._queue_embed_backfill(mid, content)
-                                except Exception as null_e:
-                                    raise RuntimeError(
-                                        f"In-database ONNX update failed ({err_str}) and fallback update failed ({null_e})"
-                                    ) from null_e
-                        n = cur.rowcount
-                    conn.commit()
+                has_tags = args.get("tags") is not None
+                if not mid or (not content and not has_tags):
+                    return tool_error("memory_id and content (or tags) required")
+                try:
+                    upd_tags = _normalize_tags(args.get("tags")) if has_tags else None
+                except ValueError as ve:
+                    return tool_error(str(ve))
+                n = self._update_row(mid, content or None, tags=upd_tags)
                 if not n:
                     return tool_error(f"Memory not found: {mid}")
-                return json.dumps({"result": "updated", "memory_id": mid})
+                out = {"result": "updated", "memory_id": mid}
+                if upd_tags is not None:
+                    out["tags"] = upd_tags
+                return json.dumps(out)
+            if tool_name == "oracle_get":
+                try:
+                    ids: list[str] = []
+                    raw_ids = ([args["memory_id"]] if args.get("memory_id") else []) + list(args.get("memory_ids") or [])
+                    for raw in raw_ids:
+                        norm_id = _normalize_memory_id(raw)
+                        if norm_id not in ids:
+                            ids.append(norm_id)
+                    if len(ids) > _GET_MAX_LIMIT:
+                        return tool_error(f"too many memory_ids (max {_GET_MAX_LIMIT})")
+                    get_tags = _normalize_tags(args.get("tags"))
+                    default_limit = len(ids) if ids and not get_tags else _GET_DEFAULT_LIMIT
+                    rows = self._get_rows(
+                        memory_ids=ids or None,
+                        tags=get_tags or None,
+                        tag_match=str(args.get("tag_match") or "all"),
+                        session_id=args.get("session_id"),
+                        agent_id=args.get("agent_id"),
+                        target=args.get("target"),
+                        limit=int(args.get("limit") or default_limit),
+                    )
+                except ValueError as ve:
+                    return tool_error(str(ve))
+                found = {r["memory_id"] for r in rows}
+                out: dict[str, Any] = {"results": rows, "count": len(rows)}
+                missing = [m for m in ids if m not in found]
+                if missing:
+                    out["missing"] = missing
+                if not rows:
+                    out["result"] = "No matching memories."
+                return json.dumps(out, default=_json_default)
             if tool_name == "oracle_delete":
                 mid = args.get("memory_id")
                 sid = args.get("session_id")
