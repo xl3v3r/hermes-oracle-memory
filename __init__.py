@@ -1035,6 +1035,11 @@ class OracleMemoryProvider(MemoryProvider):
 
         # Idempotent initialization: reuse existing pool if configuration matches
         if self._pool is not None and self._initialized and self._pool_fingerprint == current_fingerprint:
+            # Re-arm after a "busy" shutdown(), which returns early with the pool
+            # still open but the writer stopped and the provider unregistered.
+            self._write_stop.clear()
+            with _LIVE_PROVIDERS_LOCK:
+                _LIVE_PROVIDERS.add(self)
             logger.debug("Oracle memory pool already initialized with matching config; reusing pool.")
             return
 
@@ -2517,9 +2522,11 @@ class OracleMemoryProvider(MemoryProvider):
         return fused_sql, fused_binds
 
     def _execute_hybrid_search(
-        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None, timeout_s: float = _SEARCH_TIMEOUT_SECS,
+        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None, timeout_s: float | None = None,
         tags: Any = None, tag_match: str = "all",
     ) -> list:
+        if timeout_s is None:
+            timeout_s = _SEARCH_TIMEOUT_SECS  # read at call time (initialize() refreshes it)
         merged: dict = {}
         if self._onnx_in_cooldown():
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")

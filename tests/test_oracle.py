@@ -297,6 +297,35 @@ class TestOraclePlugin(unittest.TestCase):
                 provider._search("q")
             self.assertEqual(provider._execute_hybrid_search.call_count, 1, msg)
 
+    def test_reinitialize_after_busy_shutdown_rearms_provider(self):
+        secrets = {"OCI_DB_USER": "TESTUSER", "OCI_DB_PASSWORD": "TESTPASSWORD", "OCI_DB_DSN": "db_low"}
+        with patch.object(oracle_plugin, "get_secret", side_effect=lambda k, d=None: secrets.get(k, d)):
+            with patch("oracledb.SessionPool") as mock_session_pool:
+                provider = oracle_plugin.OracleMemoryProvider()
+                provider._verify_schema = MagicMock()
+                provider._ensure_schema = MagicMock()
+                provider._ensure_write_worker = MagicMock()
+                try:
+                    provider.initialize("s1")
+                    pool = provider._pool
+                    self.assertEqual(mock_session_pool.call_count, 1)
+                    busy = MagicMock()
+                    busy.is_alive.return_value = True
+                    provider._write_worker = busy
+                    provider.shutdown()  # busy -> returns early, pool left open
+                    self.assertIs(provider._pool, pool)
+                    self.assertTrue(provider._write_stop.is_set())
+                    self.assertNotIn(provider, oracle_plugin._LIVE_PROVIDERS)
+                    provider._write_worker = None
+                    provider.initialize("s2")  # same config -> reuse path
+                    self.assertEqual(mock_session_pool.call_count, 1)
+                    self.assertIs(provider._pool, pool)
+                    self.assertFalse(provider._write_stop.is_set())
+                    self.assertIn(provider, oracle_plugin._LIVE_PROVIDERS)
+                finally:
+                    with oracle_plugin._LIVE_PROVIDERS_LOCK:
+                        oracle_plugin._LIVE_PROVIDERS.discard(provider)
+
     def test_search_still_retries_broken_session_once(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._onnx_model = "BGE_BASE_EN_V1_5"
