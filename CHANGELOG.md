@@ -19,7 +19,7 @@ All notable changes to this project are documented in this file.
 - **Search timeout env ignored**: `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now drives the per-query clamp (default raised 13 s → 30 s); float values for `HERMES_ORACLE_INGEST_TIMEOUT` no longer crash `initialize()` / `scripts/sync_skills.py`.
 - **Destructive tests**: the drift test no longer copies over `~/.hermes/plugins/oracle` and profile copies (now read-only, opt-in via `HERMES_ORACLE_DRIFT_DIR`); `tests/test_skill_bundles.py` (wrote into `~/.hermes/skills`) removed; the version test no longer deletes files.
 - CLA workflow allowlist syntax (comma-separated).
-- **Credential exfiltration via `oracle_chunk(file_path=...)`** (security): the tool read any file the model named and stored it in the shared database. Credential and system paths (`.env*`, `auth.json`, `.netrc`, `.ssh`/`.aws`/`.oci`/`.gnupg`/… directories, `*.pem`/`*.key`/wallets, `/etc`, `/proc`, `/root`, …) are refused after `resolve()`, so `..` and symlinks cannot bypass the check.
+- **Credential exfiltration via `oracle_chunk(file_path=...)`** (security): the tool read any file the model named and stored it in the shared database. Credential and system paths (`.env*`, `auth.json`, `.netrc`, `.ssh`/`.aws`/`.oci`/`.gnupg`/… directories, `*.pem`/`*.key`/wallets, `/etc`, `/proc`, `/root`, …) are refused after `resolve()`, so `..` and symlinks cannot bypass the check (macOS `/private/...` roots included; token stores such as `.config/gcloud`, `.config/gh`, `.envrc` and shell history too). The user's home and `HERMES_HOME` are exempt from the system-root check only, so root/service installs keep working.
 - **`oracle_delete` thread purge could wipe shared data**: `session_id="skills"` deleted the whole skill corpus and `"none"` unrelated rows. Reserved ids are refused, a purge never deletes `role='skill'` rows, and passing both `memory_id` and `session_id` is an error.
 - **`oracle_sync_skills` argument handling**: a string `dirs` was iterated per character (scanning `/`); `force="false"` meant true. `dirs` accepts a string or list, refuses `/`, `$HOME`, system and credential dirs; `force` parses text; `mode`/`batch_size` validated.
 - **Skill-lifecycle sync never ran in-process**: `from scripts.sync_skills import …` resolves to the host's own `scripts` package inside Hermes and failed silently. The module is now loaded by path and cached; importing it no longer reads the Hermes `.env`, re-execs, or edits `sys.path` (CLI only).
@@ -27,9 +27,9 @@ All notable changes to this project are documented in this file.
 - **Connections reused after a call timeout**: a timed-out session (`DPY-4024`, `DPI-1067`, …) is dropped instead of returned to the pool; reusing it was the likely source of `ORA-01002` / `'NoneType' object is not iterable` on later searches. `_search` never retries a timeout.
 - **Prefetch start race**: two concurrent prefetches could `start()` the same thread (`threads can only be started once`).
 - **Failed `initialize()` looked ready**: on any init error the new pool is closed, `_initialized` cleared and the provider unregistered from the hook registry.
-- **Busy `shutdown()` then re-`initialize()`** left background writes stopped/unregistered; the reuse path now re-arms the provider. `shutdown()` gives a read-only prefetch thread 3 s and never leaks the pool for it.
+- **Busy `shutdown()` then re-`initialize()`** left background writes stopped/unregistered; the reuse path now re-arms the provider. `shutdown()` gives a read-only prefetch thread 3 s, then force-closes the pool if a read still holds a connection instead of leaking it. A provider is registered for hooks only after schema setup succeeds.
 - **`oracle_get`**: a string `memory_ids` is no longer split into characters (accepts one id, comma/space list, or JSON array); results cut off by `limit` report `truncated` instead of listing existing rows as `missing`; id lookups combined with tags default the limit to the id count.
-- **Upsert race with a concurrent delete** returned `upserted: true` with nothing written; it now returns an error. `_update_row` drops broken sessions like other paths; the hook fallback picks the newest provider by registration order (WeakSet order is arbitrary).
+- **Upsert race with a concurrent delete** returned `upserted: true` with nothing written; it now returns an error. `_update_row` and the `oracle_delete` purge drop broken sessions like other paths; the hook fallback picks the newest provider by registration order (WeakSet order is arbitrary).
 - `scripts/sync_skills.py` parses `HERMES_ORACLE_INGEST_TIMEOUT` with the plugin's clamp (30–7200 s; bad/≤0 → 600 s) instead of crashing or disabling the timeout.
 
 ### Changed
@@ -39,7 +39,7 @@ All notable changes to this project are documented in this file.
 
 ### Notes
 - No schema change. Single-current-notes convention maintained: this is `RELEASE_NOTES_1.1.1.3.md`; the v1.1.1.2 notes file was removed.
-- Test suite: 303 passed / 3 skipped (new `tests/test_audit_fixes.py`).
+- Test suite: 307 passed / 3 skipped (new `tests/test_audit_fixes.py`).
 
 ## [1.1.1.2] - 2026-11-10
 

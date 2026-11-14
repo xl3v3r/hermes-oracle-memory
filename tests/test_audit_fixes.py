@@ -61,6 +61,29 @@ class TestChunkSecretGuard(unittest.TestCase):
             p, _ = _provider()
             self.assertIn("Refusing to read", p.handle_tool_call("oracle_chunk", {"file_path": f}))
 
+    def test_macos_private_roots_refused(self):
+        for f in ("/private/etc/ssh/sshd_config", "/private/var/db/x", "/private/var/root/notes"):
+            self.assertEqual(oracle_plugin._sensitive_path_reason(Path(f)), "system path", f)
+
+    def test_home_and_hermes_home_exempt_from_system_roots_only(self):
+        with patch.object(oracle_plugin.Path, "home", return_value=Path("/root")), \
+                patch.dict(os.environ, {"HERMES_HOME": "/var/lib/hermes"}):
+            r = oracle_plugin._sensitive_path_reason
+            self.assertEqual(r(Path("/root/docs/notes.md")), "")
+            self.assertEqual(r(Path("/var/lib/hermes/skills/x/SKILL.md")), "")
+            self.assertNotEqual(r(Path("/root") / ".ssh" / "config"), "")
+            self.assertNotEqual(r(Path("/var/lib/hermes/.env")), "")
+            self.assertEqual(r(Path("/var/lib/postgresql/data")), "system path")
+            self.assertEqual(r(Path("/etc/hostname")), "system path")
+
+    def test_tool_token_stores_refused(self):
+        r = oracle_plugin._sensitive_path_reason
+        for f in ("/home/u/.config/gcloud/application_default_credentials.json",
+                  "/home/u/.config/gh/hosts.yml", "/home/u/.cargo/credentials.toml",
+                  "/home/u/proj/.envrc", "/home/u/.bash_history"):
+            self.assertNotEqual(r(Path(f)), "", f)
+        self.assertEqual(r(Path("/home/u/.config/myapp/settings.json")), "")
+
     def test_plain_document_is_allowed(self):
         for name in ("notes.md", "export.json", "env-setup.txt"):
             self.assertEqual(oracle_plugin._sensitive_path_reason(Path("/home/u/docs") / name), "", name)
@@ -103,7 +126,7 @@ class TestSyncSkillsArgs(unittest.TestCase):
             self.assertEqual(p.sync_skills.call_args[1]["dirs"], [d.resolve()])
 
     def test_root_home_and_secret_dirs_refused(self):
-        for bad in ("/", "/home", str(Path.home()), str(Path.home() / ".ssh"), "/etc"):
+        for bad in ("/", "/home", str(Path.home()), str(Path.home().parent), str(Path.home() / ".ssh"), "/etc"):
             p, out = self._call({"dirs": [bad]})
             self.assertIn("refusing to scan", out, bad)
             p.sync_skills.assert_not_called()

@@ -191,18 +191,50 @@ _SENSITIVE_FILE_NAMES = frozenset({
     ".env", "auth.json", ".netrc", ".pgpass", ".git-credentials", ".npmrc", ".pypirc",
     "credentials", "credentials.json", "cwallet.sso", "ewallet.p12", "ewallet.pem",
     "keystore.jks", "truststore.jks", "shadow", "gshadow",
+    "application_default_credentials.json", "credentials.db", "access_tokens.db",
+    "credentials.toml", "credentials.tfrc.json", ".envrc",
+    ".bash_history", ".zsh_history", ".python_history", ".psql_history", ".mysql_history",
 })
+# Tool config dirs under ~/.config that hold tokens (gcloud, GitHub CLI, ...).
+_SENSITIVE_CONFIG_DIRS = frozenset({"gcloud", "gh", "hub", "doctl", "rclone", "op", "1password"})
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".kdbx", ".env", ".sso")
-_SENSITIVE_ROOTS = ("/proc", "/sys", "/dev", "/etc", "/boot", "/root", "/var/lib", "/run")
+_SENSITIVE_ROOTS = (
+    "/proc", "/sys", "/dev", "/etc", "/boot", "/root", "/var/lib", "/run",
+    # macOS: resolve() maps /etc and /var to /private/...
+    "/private/etc", "/private/var/root", "/private/var/db", "/private/var/lib",
+)
+
+
+def _trusted_home_roots() -> list[Path]:
+    """The user's home and HERMES_HOME, exempt from the system-root check (but
+    not from the credential name checks): when Hermes runs as root its home is
+    /root, and service installs may use HERMES_HOME=/var/lib/hermes."""
+    out = []
+    for raw in (str(Path.home()), os.environ.get("HERMES_HOME", "")):
+        if not raw:
+            continue
+        try:
+            r = Path(raw).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if len(r.parts) >= 2:  # never exempt "/"
+            out.append(r)
+    return out
 
 
 def _sensitive_path_reason(p: Path) -> str:
     """Non-empty reason when *p* (already resolved) looks like a secret store."""
     sp = str(p)
-    if sp == "/" or any(sp == r or sp.startswith(r + "/") for r in _SENSITIVE_ROOTS):
+    if sp == "/":
+        return "system path"
+    if any(sp == r or sp.startswith(r + "/") for r in _SENSITIVE_ROOTS) and not any(
+        p.is_relative_to(h) for h in _trusted_home_roots()
+    ):
         return "system path"
     parts = [x.lower() for x in p.parts]
-    if any(x in _SENSITIVE_DIR_NAMES for x in parts):
+    if any(x in _SENSITIVE_DIR_NAMES for x in parts) or any(
+        a == ".config" and b in _SENSITIVE_CONFIG_DIRS for a, b in zip(parts, parts[1:])
+    ):
         return "credentials directory"
     name = parts[-1] if parts else ""
     if (name in _SENSITIVE_FILE_NAMES or name.startswith(".env.") or name.endswith(_SENSITIVE_SUFFIXES)
@@ -1230,8 +1262,9 @@ class OracleMemoryProvider(MemoryProvider):
             self._initialized = True
             self._pool_fingerprint = current_fingerprint
             self._write_stop.clear()
-            _register_live_provider(self)
             self._ensure_schema()
+            # Register only once ready, so hooks never route to a half-built provider.
+            _register_live_provider(self)
             self._init_error = ""
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
         except Exception as e:
@@ -4111,7 +4144,7 @@ class OracleMemoryProvider(MemoryProvider):
                         f"session_id '{sid}' is shared by unrelated rows (skill corpus / rows without a "
                         "session) and cannot be purged; delete individual rows by memory_id"
                     )
-                with self._pool.acquire() as conn:
+                with self._acquire_checked() as conn:
                     with conn.cursor() as cur:
                         if sid:
                             # Skill-corpus rows are shared across hosts: never purged by thread.
@@ -4266,7 +4299,9 @@ class OracleMemoryProvider(MemoryProvider):
                     dirs = []
                     for d in raw_dirs:
                         dp = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
-                        if dp == Path.home().resolve() or _sensitive_path_reason(dp) or len(dp.parts) < 3:
+                        # Refuse broad roots: "/", $HOME and any ancestor of it, system/credential dirs.
+                        if (Path.home().resolve().is_relative_to(dp) or _sensitive_path_reason(dp)
+                                or len(dp.parts) < 3):
                             return tool_error(f"refusing to scan {d}: pass a specific skills directory")
                         if not dp.is_dir():
                             return tool_error(f"not a directory: {d}")
@@ -4453,7 +4488,14 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 self._pool.close()
             except Exception as e:
-                logger.debug("oracle pool close: %s", e)
+                # Writers are idle here, so a busy connection belongs to a read
+                # (prefetch still in its search): force the close rather than
+                # leak the pool and its ADB sessions.
+                logger.info("oracle pool close: %s; forcing", e)
+                try:
+                    self._pool.close(force=True)
+                except Exception as e2:
+                    logger.warning("oracle pool forced close failed: %s", e2)
             self._pool = None
 
 

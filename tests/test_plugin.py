@@ -288,6 +288,18 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
         pool.close.assert_called_once()
         self.assertIsNone(p._pool)
 
+    def test_shutdown_forces_close_when_prefetch_still_holds_a_connection(self):
+        from unittest.mock import call
+        p = oracle_plugin.OracleMemoryProvider()
+        pool = MagicMock()
+        pool.close.side_effect = [Exception("DPY-1005: unable to close pool with busy connections"), None]
+        p._pool = pool; p._initialized = True
+        pf = MagicMock(); pf.is_alive.return_value = True
+        p._prefetch_thread = pf
+        p.shutdown()
+        self.assertEqual(pool.close.call_args_list, [call(), call(force=True)])
+        self.assertIsNone(p._pool)
+
     def test_queue_on_dead_provider_is_handed_off_not_failed(self):
         a = self._live("sess-A")
         b = oracle_plugin.OracleMemoryProvider()

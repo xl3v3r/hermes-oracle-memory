@@ -41,7 +41,7 @@
 
   Bad or non-positive values fall back to the default (logged once). The pool fingerprint now includes the wait and idle settings.
 - **Audit fixes (security and data safety)**:
-  - `oracle_chunk(file_path=...)` refuses credential and system paths after `resolve()` (`.env*`, `auth.json`, `.netrc`, `.git-credentials`, `.ssh`/`.aws`/`.oci`/`.gnupg`/`.kube`/… directories, `*.pem`/`*.key`/`*.p12`/wallets, `id_*` keys, `/etc`, `/proc`, `/sys`, `/root`, …).
+  - `oracle_chunk(file_path=...)` refuses credential and system paths after `resolve()` (`.env*`, `auth.json`, `.netrc`, `.git-credentials`, `.ssh`/`.aws`/`.oci`/`.gnupg`/`.kube`/… directories, `*.pem`/`*.key`/`*.p12`/wallets, `id_*` keys, `.config/gcloud`/`.config/gh`, `.envrc`, shell history, `/etc`, `/proc`, `/sys`, `/root`, `/var/lib`, and the macOS `/private/...` equivalents). The user's home and `HERMES_HOME` are exempt from the system-root check only (root and service installs), never from the credential-name checks.
   - `oracle_delete`: reserved `session_id`s (`skills`, `none`, `null`) refused; a thread purge never deletes skill rows; `memory_id` and `session_id` together is an error.
   - `oracle_sync_skills`: string `dirs` handled as one path; `/`, `$HOME`, system and credential dirs refused (max 20); `force` parses `"false"`; `mode` and `batch_size` validated.
 - **Audit fixes (reliability)**:
@@ -49,9 +49,9 @@
   - Skill lookups skip hidden trees (`.archive/`), so archived skills are pruned.
   - Any call timeout drops the pooled session instead of reusing it (stale cursor → `ORA-01002`).
   - Prefetch starts the thread it created under the lock (no double `start()`).
-  - Failed `initialize()` closes the new pool, clears `_initialized`, and unregisters the provider; a same-config re-`initialize()` after a busy `shutdown()` re-arms the writer and registry; `shutdown()` waits at most 3 s for a read-only prefetch.
+  - Failed `initialize()` closes the new pool, clears `_initialized`, and unregisters the provider; a same-config re-`initialize()` after a busy `shutdown()` re-arms the writer and registry; `shutdown()` waits at most 3 s for a read-only prefetch, then force-closes the pool rather than leaking it; providers are registered for hooks only after schema setup succeeds.
   - `oracle_get`: string `memory_ids` (single, comma/space list, JSON array) no longer split into characters; `truncated` instead of false `missing` when `limit` cuts results.
-  - Upsert racing a concurrent delete returns an error instead of `upserted: true`; `_update_row` uses the checked acquire; hook fallback picks the newest provider by registration order.
+  - Upsert racing a concurrent delete returns an error instead of `upserted: true`; `_update_row` and the `oracle_delete` purge use the checked acquire; hook fallback picks the newest provider by registration order.
 - **Tests and CI**: the drift test is read-only and opt-in (`HERMES_ORACLE_DRIFT_DIR=<installed plugin dir>`); `tests/test_skill_bundles.py` is removed; the version test no longer deletes files; new `tests/test_handoff.py` (25 tests) and timeout tests. New `.github/workflows/tests.yml` runs the suite on Python 3.11 and 3.13 with a sandboxed `HOME` plus a version-drift check. CLA workflow allowlist syntax fixed (comma-separated; bot accounts no longer block PRs).
 - Version bump `1.1.1.2` → `1.1.1.3` across `VERSION`, `plugin.yaml`, `pyproject.toml`, `__version__`, README/INSTALL badges, and both `skills/*/SKILL.md` pins. Release-notes rotation: `RELEASE_NOTES_1.1.1.2.md` → `RELEASE_NOTES_1.1.1.3.md` (v1.1.1.2 details remain in `CHANGELOG.md`).
 
@@ -62,6 +62,6 @@
 - **Never run the test suite of v1.1.1.2 or older on a host with an installed plugin** — see "Destructive test suite" above. From 1.1.1.3, running it with `HOME` pointed at a scratch directory is still recommended.
 
 ### Verification
-- Test suite: 303 passed, 3 skipped (sandboxed `HOME`; installed plugin checksum unchanged before/after); identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The 16 new audit tests fail against the previous code.
+- Test suite: 307 passed, 3 skipped (sandboxed `HOME`; installed plugin checksum unchanged before/after); identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The new audit tests fail against the previous code.
 - `mypy` (3.11) clean on `__init__.py`; `ruff` (F, E9) clean on changed files; syntax-checked for 3.10–3.13. Plugin scanner: no critical/high findings.
 - Live end-to-end against Oracle ADB 26ai: handoff insert, upsert, tag-preserving upsert, `oracle_get` by id/tags (`all`/`any`), tags-only update, tag-filtered search in text/vector/hybrid modes, and cleanup — 15/15 checks pass under the new pool settings.
