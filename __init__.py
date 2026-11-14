@@ -12,6 +12,7 @@ import array
 import decimal
 import html
 import importlib.util
+import itertools
 import json
 import logging
 import math
@@ -166,6 +167,88 @@ import weakref as _weakref
 
 _LIVE_PROVIDERS: "_weakref.WeakSet[Any]" = _weakref.WeakSet()
 _LIVE_PROVIDERS_LOCK = threading.Lock()
+_LIVE_SEQ = itertools.count(1)
+
+
+def _register_live_provider(provider: Any) -> None:
+    """Add *provider* to the live registry, stamping registration order so the
+    hook fallback can pick the newest one (WeakSet iteration is unordered)."""
+    with _LIVE_PROVIDERS_LOCK:
+        provider._live_seq = next(_LIVE_SEQ)
+        _LIVE_PROVIDERS.add(provider)
+
+
+# oracle_chunk(file_path=...) stores the file in the SHARED database, where any
+# later oracle_search on any host can read it back. A prompt-injected call must
+# not be able to copy credentials there, so refuse well-known secret locations.
+_RESERVED_SESSION_IDS = frozenset({"skills", "none", "null"})
+
+_SENSITIVE_DIR_NAMES = frozenset({
+    ".ssh", ".gnupg", ".aws", ".oci", ".kube", ".docker", ".azure", ".gcloud",
+    ".password-store", ".pki", ".secrets",
+})
+_SENSITIVE_FILE_NAMES = frozenset({
+    ".env", "auth.json", ".netrc", ".pgpass", ".git-credentials", ".npmrc", ".pypirc",
+    "credentials", "credentials.json", "cwallet.sso", "ewallet.p12", "ewallet.pem",
+    "keystore.jks", "truststore.jks", "shadow", "gshadow",
+})
+_SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".kdbx", ".env", ".sso")
+_SENSITIVE_ROOTS = ("/proc", "/sys", "/dev", "/etc", "/boot", "/root", "/var/lib", "/run")
+
+
+def _sensitive_path_reason(p: Path) -> str:
+    """Non-empty reason when *p* (already resolved) looks like a secret store."""
+    sp = str(p)
+    if sp == "/" or any(sp == r or sp.startswith(r + "/") for r in _SENSITIVE_ROOTS):
+        return "system path"
+    parts = [x.lower() for x in p.parts]
+    if any(x in _SENSITIVE_DIR_NAMES for x in parts):
+        return "credentials directory"
+    name = parts[-1] if parts else ""
+    if (name in _SENSITIVE_FILE_NAMES or name.startswith(".env.") or name.endswith(_SENSITIVE_SUFFIXES)
+            or re.fullmatch(r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?", name)):
+        return "credentials file"
+    return ""
+
+
+def _as_bool(v: Any) -> bool:
+    """Tool-argument boolean: bool("false") is True, so parse text explicitly."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+_SYNC_MOD_NAME = "hermes_oracle_sync_skills"
+_SYNC_MOD_LOCK = threading.Lock()
+
+
+def _sync_skills_module() -> Any:
+    """scripts/sync_skills.py, loaded by file path and cached. Never use
+    `import scripts.sync_skills` in-process: inside Hermes the top-level name
+    `scripts` is the host's own package, so that import fails (silently, in the
+    skill-lifecycle hook)."""
+    with _SYNC_MOD_LOCK:
+        mod = sys.modules.get(_SYNC_MOD_NAME)
+        if mod is None:
+            path = Path(__file__).resolve().parent / "scripts" / "sync_skills.py"
+            if not path.exists():
+                raise ImportError(f"Cannot find sync_skills script at {path}")
+            mod = _load_module_from_path(_SYNC_MOD_NAME, path)
+        return mod
+
+
+def _skill_md_matches(root: Path, skill_name: str) -> list[Path]:
+    """<root>/*/<skill_name>/SKILL.md, ignoring hidden trees such as .archive/
+    (Hermes moves archived skills there before emitting 'archived')."""
+    out = []
+    for sub in root.glob(f"*/{skill_name}/SKILL.md"):
+        try:
+            rel = sub.relative_to(root).parts
+        except ValueError:
+            continue
+        if not any(part.startswith(".") for part in rel):
+            out.append(sub)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +262,25 @@ _MAX_TAGS = 32
 _MAX_TAG_LEN = 64
 _GET_DEFAULT_LIMIT = 20
 _GET_MAX_LIMIT = 100
+
+
+def _id_list(raw: Any) -> list[Any]:
+    """memory_ids as a list. LLM callers often pass one id or a comma/space
+    separated (or JSON-array) string; list("abc") would split it into chars."""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if txt.startswith("["):
+            try:
+                parsed = json.loads(txt)
+            except ValueError:
+                raise ValueError("memory_ids: invalid JSON array") from None
+            return list(parsed) if isinstance(parsed, list) else [parsed]
+        return [p for p in re.split(r"[,\s]+", txt) if p]
+    if isinstance(raw, (list, tuple, set)):
+        return list(raw)
+    return [raw]
 
 
 def _normalize_memory_id(value: Any) -> str:
@@ -591,7 +693,7 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "oracle_delete",
-        "description": "Delete an Oracle memory by memory_id (e.g. chk_* or fact_*) or purge an entire session thread by session_id from oracle_search. Never use the local memory tool to remove Oracle entries.",
+        "description": "Delete an Oracle memory by memory_id (e.g. chk_* or fact_*) or purge an entire session thread by session_id from oracle_search (pass one, not both; skill-corpus rows and the shared ids 'skills'/'none' are never purged). Never use the local memory tool to remove Oracle entries.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1038,11 +1140,11 @@ class OracleMemoryProvider(MemoryProvider):
             # Re-arm after a "busy" shutdown(), which returns early with the pool
             # still open but the writer stopped and the provider unregistered.
             self._write_stop.clear()
-            with _LIVE_PROVIDERS_LOCK:
-                _LIVE_PROVIDERS.add(self)
+            _register_live_provider(self)
             logger.debug("Oracle memory pool already initialized with matching config; reusing pool.")
             return
 
+        new_pool: Any = None
         try:
             import oracledb
 
@@ -1123,13 +1225,14 @@ class OracleMemoryProvider(MemoryProvider):
 
             pool_kwargs["session_callback"] = _session_callback
 
-            self._pool = _CallTimeoutPool(oracledb.SessionPool(**pool_kwargs), pool_call_timeout)
+            new_pool = _CallTimeoutPool(oracledb.SessionPool(**pool_kwargs), pool_call_timeout)
+            self._pool = new_pool
             self._initialized = True
             self._pool_fingerprint = current_fingerprint
             self._write_stop.clear()
-            with _LIVE_PROVIDERS_LOCK:
-                _LIVE_PROVIDERS.add(self)
+            _register_live_provider(self)
             self._ensure_schema()
+            self._init_error = ""
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
         except Exception as e:
             err_msg = str(e)
@@ -1137,7 +1240,18 @@ class OracleMemoryProvider(MemoryProvider):
                 err_msg = err_msg.replace(password, "******")
             self._init_error = err_msg
             logger.error("Oracle memory pool failed: %s", err_msg)
+            # Not ready: never look initialized, never receive hook/handoff
+            # writes, and do not leak the sessions of a pool built in this call.
             self._pool = None
+            self._initialized = False
+            self._pool_fingerprint = ""
+            with _LIVE_PROVIDERS_LOCK:
+                _LIVE_PROVIDERS.discard(self)
+            if new_pool is not None:
+                try:
+                    new_pool.close(force=True)
+                except Exception as close_e:
+                    logger.debug("oracle pool close after failed init: %s", close_e)
 
     def _ensure_schema(self) -> None:
         if not self._pool:
@@ -1840,7 +1954,7 @@ class OracleMemoryProvider(MemoryProvider):
                 SET metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')), SET '$.tags' = JSON(:tags))
                 WHERE memory_id = :id
             """  # nosec B608
-            with self._pool.acquire() as conn:
+            with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, {"id": mid, **meta_binds})
                     n = cur.rowcount
@@ -1856,7 +1970,7 @@ class OracleMemoryProvider(MemoryProvider):
             )
         txt = self._safe_varchar_bytes(content, 4000)
         embed_txt = self._safe_embed_text(content)
-        with self._pool.acquire() as conn:
+        with self._acquire_checked() as conn:
             with conn.cursor() as cur:
                 succeeded = False
                 try:
@@ -1970,7 +2084,10 @@ class OracleMemoryProvider(MemoryProvider):
                 if "ORA-00001" not in str(e):
                     raise
                 # Lost a race with a concurrent writer of the same id: update instead.
-                self._update_row(mid, content, tags=tags)
+                if not self._update_row(mid, content, tags=tags):
+                    raise RuntimeError(
+                        f"upsert of {mid} raced with a concurrent delete; nothing was written, retry"
+                    ) from e
                 out = {"result": "Fact updated (upsert).", "memory_id": mid, "upserted": True}
         if tags:
             out["tags"] = tags
@@ -2854,14 +2971,18 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 yield conn
             except BaseException as exc:
-                bad = _is_session_error(exc) and not isinstance(exc, TimeoutError) and "timed out" not in str(exc)
-                bad = bad or (isinstance(exc, Exception) and not _ORA_CODE_RE.search(str(exc))
-                              and not isinstance(exc, TimeoutError) and "timed out" not in str(exc))
+                # Session errors, call timeouts and non-Oracle exceptions all
+                # drop the connection. After a call timeout (DPY-4024) the thin
+                # driver's statement cache can keep a cancelled cursor id; reusing
+                # that session produced ORA-01002 and then "'NoneType' object is
+                # not iterable" on later searches. A reconnect is far cheaper.
+                bad = _is_session_error(exc) or _is_timeout_error(exc)
+                bad = bad or (isinstance(exc, Exception) and not _ORA_CODE_RE.search(str(exc)))
                 if bad:
                     try:
                         pool.drop(conn)
                         conn = None
-                        logger.info("oracle: dropped pooled connection after session-level error: %s", exc)
+                        logger.info("oracle: dropped pooled connection after session-level error or timeout: %s", exc)
                     except Exception as drop_e:
                         logger.debug("oracle pool drop failed: %s", drop_e)
                 raise
@@ -3084,10 +3205,11 @@ class OracleMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
             self._prefetch_done = False
             self._prefetch_count = 0
-            self._prefetch_thread = threading.Thread(
-                target=_run, daemon=True, name="oracle-prefetch"
-            )
-        self._prefetch_thread.start()
+            pf_thread = threading.Thread(target=_run, daemon=True, name="oracle-prefetch")
+            self._prefetch_thread = pf_thread
+        # Start the thread created under the lock, never re-read the attribute:
+        # a concurrent call may already have replaced it (double start()).
+        pf_thread.start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not isinstance(query, str) or not query or is_trivial_prompt(query):
@@ -3219,7 +3341,7 @@ class OracleMemoryProvider(MemoryProvider):
             for p in live:
                 if p._session_id == session_id:
                     return p
-        return live[-1]
+        return max(live, key=lambda p: getattr(p, "_live_seq", 0))
 
     def on_skill_lifecycle(self, *args: Any, **kwargs: Any) -> None:
         """Global hook entry point. Hermes binds this hook to whichever provider
@@ -3312,7 +3434,7 @@ class OracleMemoryProvider(MemoryProvider):
                         if candidate.is_file():
                             skill_file = candidate
                             break
-                        for sub in root_candidate.glob(f"*/{skill_name}/SKILL.md"):
+                        for sub in _skill_md_matches(root_candidate, skill_name):
                             if sub.is_file():
                                 skill_file = sub
                                 break
@@ -3323,7 +3445,8 @@ class OracleMemoryProvider(MemoryProvider):
                     logger.debug("on_skill_lifecycle: local SKILL.md not found for '%s'; skipping live ingest", skill_name)
                     return
 
-                from scripts.sync_skills import parse_skill_file, format_skill_payload
+                _sync = _sync_skills_module()
+                parse_skill_file, format_skill_payload = _sync.parse_skill_file, _sync.format_skill_payload
 
                 skill_info = parse_skill_file(skill_file)
                 if not skill_info:
@@ -3402,7 +3525,7 @@ class OracleMemoryProvider(MemoryProvider):
                         if target_file.exists():
                             found = True
                             break
-                        for sub in root_candidate.glob(f"*/{skill_name}/SKILL.md"):
+                        for sub in _skill_md_matches(root_candidate, skill_name):
                             if sub.exists():
                                 found = True
                                 break
@@ -3414,7 +3537,7 @@ class OracleMemoryProvider(MemoryProvider):
                         if not self._pool:
                             return
                         host_id = get_host_id()
-                        from scripts.sync_skills import compute_host_root
+                        compute_host_root = _sync_skills_module().compute_host_root
                         host_root = compute_host_root()
                         with self._pool.acquire() as conn:
                             with conn.cursor() as cur:
@@ -3942,7 +4065,7 @@ class OracleMemoryProvider(MemoryProvider):
             if tool_name == "oracle_get":
                 try:
                     ids: list[str] = []
-                    raw_ids = ([args["memory_id"]] if args.get("memory_id") else []) + list(args.get("memory_ids") or [])
+                    raw_ids = ([args["memory_id"]] if args.get("memory_id") else []) + _id_list(args.get("memory_ids"))
                     for raw in raw_ids:
                         norm_id = _normalize_memory_id(raw)
                         if norm_id not in ids:
@@ -3950,7 +4073,9 @@ class OracleMemoryProvider(MemoryProvider):
                     if len(ids) > _GET_MAX_LIMIT:
                         return tool_error(f"too many memory_ids (max {_GET_MAX_LIMIT})")
                     get_tags = _normalize_tags(args.get("tags"))
-                    default_limit = len(ids) if ids and not get_tags else _GET_DEFAULT_LIMIT
+                    # memory_id is unique, so an id lookup never needs more than len(ids) rows.
+                    default_limit = len(ids) if ids else _GET_DEFAULT_LIMIT
+                    eff_limit = max(1, min(int(args.get("limit") or default_limit), _GET_MAX_LIMIT))
                     rows = self._get_rows(
                         memory_ids=ids or None,
                         tags=get_tags or None,
@@ -3958,27 +4083,42 @@ class OracleMemoryProvider(MemoryProvider):
                         session_id=args.get("session_id"),
                         agent_id=args.get("agent_id"),
                         target=args.get("target"),
-                        limit=int(args.get("limit") or default_limit),
+                        limit=eff_limit,
                     )
                 except ValueError as ve:
                     return tool_error(str(ve))
                 found = {r["memory_id"] for r in rows}
                 got: dict[str, Any] = {"results": rows, "count": len(rows)}
-                missing = [m for m in ids if m not in found]
-                if missing:
-                    got["missing"] = missing
+                if len(rows) >= eff_limit and (not ids or len(ids) > eff_limit):
+                    # Cut off by `limit`: unreturned ids may exist, so do not call them missing.
+                    got["truncated"] = True
+                else:
+                    missing = [m for m in ids if m not in found]
+                    if missing:
+                        got["missing"] = missing
                 if not rows:
                     got["result"] = "No matching memories."
                 return json.dumps(got, default=_json_default)
             if tool_name == "oracle_delete":
                 mid = str(args.get("memory_id") or "").strip()
-                sid = args.get("session_id")
+                sid = str(args.get("session_id") or "").strip()
                 if not mid and not sid:
                     return tool_error("memory_id or session_id required")
+                if mid and sid:
+                    return tool_error("pass memory_id OR session_id, not both (session_id purges a whole thread)")
+                if sid and sid.lower() in _RESERVED_SESSION_IDS:
+                    return tool_error(
+                        f"session_id '{sid}' is shared by unrelated rows (skill corpus / rows without a "
+                        "session) and cannot be purged; delete individual rows by memory_id"
+                    )
                 with self._pool.acquire() as conn:
                     with conn.cursor() as cur:
                         if sid:
-                            query = f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE session_id = :1"  # nosec B608
+                            # Skill-corpus rows are shared across hosts: never purged by thread.
+                            query = (
+                                f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE session_id = :1"  # nosec B608
+                                " AND (role IS NULL OR role <> 'skill')"
+                            )
                             cur.execute(query, (sid,))
                             n = cur.rowcount
                             conn.commit()
@@ -4008,6 +4148,12 @@ class OracleMemoryProvider(MemoryProvider):
                 if file_path:
                     try:
                         p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
+                        why = _sensitive_path_reason(p)
+                        if why:
+                            return tool_error(
+                                f"Refusing to read {file_path} ({why}): chunked files are stored in the "
+                                "shared memory database. Pass non-secret text via 'content' instead."
+                            )
                         if not p.is_file():
                             return tool_error(f"File not found: {file_path}")
                         if p.stat().st_size > _MAX_CHUNK_FILE_BYTES:
@@ -4098,10 +4244,34 @@ class OracleMemoryProvider(MemoryProvider):
                     {"result": "chunked", "count": len(ids), "memory_ids": ids}
                 )
             if tool_name == "oracle_sync_skills":
-                mode = args.get("mode") or "meta"
-                force = bool(args.get("force", False))
-                dirs = args.get("dirs")
-                batch_size = int(args.get("batch_size") or 50)
+                mode = str(args.get("mode") or "meta").strip().lower()
+                if mode not in ("meta", "full"):
+                    return tool_error("mode must be 'meta' or 'full'")
+                force = _as_bool(args.get("force", False))
+                raw_dirs = args.get("dirs")
+                if isinstance(raw_dirs, str):
+                    # A bare string would otherwise be iterated per character
+                    # ('~/x' -> '/', i.e. a walk of the whole filesystem).
+                    txt = raw_dirs.strip()
+                    try:
+                        raw_dirs = json.loads(txt) if txt.startswith("[") else ([txt] if txt else [])
+                    except ValueError:
+                        return tool_error("dirs: invalid JSON array")
+                dirs: list[str | Path] | None = None
+                if raw_dirs in (None, []):
+                    pass
+                elif not isinstance(raw_dirs, list) or len(raw_dirs) > 20:
+                    return tool_error("dirs must be a list of up to 20 directory paths")
+                else:
+                    dirs = []
+                    for d in raw_dirs:
+                        dp = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
+                        if dp == Path.home().resolve() or _sensitive_path_reason(dp) or len(dp.parts) < 3:
+                            return tool_error(f"refusing to scan {d}: pass a specific skills directory")
+                        if not dp.is_dir():
+                            return tool_error(f"not a directory: {d}")
+                        dirs.append(dp)
+                batch_size = max(1, min(int(args.get("batch_size") or 50), 500))
                 res = self.sync_skills(mode=mode, force=force, dirs=dirs, batch_size=batch_size)
                 return json.dumps(res)
             if tool_name == "oracle_load_skill":
@@ -4254,14 +4424,7 @@ class OracleMemoryProvider(MemoryProvider):
             raise RuntimeError(
                 self._init_error or self.unavailable_reason() or "Oracle memory pool not initialized"
             )
-        try:
-            from scripts.sync_skills import sync_skills_library
-        except ImportError:
-            scripts_path = Path(__file__).resolve().parent / "scripts" / "sync_skills.py"
-            if not scripts_path.exists():
-                raise ImportError(f"Cannot find sync_skills script at {scripts_path}")
-            mod = _load_module_from_path("hermes_oracle_sync_skills", scripts_path)
-            sync_skills_library = mod.sync_skills_library
+        sync_skills_library = _sync_skills_module().sync_skills_library
         return sync_skills_library(provider=self, mode=mode, force=force, dirs=dirs, dry_run=False, batch_size=batch_size)
 
     def shutdown(self) -> None:
@@ -4272,10 +4435,14 @@ class OracleMemoryProvider(MemoryProvider):
             _LIVE_PROVIDERS.discard(self)
         self._write_stop.set()
         busy = False
-        for t in (self._write_worker, self._embed_worker, self._prefetch_thread):
+        for t in (self._write_worker, self._embed_worker):
             if t and t.is_alive():
                 t.join(timeout=30.0)
                 busy = busy or t.is_alive()
+        # Prefetch only reads; do not hold shutdown (or leak the pool) for it.
+        pf = self._prefetch_thread
+        if pf and pf.is_alive():
+            pf.join(timeout=3.0)
         if busy:
             # A writer still holds a pooled connection; closing the pool under
             # it raised "list.remove(x): x not in list" and failed every queued

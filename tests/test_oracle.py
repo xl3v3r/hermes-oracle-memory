@@ -280,7 +280,8 @@ class TestOraclePlugin(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             provider._search("q")
         self.assertEqual(provider._execute_hybrid_search.call_count, 1)
-        provider._pool.drop.assert_not_called()
+        # 1.1.1.3: the timed-out session is dropped (stale cursor -> ORA-01002), not reused.
+        provider._pool.drop.assert_called_once()
 
     def test_search_does_not_retry_pool_or_call_timeouts(self):
         for msg in (

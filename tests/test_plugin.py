@@ -267,6 +267,27 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
             self.assertEqual(a_ins.call_args[1]["session_id"], "sess-A")
             b_insert.assert_not_called()
 
+    def test_fallback_picks_newest_registered_provider(self):
+        provs = []
+        for i in range(6):
+            p = oracle_plugin.OracleMemoryProvider()
+            p._pool = MagicMock(); p._initialized = True; p._session_id = f"s{i}"
+            oracle_plugin._register_live_provider(p)
+            provs.append(p)
+        dead = oracle_plugin.OracleMemoryProvider()
+        self.assertIs(dead._live_provider_for("no-such-session"), provs[-1])
+
+    def test_shutdown_does_not_wait_on_or_leak_pool_for_prefetch(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        pool = MagicMock()
+        p._pool = pool; p._initialized = True
+        pf = MagicMock(); pf.is_alive.return_value = True
+        p._prefetch_thread = pf
+        p.shutdown()
+        pf.join.assert_called_once_with(timeout=3.0)
+        pool.close.assert_called_once()
+        self.assertIsNone(p._pool)
+
     def test_queue_on_dead_provider_is_handed_off_not_failed(self):
         a = self._live("sess-A")
         b = oracle_plugin.OracleMemoryProvider()

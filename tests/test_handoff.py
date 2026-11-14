@@ -125,6 +125,7 @@ class TestAddWithMemoryIdAndTags(unittest.TestCase):
         def execute(sql, binds=None):
             calls["n"] += 1
             if "INSERT" in sql:
+                cur.rowcount = 1  # the concurrent writer's row now exists
                 raise Exception("ORA-00001: unique constraint (HERMES_AGENT_MEMORY.SYS_C001) violated")
 
         cur.execute.side_effect = execute
@@ -132,6 +133,18 @@ class TestAddWithMemoryIdAndTags(unittest.TestCase):
         self.assertTrue(out["upserted"])
         self.assertEqual(calls["n"], 3)  # UPDATE(0 rows) -> INSERT(dup) -> UPDATE
         self.assertFalse(p._onnx_in_cooldown())
+
+    def test_add_upsert_race_with_concurrent_delete_reports_error(self):
+        p, _, cur = _provider(rowcount=0)
+
+        def execute(sql, binds=None):
+            if "INSERT" in sql:
+                raise Exception("ORA-00001: unique constraint (HERMES_AGENT_MEMORY.SYS_C001) violated")
+
+        cur.execute.side_effect = execute  # every UPDATE matches 0 rows
+        out = p.handle_tool_call("oracle_add", {"content": "s", "memory_id": "handoff:gone"})
+        self.assertNotIn('"upserted": true', out)
+        self.assertIn("concurrent delete", out)
 
     def test_memory_id_with_multiple_facts_is_rejected(self):
         p, _, cur = _provider()
@@ -202,6 +215,33 @@ class TestOracleGet(unittest.TestCase):
         self.assertIn("memory_id IN (:m0, :m1)", sql)
         self.assertNotIn("VECTOR", sql)
         self.assertEqual(binds["lim"], 2)
+
+    def test_get_memory_ids_as_string_is_not_split_into_chars(self):
+        for raw, want in (
+            ("handoff:proj:topic", ["handoff:proj:topic"]),
+            ("handoff:a, handoff:b", ["handoff:a", "handoff:b"]),
+            ('["handoff:a","handoff:b"]', ["handoff:a", "handoff:b"]),
+        ):
+            p, _, cur = _provider(fetch=[])
+            json.loads(p.handle_tool_call("oracle_get", {"memory_ids": raw}))
+            _, binds = cur.execute.call_args[0]
+            self.assertEqual([binds[k] for k in sorted(b for b in binds if b.startswith("m"))], want, raw)
+
+    def test_get_truncated_by_limit_does_not_report_missing(self):
+        p, _, _ = _provider(fetch=[self.ROW])
+        out = json.loads(p.handle_tool_call(
+            "oracle_get", {"memory_ids": ["handoff:proj:topic", "handoff:b", "handoff:c"], "limit": 1}))
+        self.assertTrue(out["truncated"])
+        self.assertNotIn("missing", out)
+
+    def test_get_ids_with_tags_defaults_limit_to_id_count(self):
+        ids = [f"handoff:{i}" for i in range(30)]
+        p, _, cur = _provider(fetch=[self.ROW])
+        out = json.loads(p.handle_tool_call("oracle_get", {"memory_ids": ids, "tags": ["handoff"]}))
+        _, binds = cur.execute.call_args[0]
+        self.assertEqual(binds["lim"], 30)
+        self.assertNotIn("truncated", out)
+        self.assertEqual(len(out["missing"]), 30)  # fetched row is not one of the ids
 
     def test_get_by_tags_any(self):
         p, _, cur = _provider(fetch=[self.ROW])
