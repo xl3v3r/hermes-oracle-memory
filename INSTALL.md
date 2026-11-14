@@ -1,11 +1,11 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.1.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.3-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
 
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1.2) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1.3) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 
@@ -144,7 +144,18 @@ OCI_WALLET_PASSWORD="YourWalletPassword"
 # Primary In-Database ONNX Model
 # =============================================================================
 HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5
+
+# =============================================================================
+# Timeouts (optional — defaults shown)
+# =============================================================================
+# HERMES_ORACLE_SEARCH_TIMEOUT_MS=30000      # recall query clamp (ms)
+# HERMES_ORACLE_POOL_WAIT_TIMEOUT_MS=20000   # max wait for a pooled connection (ms)
+# HERMES_ORACLE_POOL_IDLE_TIMEOUT=300        # idle session lifetime (s)
+# HERMES_ORACLE_PREFETCH_WAIT=3              # per-turn recall wait (s, 0.1-7)
+# HERMES_ORACLE_INGEST_TIMEOUT=600           # bulk ingest / write budget (s)
 ```
+
+> Upgrading from 1.1.1.2 or older: if your `.env` pins `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`, that value now actually takes effect. Remove it (or set `30000`) to use the new default.
 
 ---
 
@@ -167,9 +178,13 @@ The script verifies:
 
 ### 2. Run Test Suite
 
+The unit tests need no database. Run them with `HOME` pointed at a scratch directory so nothing can reach your real `~/.hermes`:
+
 ```bash
-pytest tests/
+HOME="$(mktemp -d)" python -m pytest -q
 ```
+
+> **Warning:** do not run the test suite of v1.1.1.2 or older on a host with an installed plugin. Its drift test copied the checkout over `~/.hermes/plugins/oracle` and every profile copy. From v1.1.1.3 the drift check is read-only and opt-in: `HERMES_ORACLE_DRIFT_DIR=~/.hermes/plugins/oracle python -m pytest -q -k zero_drift`.
 
 ### 3. Check Hermes Agent Status
 

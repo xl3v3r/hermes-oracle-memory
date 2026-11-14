@@ -878,7 +878,7 @@ def sync_skills_library(
     conn = None  # bound by the context manager; rollback target if enter fails
     try:
         with _ConnContext(target_provider_or_conn, is_direct_conn) as conn:
-            ingest_ms = int(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600")) * 1000
+            ingest_ms = int(float(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600") or "600") * 1000)
             try:
                 conn.call_timeout = ingest_ms
             except Exception:
