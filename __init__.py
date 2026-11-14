@@ -45,7 +45,31 @@ _51815_BACKOFF_SECS = 0.5
 def _is_51815(err: Any) -> bool:
     return "ORA-51815" in str(err)
 
-_PREFETCH_WAIT_SECS = 0.5
+def _env_number(name: str, default: float | None, *, lo: float | None = None, hi: float | None = None) -> float | None:
+    """Positive number from the environment (int or float text). Bad, empty, or
+    non-positive values fall back to *default* (logged once); result is clamped
+    to [lo, hi] when given."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        val = float(str(raw).strip())
+        if not math.isfinite(val) or val <= 0:
+            raise ValueError
+    except ValueError:
+        logging.getLogger(__name__).warning("ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+    if lo is not None:
+        val = max(lo, val)
+    if hi is not None:
+        val = min(hi, val)
+    return val
+
+
+# How long prefetch() waits for this turn's recall before returning empty (the
+# search keeps running and is reused if the same query comes back). Must stay
+# under the host's external-prefetch budget (agent/memory_manager.py: 8 s).
+_PREFETCH_WAIT_SECS = float(_env_number("HERMES_ORACLE_PREFETCH_WAIT", 3.0, lo=0.1, hi=7.0))
 _EMBED_DIM = 768
 _EMBED_MODEL = "qwen/qwen3-embedding-4b"
 _OCI_EMBED_MODEL = "cohere.embed-v4.0"
@@ -81,7 +105,7 @@ _SESSION_ERROR_MARKERS = (
     "ORA-00028", "ORA-00603", "ORA-01001", "ORA-01002", "ORA-01012", "ORA-01013",
     "ORA-02396", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12537",
     "ORA-12541", "ORA-25408",
-    "DPI-1067", "DPI-1040", "DPY-4011", "DPY-4024", "DPY-1001", "DPY-1002",
+    "DPI-1067", "DPI-1040", "DPY-4005", "DPY-4011", "DPY-4024", "DPY-1001", "DPY-1002",
     "timed out", "timeout",
 )
 _ORA_CODE_RE = re.compile(r"\bORA-\d{5}\b")
@@ -271,9 +295,46 @@ class _CallTimeoutPool:
         return getattr(self._p, name)
 _FETCH_ARRAYSIZE = 64
 _EMBED_TIMEOUT_SECS = 10.0
-_SEARCH_TIMEOUT_SECS = float(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT", "13.0"))
-_SEARCH_TIMEOUT_MS = int(_SEARCH_TIMEOUT_SECS * 1000)
-_INGEST_TIMEOUT_SECS = float(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600.0"))
+# --- Timeouts (1.1.1.3) -------------------------------------------------------
+# Read-path budget for one recall query (oracle_search / prefetch / oracle_get).
+# HERMES_ORACLE_SEARCH_TIMEOUT_MS is the documented knob; before 1.1.1.3 the
+# per-query clamp read HERMES_ORACLE_SEARCH_TIMEOUT (seconds) instead, so the
+# documented variable never took effect. The seconds form is still honored as
+# a legacy fallback. 13 s was too short: observed recall p99 was ~14 s.
+_DEFAULT_SEARCH_TIMEOUT_MS = 30000
+_DEFAULT_INGEST_TIMEOUT_SECS = 600.0
+# Max wait for a pooled connection. Before 1.1.1.3 the pool used
+# POOL_GETMODE_WAIT, which ignores wait_timeout and blocks forever when every
+# session is busy (observed: oracle_search hung 403 s until the user stopped it).
+_DEFAULT_POOL_WAIT_TIMEOUT_MS = 20000
+# Idle seconds before sessions above `min` are closed (was 5 s, which forced a
+# fresh TLS handshake to ADB for most bursts).
+_DEFAULT_POOL_IDLE_TIMEOUT_SECS = 300
+
+
+def _search_timeout_ms() -> int:
+    ms = _env_number("HERMES_ORACLE_SEARCH_TIMEOUT_MS", None)
+    if ms is None:
+        secs = _env_number("HERMES_ORACLE_SEARCH_TIMEOUT", None)  # legacy (seconds)
+        ms = secs * 1000 if secs is not None else _DEFAULT_SEARCH_TIMEOUT_MS
+    return int(max(1000, min(ms, 600000)))
+
+
+def _ingest_timeout_secs() -> float:
+    return float(_env_number("HERMES_ORACLE_INGEST_TIMEOUT", _DEFAULT_INGEST_TIMEOUT_SECS, lo=30.0, hi=7200.0))
+
+
+def _pool_wait_timeout_ms() -> int:
+    return int(_env_number("HERMES_ORACLE_POOL_WAIT_TIMEOUT_MS", _DEFAULT_POOL_WAIT_TIMEOUT_MS, lo=1000, hi=300000))
+
+
+def _pool_idle_timeout_secs() -> int:
+    return int(_env_number("HERMES_ORACLE_POOL_IDLE_TIMEOUT", _DEFAULT_POOL_IDLE_TIMEOUT_SECS, lo=30, hi=86400))
+
+
+_SEARCH_TIMEOUT_MS = _search_timeout_ms()
+_SEARCH_TIMEOUT_SECS = _SEARCH_TIMEOUT_MS / 1000.0
+_INGEST_TIMEOUT_SECS = _ingest_timeout_secs()
 _INGEST_TIMEOUT_MS = int(_INGEST_TIMEOUT_SECS * 1000)
 _SKILL_FETCH_MAX_CHUNKS = int(os.environ.get("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", "400"))
 _EMBED_MAX_RETRIES = 2
@@ -937,8 +998,15 @@ class OracleMemoryProvider(MemoryProvider):
             self._init_error = "OCI_DB_PASSWORD or OCI_DB_DSN missing"
             logger.error("Oracle memory: %s", self._init_error)
             return
-        ingest_timeout_ms = int(os.environ.get("HERMES_ORACLE_INGEST_TIMEOUT", "600")) * 1000
-        search_timeout_ms = int(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT_MS", "13000"))
+        # Single env read for every timeout; refresh the module-level read-path
+        # clamps too so .env changes picked up by a re-initialize apply everywhere.
+        global _SEARCH_TIMEOUT_MS, _SEARCH_TIMEOUT_SECS, _INGEST_TIMEOUT_SECS, _INGEST_TIMEOUT_MS
+        search_timeout_ms = _search_timeout_ms()
+        ingest_timeout_ms = int(_ingest_timeout_secs() * 1000)
+        _SEARCH_TIMEOUT_MS, _SEARCH_TIMEOUT_SECS = search_timeout_ms, search_timeout_ms / 1000.0
+        _INGEST_TIMEOUT_MS, _INGEST_TIMEOUT_SECS = ingest_timeout_ms, ingest_timeout_ms / 1000.0
+        pool_wait_ms = _pool_wait_timeout_ms()
+        pool_idle_s = _pool_idle_timeout_secs()
         pool_call_timeout = max(search_timeout_ms, ingest_timeout_ms)
         # Timeout config participates in the fingerprint: a long-lived app
         # process must re-create its pool when these env vars change,
@@ -946,7 +1014,7 @@ class OracleMemoryProvider(MemoryProvider):
         # call_timeout budget (stale 13s clamp -> DPY-4024 on writes).
         current_fingerprint = (
             f"{self._user}@{self._dsn}:{self._table}"
-            f":ct={pool_call_timeout}"
+            f":ct={pool_call_timeout}:wt={pool_wait_ms}:it={pool_idle_s}"
         )
 
         # Idempotent initialization: reuse existing pool if configuration matches
@@ -968,9 +1036,11 @@ class OracleMemoryProvider(MemoryProvider):
                 "max": 6,
                 "increment": 1,
                 "threaded": True,
-                "getmode": oracledb.POOL_GETMODE_WAIT,
-                "timeout": 5,
-                "wait_timeout": 5,
+                # TIMEDWAIT: acquire() raises DPY-4005 after wait_timeout (ms)
+                # instead of blocking forever when all sessions are busy.
+                "getmode": oracledb.POOL_GETMODE_TIMEDWAIT,
+                "wait_timeout": pool_wait_ms,
+                "timeout": pool_idle_s,  # seconds idle before extra sessions close
                 "call_timeout": pool_call_timeout,
             }
 

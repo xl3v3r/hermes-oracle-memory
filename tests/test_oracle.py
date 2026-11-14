@@ -1919,8 +1919,9 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("in cooldown", str(ctx.exception))
 
     def test_search_timeout_constants(self):
-        self.assertEqual(oracle_plugin._SEARCH_TIMEOUT_SECS, 13.0)
-        self.assertEqual(oracle_plugin._SEARCH_TIMEOUT_MS, 13000)
+        # 1.1.1.3 default (13 s was below the observed recall p99); tests run without .env
+        self.assertEqual(oracle_plugin._DEFAULT_SEARCH_TIMEOUT_MS, 30000)
+        self.assertEqual(oracle_plugin._SEARCH_TIMEOUT_MS, int(oracle_plugin._SEARCH_TIMEOUT_SECS * 1000))
 
     def test_oracle_search_timeout_clean_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
