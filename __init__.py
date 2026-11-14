@@ -2239,12 +2239,22 @@ class OracleMemoryProvider(MemoryProvider):
     def _insert_many(
         self,
         rows: list[dict[str, Any]],
-    ) -> None:
-        if not self._pool:
+        tx_conn: Any = None,
+    ) -> list[tuple[str, str]]:
+        """Insert *rows*. Without *tx_conn* each attempt runs on its own pooled
+        connection and commits; returns [].
+
+        With *tx_conn* every statement runs on the caller's connection inside the
+        caller's transaction and nothing is committed: a failed attempt is rolled
+        back to a savepoint (a partial array insert must not leave rows behind
+        for the retry). The caller commits, then queues the returned
+        (memory_id, content) pairs with _queue_embed_backfill — queuing before the
+        commit would let the backfill look for rows nobody else can see yet."""
+        if tx_conn is None and not self._pool:
             raise RuntimeError(self._init_error or "pool not initialized")
 
         if not rows:
-            return
+            return []
 
         onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
         if onnx_enabled:
@@ -2286,10 +2296,8 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 binds_list.append(binds)
             try:
-                with self._pool.acquire() as conn, conn.cursor() as cur:
-                    cur.executemany(sql, binds_list)
-                    conn.commit()
-                return
+                self._exec_insert(sql, binds_list, tx_conn)
+                return []
             except Exception as e:
                 err_str = str(e)
                 is_51815 = "ORA-51815" in err_str
@@ -2301,10 +2309,8 @@ class OracleMemoryProvider(MemoryProvider):
                     for attempt in range(_EMBED_MAX_RETRIES):
                         try:
                             time.sleep(0.05 * (attempt + 1))
-                            with self._pool.acquire() as conn, conn.cursor() as cur:
-                                cur.executemany(sql, binds_list)
-                                conn.commit()
-                            return
+                            self._exec_insert(sql, binds_list, tx_conn)
+                            return []
                         except Exception as retry_e:
                             err_str = str(retry_e)
                             if "ORA-51815" not in err_str:
@@ -2343,10 +2349,8 @@ class OracleMemoryProvider(MemoryProvider):
                         )
                         conservative_binds_list.append(binds)
                     try:
-                        with self._pool.acquire() as conn, conn.cursor() as cur:
-                            cur.executemany(sql, conservative_binds_list)
-                            conn.commit()
-                        return
+                        self._exec_insert(sql, conservative_binds_list, tx_conn)
+                        return []
                     except Exception as retry_e:
                         err_str = str(retry_e)
                         is_51815 = "ORA-51815" in err_str
@@ -2405,15 +2409,17 @@ class OracleMemoryProvider(MemoryProvider):
                     )
                     null_binds_list.append(binds)
                 try:
-                    with self._pool.acquire() as conn, conn.cursor() as cur:
-                        cur.executemany(null_sql, null_binds_list)
-                        conn.commit()
-                    for row in rows:
-                        mid = row.get("memory_id")
-                        cnt = row.get("content")
-                        if mid and cnt:
-                            self._queue_embed_backfill(mid, cnt)
-                    return
+                    self._exec_insert(null_sql, null_binds_list, tx_conn)
+                    backfill = [
+                        (str(row["memory_id"]), str(row["content"]))
+                        for row in rows
+                        if row.get("memory_id") and row.get("content")
+                    ]
+                    if tx_conn is not None:
+                        return backfill  # caller queues after its commit
+                    for mid, cnt in backfill:
+                        self._queue_embed_backfill(mid, cnt)
+                    return []
                 except Exception as null_e:
                     logger.error(
                         "Null-embedding insert_many fallback failed (%s)", null_e
@@ -2469,9 +2475,28 @@ class OracleMemoryProvider(MemoryProvider):
                  :10, SYSTIMESTAMP, :11, :12, :13, :14)
         """
 
-        with self._pool.acquire() as conn, conn.cursor() as cur:
-            cur.executemany(sql, binds_list)
-            conn.commit()
+        self._exec_insert(sql, binds_list, tx_conn)
+        return []
+
+    def _exec_insert(self, sql: str, binds_list: list[Any], tx_conn: Any = None) -> None:
+        """executemany on a fresh pooled connection (and commit), or inside the
+        caller's open transaction on *tx_conn* (no commit; a failure is rolled
+        back to a savepoint so earlier statements in that transaction survive)."""
+        if tx_conn is None:
+            with self._pool.acquire() as conn, conn.cursor() as cur:
+                cur.executemany(sql, binds_list)
+                conn.commit()
+            return
+        with tx_conn.cursor() as cur:
+            cur.execute("SAVEPOINT hermes_insert_many")
+            try:
+                cur.executemany(sql, binds_list)
+            except Exception:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT hermes_insert_many")
+                except Exception as rb_e:
+                    logger.debug("rollback to savepoint failed: %s", rb_e)
+                raise
 
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
@@ -3560,15 +3585,32 @@ class OracleMemoryProvider(MemoryProvider):
                         payload_rows = format_skill_payload(skill_info, mode="full", host=host_id)
                         if not payload_rows:
                             return
+                        if self._pool is None:
+                            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", skill_name)
+                            return
 
                         conv_ref = f"skill:{host_id}:{skill_name}"
-                        with self._pool.acquire() as conn:
-                            with conn.cursor() as cur:
-                                del_sql = f"DELETE FROM {self._table} WHERE role = 'skill' AND (conv_ref = :1 OR memory_id = :2)"
-                                cur.execute(del_sql, (conv_ref, c0_id))
-                            conn.commit()
-
-                        self._insert_many(payload_rows)
+                        # DELETE + INSERT commit together. If the insert fails
+                        # (ONNX cooldown, timeout, forced pool close at shutdown)
+                        # the transaction rolls back and the previous rows stay,
+                        # instead of the skill vanishing from every host. The
+                        # checked acquire reads the pool once and drops a session
+                        # broken by a timeout instead of returning it.
+                        with self._acquire_checked() as conn:
+                            try:
+                                with conn.cursor() as cur:
+                                    del_sql = f"DELETE FROM {self._table} WHERE role = 'skill' AND (conv_ref = :1 OR memory_id = :2)"
+                                    cur.execute(del_sql, (conv_ref, c0_id))
+                                backfill = self._insert_many(payload_rows, tx_conn=conn)
+                                conn.commit()
+                            except BaseException:
+                                try:
+                                    conn.rollback()
+                                except Exception as rb_e:
+                                    logger.debug("on_skill_lifecycle rollback failed: %s", rb_e)
+                                raise
+                        for mid, cnt in backfill or []:
+                            self._queue_embed_backfill(mid, cnt)
                         logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", skill_name, len(payload_rows))
                     except Exception as up_e:
                         logger.warning("on_skill_lifecycle: background upsert failed for '%s': %s", skill_name, up_e)
@@ -3577,8 +3619,10 @@ class OracleMemoryProvider(MemoryProvider):
                             self._in_flight_lifecycle_skills.discard(skill_name)
 
                 thread = threading.Thread(target=do_lifecycle_upsert, daemon=True, name=f"oracle-lifecycle-{skill_name}")
-                self._track_sync_thread(thread)
-                thread.start()
+                if not self._start_sync_thread(thread):
+                    logger.info("on_skill_lifecycle: provider shutting down; not ingesting '%s'", skill_name)
+                    with self._lifecycle_lock:
+                        self._in_flight_lifecycle_skills.discard(skill_name)
             except Exception as e:
                 logger.debug("on_skill_lifecycle ingest error: %s", e)
                 with self._lifecycle_lock:
@@ -3608,12 +3652,13 @@ class OracleMemoryProvider(MemoryProvider):
 
                 if not found:
                     def do_archive_delete():
-                        if not self._pool:
+                        pool = self._pool  # read once (see do_lifecycle_upsert)
+                        if pool is None:
                             return
                         host_id = get_host_id()
                         compute_host_root = _sync_skills_module().compute_host_root
                         host_root = compute_host_root()
-                        with self._pool.acquire() as conn:
+                        with pool.acquire() as conn:
                             with conn.cursor() as cur:
                                 del_sql = f"""
                                     DELETE FROM {self._table}
@@ -3632,8 +3677,8 @@ class OracleMemoryProvider(MemoryProvider):
                         logger.info("on_skill_lifecycle: archived and pruned skill '%s' for host '%s'", skill_name, host_id)
 
                     thread = threading.Thread(target=do_archive_delete, daemon=True, name="oracle-lifecycle-archive")
-                    self._track_sync_thread(thread)
-                    thread.start()
+                    if not self._start_sync_thread(thread):
+                        logger.info("on_skill_lifecycle: provider shutting down; not pruning '%s'", skill_name)
             except Exception as e:
                 logger.debug("on_skill_lifecycle archive error: %s", e)
             return
@@ -4515,8 +4560,9 @@ class OracleMemoryProvider(MemoryProvider):
             if t and t.is_alive():
                 t.join(timeout=30.0)
                 busy = busy or t.is_alive()
-        # Skill-lifecycle writers DELETE a skill's rows and then re-INSERT them;
-        # closing the pool between the two steps would drop the skill everywhere.
+        # Skill-lifecycle writers (DELETE + re-INSERT of a skill, one transaction).
+        # _write_stop is already set, so _start_sync_thread() refuses new ones and
+        # this snapshot (same lock) contains every writer that did start.
         with self._sync_threads_lock:
             sync_threads = [t for t in self._sync_threads if t.is_alive()]
         deadline = time.monotonic() + 30.0
@@ -4549,11 +4595,21 @@ class OracleMemoryProvider(MemoryProvider):
                     target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
                 ).start()
 
-    def _track_sync_thread(self, thread: threading.Thread) -> None:
-        """Remember a skill-lifecycle writer so shutdown() can wait for it."""
+    def _start_sync_thread(self, thread: threading.Thread) -> bool:
+        """Start a skill-lifecycle writer and record it so shutdown() waits for it.
+
+        Starting and recording happen under one lock, and shutdown() sets
+        _write_stop before it snapshots the list under the same lock, so a writer
+        is either in that snapshot or refused here. Every listed thread was
+        started under the lock, so pruning on is_alive() only drops finished ones.
+        Returns False (thread not started) once shutdown has begun."""
         with self._sync_threads_lock:
+            if self._write_stop.is_set():
+                return False
             self._sync_threads = [t for t in self._sync_threads if t.is_alive()]
+            thread.start()
             self._sync_threads.append(thread)
+            return True
 
 
 _safe_embed_text = OracleMemoryProvider._safe_embed_text

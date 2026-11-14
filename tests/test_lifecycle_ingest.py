@@ -153,5 +153,83 @@ class TestLifecycleIngest(unittest.TestCase):
                 self.assertEqual(binds["h"], "atlas_host")
 
 
+
+
+class TestLifecycleUpsertAtomic(unittest.TestCase):
+    """DELETE + re-INSERT of a skill is one transaction, and no writer starts
+    once shutdown() has begun (a skill must never vanish from the shared corpus)."""
+
+    def setUp(self):
+        self.provider = oracle_plugin.OracleMemoryProvider()
+        self.provider._pool = MagicMock()
+        self.conn = MagicMock()
+        self.cur = MagicMock()
+        self.provider._pool.acquire.return_value = self.conn  # _acquire_checked()
+        self.conn.__enter__.return_value = self.conn          # plain `with pool.acquire()`
+        self.conn.cursor.return_value.__enter__.return_value = self.cur
+        self.cur.fetchone.return_value = ("different_hash",)
+        self.events = []
+        self.cur.execute.side_effect = lambda sql, *a, **k: self.events.append(
+            "delete" if sql.lstrip().upper().startswith("DELETE") else "sql")
+        self.conn.commit.side_effect = lambda: self.events.append("commit")
+        self.conn.rollback.side_effect = lambda: self.events.append("rollback")
+        # run the writer inline instead of on a thread
+        self._sync = patch.object(self.provider, "_start_sync_thread",
+                                  side_effect=lambda t: (t.run(), True)[1])
+        self._sync.start()
+        self.addCleanup(self._sync.stop)
+
+    def _fire(self, insert_side_effect):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir) / "skills" / "atomic-skill"
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text("---\nname: atomic-skill\ndescription: d\n---\n\n# Atomic\nBody.\n")
+            with patch("pathlib.Path.home", return_value=Path(tmpdir)), \
+                    patch.object(self.provider, "_insert_many", side_effect=insert_side_effect) as ins:
+                self.provider.on_skill_lifecycle("edited", "atomic-skill")
+                return ins
+
+    def test_delete_and_insert_commit_together(self):
+        ins = self._fire(lambda rows, tx_conn=None: (self.events.append("insert"), [])[1])
+        self.assertEqual(ins.call_args.kwargs["tx_conn"], self.conn)
+        self.assertEqual([e for e in self.events if e != "sql"], ["delete", "insert", "commit"])
+        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+
+    def test_failed_insert_rolls_back_the_delete(self):
+        def boom(rows, tx_conn=None):
+            raise RuntimeError("In-database ONNX embedding model is unavailable")
+        self._fire(boom)
+        self.assertIn("rollback", self.events)
+        self.assertNotIn("commit", self.events)
+        self.provider._pool.drop.assert_called_once_with(self.conn)  # non-ORA error: session dropped
+        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+
+    def test_pool_cleared_mid_upsert_still_commits_on_captured_connection(self):
+        def clear_pool(rows, tx_conn=None):
+            self.provider._pool = None  # shutdown() meanwhile
+            return []
+        self._fire(clear_pool)
+        self.assertEqual(self.events[-1], "commit")
+
+    def test_backfill_queued_only_after_commit(self):
+        order = []
+        self.conn.commit.side_effect = lambda: order.append("commit")
+        with patch.object(self.provider, "_queue_embed_backfill",
+                          side_effect=lambda m, c: order.append(("backfill", m))):
+            self._fire(lambda rows, tx_conn=None: [("skill:x:c0", "body")])
+        self.assertEqual(order, ["commit", ("backfill", "skill:x:c0")])
+
+    def test_no_writer_after_shutdown_began(self):
+        self._sync.stop()  # use the real _start_sync_thread
+        self.provider._write_stop.set()
+        with patch.object(oracle_plugin.threading.Thread, "start") as start:
+            ins = self._fire(lambda rows, tx_conn=None: [])
+        start.assert_not_called()
+        ins.assert_not_called()
+        self.assertNotIn("delete", self.events)
+        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self._sync.start()
+
+
 if __name__ == "__main__":
     unittest.main()

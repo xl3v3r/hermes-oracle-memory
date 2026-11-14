@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -293,11 +294,12 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
         pool = MagicMock()
         pool.close.side_effect = Exception("DPY-1005: unable to close pool with busy connections")
         p._pool = pool; p._initialized = True
-        with patch.object(oracle_plugin.threading, "Thread") as th:
+        called = threading.Event()
+        closer = MagicMock(side_effect=lambda *a, **k: called.set())
+        with patch.object(oracle_plugin, "_close_pool_when_idle", closer):
             p.shutdown()
-        self.assertIs(th.call_args.kwargs["target"], oracle_plugin._close_pool_when_idle)
-        self.assertEqual(th.call_args.kwargs["args"], (pool,))
-        th.return_value.start.assert_called_once()
+            self.assertTrue(called.wait(5))
+        closer.assert_called_once_with(pool)
         pool.close.assert_called_once_with()  # never force-closed inline
         self.assertIsNone(p._pool)
 
@@ -326,13 +328,37 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
         oracle_plugin._close_pool_when_idle(pool, budget=0.0, poll=0.0)
         self.assertEqual(pool.close.call_args_list, [call(force=True)])
 
-    def test_lifecycle_thread_list_is_pruned(self):
+    def test_sync_thread_started_under_lock_and_dead_ones_pruned(self):
         p = oracle_plugin.OracleMemoryProvider()
         dead = MagicMock(); dead.is_alive.return_value = False
         p._sync_threads = [dead] * 50
         live = MagicMock(); live.is_alive.return_value = True
-        p._track_sync_thread(live)
+        live.start.side_effect = lambda: self.assertTrue(p._sync_threads_lock.locked())
+        self.assertTrue(p._start_sync_thread(live))
+        live.start.assert_called_once()
         self.assertEqual(p._sync_threads, [live])
+
+    def test_sync_thread_refused_once_shutdown_began(self):
+        p = oracle_plugin.OracleMemoryProvider()
+        p._write_stop.set()
+        t = MagicMock()
+        self.assertFalse(p._start_sync_thread(t))
+        t.start.assert_not_called()
+        self.assertEqual(p._sync_threads, [])
+
+    def test_unstarted_thread_cannot_be_pruned_by_concurrent_tracking(self):
+        # Every listed thread was started under the lock, so a concurrent
+        # _start_sync_thread() never drops one that is about to run.
+        p = oracle_plugin.OracleMemoryProvider()
+        gate = threading.Event()
+        first = threading.Thread(target=gate.wait, daemon=True)
+        second = threading.Thread(target=gate.wait, daemon=True)
+        try:
+            self.assertTrue(p._start_sync_thread(first))
+            self.assertTrue(p._start_sync_thread(second))
+            self.assertEqual(p._sync_threads, [first, second])
+        finally:
+            gate.set(); first.join(2); second.join(2)
 
     def test_queue_on_dead_provider_is_handed_off_not_failed(self):
         a = self._live("sess-A")

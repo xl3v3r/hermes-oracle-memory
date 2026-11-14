@@ -49,6 +49,7 @@
   - Skill lookups skip hidden trees (`.archive/`), so archived skills are pruned.
   - Any call timeout drops the pooled session instead of reusing it (stale cursor → `ORA-01002`).
   - Prefetch starts the thread it created under the lock (no double `start()`).
+  - Skill-lifecycle upsert (`created`/`edited`/`patched`/…) runs DELETE + re-INSERT in **one transaction**; a failed insert (ONNX cooldown, timeout, shutdown) rolls back and the skill's previous rows stay. Writers are refused once `shutdown()` has begun, and are started and recorded under one lock so `shutdown()` always waits for every writer that did start. In 1.1.1.2 any upsert in flight at shutdown could delete a skill from the shared corpus.
   - Failed `initialize()` closes the new pool, clears `_initialized`, and unregisters the provider; a same-config re-`initialize()` after a busy `shutdown()` re-arms the writer and registry; `shutdown()` also waits for skill-lifecycle writers, waits at most 3 s for a read-only prefetch, and closes the pool in the background once a still-borrowed connection returns (never killing it mid-call, never leaking the pool); providers are registered for hooks only after schema setup succeeds.
   - `oracle_get`: string `memory_ids` (single, comma/space list, JSON array) no longer split into characters; `truncated` instead of false `missing` when `limit` cuts results.
   - Upsert racing a concurrent delete returns an error instead of `upserted: true`; `_update_row` and the `oracle_delete` purge use the checked acquire; hook fallback picks the newest provider by registration order.
@@ -62,7 +63,8 @@
 - **Never run the test suite of v1.1.1.2 or older on a host with an installed plugin** — see "Destructive test suite" above. From 1.1.1.3, running it with `HOME` pointed at a scratch directory is still recommended.
 
 ### Verification
-- Test suite: 314 passed, 3 skipped (sandboxed `HOME`; installed plugin checksum unchanged before/after); identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The new audit tests fail against the previous code.
+- Test suite: 323 passed, 3 skipped (sandboxed `HOME`; installed plugin checksum unchanged before/after); identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The new audit tests fail against the previous code.
+- Live (throwaway rows): DELETE + failing insert inside one transaction rolls back to the original row (no cooldown tripped); DELETE + insert commit together and are invisible to other sessions until commit.
 - Live: `shutdown()` with a borrowed connection returns immediately, defers the close (`DPY-1005` observed), and the pool is closed once the connection is released.
 - `mypy` (3.11) clean on `__init__.py`; `ruff` (F, E9) clean on changed files; syntax-checked for 3.10–3.13. Plugin scanner: no critical/high findings.
 - Live end-to-end against Oracle ADB 26ai: handoff insert, upsert, tag-preserving upsert, `oracle_get` by id/tags (`all`/`any`), tags-only update, tag-filtered search in text/vector/hybrid modes, and cleanup — 15/15 checks pass under the new pool settings.

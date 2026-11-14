@@ -83,7 +83,8 @@ class TestChunkSecretGuard(unittest.TestCase):
                             ("/var/lib", "/var/lib/x")):
             with patch.object(oracle_plugin.Path, "home", return_value=Path(home)), \
                     patch.dict(os.environ, {"HERMES_HOME": home}):
-                self.assertEqual(r(Path(probe)), "system path", home)
+                # resolve() the probe like real callers (macOS: /etc -> /private/etc)
+                self.assertEqual(r(Path(probe).resolve()), "system path", home)
 
     def test_home_lookup_failure_fails_closed(self):
         with patch.object(oracle_plugin.Path, "home", side_effect=RuntimeError("no home")), \
@@ -101,6 +102,35 @@ class TestChunkSecretGuard(unittest.TestCase):
     def test_plain_document_is_allowed(self):
         for name in ("notes.md", "export.json", "env-setup.txt"):
             self.assertEqual(oracle_plugin._sensitive_path_reason(Path("/home/u/docs") / name), "", name)
+
+
+class TestInsertManyInCallerTransaction(unittest.TestCase):
+    ROWS = [{"memory_id": "skill:h:x:c0", "content": "body", "role": "skill"}]
+
+    def test_uses_caller_connection_and_never_commits(self):
+        p, _ = _provider()
+        p._pool = None  # shutdown() may have cleared it; the caller's connection is enough
+        conn, cur = MagicMock(), MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        self.assertEqual(p._insert_many(self.ROWS, tx_conn=conn), [])
+        cur.executemany.assert_called_once()
+        conn.commit.assert_not_called()
+        self.assertEqual(cur.execute.call_args_list[0].args[0], "SAVEPOINT hermes_insert_many")
+
+    def test_failed_attempts_roll_back_to_savepoint_and_backfill_is_deferred(self):
+        p, _ = _provider()
+        conn, cur = MagicMock(), MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        shape = Exception("ORA-54401: embedding input too long")
+        cur.executemany.side_effect = [shape, shape, None]  # full -> conservative -> NULL embedding
+        with patch.object(p, "_queue_embed_backfill") as q:
+            out = p._insert_many(self.ROWS, tx_conn=conn)
+        self.assertEqual(out, [("skill:h:x:c0", "body")])
+        q.assert_not_called()  # caller queues after its commit
+        conn.commit.assert_not_called()
+        stmts = [c.args[0] for c in cur.execute.call_args_list]
+        self.assertEqual(stmts.count("ROLLBACK TO SAVEPOINT hermes_insert_many"), 2)
+        self.assertFalse(p._onnx_in_cooldown())
 
 
 class TestDeleteGuard(unittest.TestCase):

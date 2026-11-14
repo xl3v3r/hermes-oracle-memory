@@ -27,7 +27,7 @@ All notable changes to this project are documented in this file.
 - **Connections reused after a call timeout**: a timed-out session (`DPY-4024`, `DPI-1067`, …) is dropped instead of returned to the pool; reusing it was the likely source of `ORA-01002` / `'NoneType' object is not iterable` on later searches. `_search` never retries a timeout.
 - **Prefetch start race**: two concurrent prefetches could `start()` the same thread (`threads can only be started once`).
 - **Failed `initialize()` looked ready**: on any init error the new pool is closed, `_initialized` cleared and the provider unregistered from the hook registry.
-- **Busy `shutdown()` then re-`initialize()`** left background writes stopped/unregistered; the reuse path now re-arms the provider. `shutdown()` waits for in-flight skill-lifecycle writers (a skill's DELETE + re-INSERT) like the other writers, gives a read-only prefetch 3 s, and if a connection is still borrowed closes the pool in the background once it returns (forced only after every call budget has expired) instead of leaking it or killing the call. A provider is registered for hooks only after schema setup succeeds.
+- **Busy `shutdown()` then re-`initialize()`** left background writes stopped/unregistered; the reuse path now re-arms the provider. **Skill-lifecycle upsert is atomic**: the DELETE of a skill's rows and the re-INSERT now commit in one transaction (`_insert_many(tx_conn=...)`, savepoint per attempt, embedding backfill queued after commit), so a failed or interrupted insert leaves the previous rows instead of removing the skill from every host. Lifecycle writers are started and recorded under one lock and refused once `shutdown()` has begun. `shutdown()` waits for in-flight skill-lifecycle writers like the other writers, gives a read-only prefetch 3 s, and if a connection is still borrowed closes the pool in the background once it returns (forced only after every call budget has expired) instead of leaking it or killing the call. A provider is registered for hooks only after schema setup succeeds.
 - **`oracle_get`**: a string `memory_ids` is no longer split into characters (accepts one id, comma/space list, or JSON array); results cut off by `limit` report `truncated` instead of listing existing rows as `missing`; id lookups combined with tags default the limit to the id count.
 - **Upsert race with a concurrent delete** returned `upserted: true` with nothing written; it now returns an error. `_update_row` and the `oracle_delete` purge drop broken sessions like other paths; the hook fallback picks the newest provider by registration order (WeakSet order is arbitrary).
 - `scripts/sync_skills.py` parses `HERMES_ORACLE_INGEST_TIMEOUT` with the plugin's clamp (30–7200 s; bad/≤0 → 600 s) instead of crashing or disabling the timeout.
@@ -39,7 +39,7 @@ All notable changes to this project are documented in this file.
 
 ### Notes
 - No schema change. Single-current-notes convention maintained: this is `RELEASE_NOTES_1.1.1.3.md`; the v1.1.1.2 notes file was removed.
-- Test suite: 314 passed / 3 skipped (new `tests/test_audit_fixes.py`).
+- Test suite: 323 passed / 3 skipped (new `tests/test_audit_fixes.py`).
 
 ## [1.1.1.2] - 2026-11-10
 
