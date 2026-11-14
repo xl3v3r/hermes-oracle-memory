@@ -45,19 +45,27 @@ _51815_BACKOFF_SECS = 0.5
 def _is_51815(err: Any) -> bool:
     return "ORA-51815" in str(err)
 
-def _env_number(name: str, default: float | None, *, lo: float | None = None, hi: float | None = None) -> float | None:
-    """Positive number from the environment (int or float text). Bad, empty, or
-    non-positive values fall back to *default* (logged once); result is clamped
-    to [lo, hi] when given."""
+def _env_number_opt(name: str) -> float | None:
+    """Positive finite number from the environment (int or float text), or None
+    when unset, empty, or invalid (invalid values are logged)."""
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
-        return default
+        return None
     try:
         val = float(str(raw).strip())
         if not math.isfinite(val) or val <= 0:
             raise ValueError
     except ValueError:
-        logging.getLogger(__name__).warning("ignoring invalid %s=%r; using %s", name, raw, default)
+        logging.getLogger(__name__).warning("ignoring invalid %s=%r; using the default", name, raw)
+        return None
+    return val
+
+
+def _env_number(name: str, default: float, *, lo: float | None = None, hi: float | None = None) -> float:
+    """Like _env_number_opt, falling back to *default*; an explicit value is
+    clamped to [lo, hi] when given."""
+    val = _env_number_opt(name)
+    if val is None:
         return default
     if lo is not None:
         val = max(lo, val)
@@ -69,7 +77,7 @@ def _env_number(name: str, default: float | None, *, lo: float | None = None, hi
 # How long prefetch() waits for this turn's recall before returning empty (the
 # search keeps running and is reused if the same query comes back). Must stay
 # under the host's external-prefetch budget (agent/memory_manager.py: 8 s).
-_PREFETCH_WAIT_SECS = float(_env_number("HERMES_ORACLE_PREFETCH_WAIT", 3.0, lo=0.1, hi=7.0))
+_PREFETCH_WAIT_SECS = _env_number("HERMES_ORACLE_PREFETCH_WAIT", 3.0, lo=0.1, hi=7.0)
 _EMBED_DIM = 768
 _EMBED_MODEL = "qwen/qwen3-embedding-4b"
 _OCI_EMBED_MODEL = "cohere.embed-v4.0"
@@ -313,15 +321,15 @@ _DEFAULT_POOL_IDLE_TIMEOUT_SECS = 300
 
 
 def _search_timeout_ms() -> int:
-    ms = _env_number("HERMES_ORACLE_SEARCH_TIMEOUT_MS", None)
+    ms = _env_number_opt("HERMES_ORACLE_SEARCH_TIMEOUT_MS")
     if ms is None:
-        secs = _env_number("HERMES_ORACLE_SEARCH_TIMEOUT", None)  # legacy (seconds)
+        secs = _env_number_opt("HERMES_ORACLE_SEARCH_TIMEOUT")  # legacy (seconds)
         ms = secs * 1000 if secs is not None else _DEFAULT_SEARCH_TIMEOUT_MS
     return int(max(1000, min(ms, 600000)))
 
 
 def _ingest_timeout_secs() -> float:
-    return float(_env_number("HERMES_ORACLE_INGEST_TIMEOUT", _DEFAULT_INGEST_TIMEOUT_SECS, lo=30.0, hi=7200.0))
+    return _env_number("HERMES_ORACLE_INGEST_TIMEOUT", _DEFAULT_INGEST_TIMEOUT_SECS, lo=30.0, hi=7200.0)
 
 
 def _pool_wait_timeout_ms() -> int:
@@ -828,7 +836,7 @@ class OracleMemoryProvider(MemoryProvider):
     """Oracle Autonomous AI Database 26ai VECTOR + Text + JSON memory."""
 
     def __init__(self) -> None:
-        self._pool = None
+        self._pool: Any = None
         self._session_id = ""
         self._agent_id = "hermes"
         self._user = ""
@@ -1650,7 +1658,7 @@ class OracleMemoryProvider(MemoryProvider):
                 VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9,
                      :10, SYSTIMESTAMP)
             """
-            binds = (
+            binds: tuple[Any, ...] = (
                 memory_id,
                 session_id or self._session_id or "none",
                 self._agent_id,
@@ -2056,7 +2064,7 @@ class OracleMemoryProvider(MemoryProvider):
                 meta = json.dumps(metadata or {})
                 txt = self._safe_varchar_bytes(content, 4000)
                 embed_txt = self._safe_embed_text(content)
-                binds = (
+                binds: tuple[Any, ...] = (
                     memory_id,
                     session_id,
                     self._agent_id,
@@ -2719,7 +2727,8 @@ class OracleMemoryProvider(MemoryProvider):
                 if not isinstance(r, dict):
                     continue
                 try:
-                    base_score = float(r.get("score")) if r.get("score") is not None else 0.0
+                    raw_score = r.get("score")
+                    base_score = float(raw_score) if raw_score is not None else 0.0
                 except (ValueError, TypeError):
                     base_score = 0.0
                 role = str(r.get("role") or "fact").strip().lower()
@@ -2769,7 +2778,7 @@ class OracleMemoryProvider(MemoryProvider):
                 r["score"] = round(base_score * recency_mult * role_mult * telemetry_mult * short_mult, 4)
 
             rows.sort(
-                key=lambda x: (x.get("score") if isinstance(x, dict) and x.get("score") is not None else 0.0),
+                key=lambda x: (x.get("score") or 0.0) if isinstance(x, dict) else 0.0,
                 reverse=True,
             )
             return self._diversify_rows(rows)
@@ -3477,7 +3486,7 @@ class OracleMemoryProvider(MemoryProvider):
                 idx, content, ref, total, md_raw, mid = r[0], r[1], r[2], r[3], r[4], r[5]
                 if not re.search(r":c\d+$", str(mid or "")):
                     idx = None
-                md = {}
+                md: dict[str, Any] = {}
                 if md_raw:
                     md = json.loads(md_raw) if isinstance(md_raw, str) else dict(md_raw)
                 p = md.get("path") or ""
@@ -3876,7 +3885,7 @@ class OracleMemoryProvider(MemoryProvider):
                         target=target,
                         metadata=add_meta,
                     )
-                    out = {"result": "Fact stored.", "memory_id": mid}
+                    out: dict[str, Any] = {"result": "Fact stored.", "memory_id": mid}
                     if add_tags:
                         out["tags"] = add_tags
                     return json.dumps(out)
@@ -3899,7 +3908,7 @@ class OracleMemoryProvider(MemoryProvider):
                         "count": len(mids),
                     })
             if tool_name == "oracle_update":
-                mid = args.get("memory_id")
+                mid = str(args.get("memory_id") or "").strip()
                 content = (args.get("content") or "").strip()
                 has_tags = args.get("tags") is not None
                 if not mid or (not content and not has_tags):
@@ -3911,10 +3920,10 @@ class OracleMemoryProvider(MemoryProvider):
                 n = self._update_row(mid, content or None, tags=upd_tags)
                 if not n:
                     return tool_error(f"Memory not found: {mid}")
-                out = {"result": "updated", "memory_id": mid}
+                upd_out: dict[str, Any] = {"result": "updated", "memory_id": mid}
                 if upd_tags is not None:
-                    out["tags"] = upd_tags
-                return json.dumps(out)
+                    upd_out["tags"] = upd_tags
+                return json.dumps(upd_out)
             if tool_name == "oracle_get":
                 try:
                     ids: list[str] = []
@@ -3939,15 +3948,15 @@ class OracleMemoryProvider(MemoryProvider):
                 except ValueError as ve:
                     return tool_error(str(ve))
                 found = {r["memory_id"] for r in rows}
-                out: dict[str, Any] = {"results": rows, "count": len(rows)}
+                got: dict[str, Any] = {"results": rows, "count": len(rows)}
                 missing = [m for m in ids if m not in found]
                 if missing:
-                    out["missing"] = missing
+                    got["missing"] = missing
                 if not rows:
-                    out["result"] = "No matching memories."
-                return json.dumps(out, default=_json_default)
+                    got["result"] = "No matching memories."
+                return json.dumps(got, default=_json_default)
             if tool_name == "oracle_delete":
-                mid = args.get("memory_id")
+                mid = str(args.get("memory_id") or "").strip()
                 sid = args.get("session_id")
                 if not mid and not sid:
                     return tool_error("memory_id or session_id required")
