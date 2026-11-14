@@ -310,7 +310,9 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
         w = MagicMock(); w.is_alive.return_value = True  # DELETE done, INSERT pending
         p._sync_threads = [w]
         p.shutdown()
-        w.join.assert_called_once()
+        # shutdown() joins within its own 30 s budget; the deferred finisher
+        # (1.1.1.4) may join again later, but never closes under a live writer.
+        self.assertLessEqual(w.join.call_args_list[0].kwargs["timeout"], 30.0)
         pool.close.assert_not_called()  # busy: never close under a lifecycle writer
         self.assertIs(p._pool, pool)
 

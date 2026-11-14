@@ -137,7 +137,21 @@ _DATA_ERROR_MARKERS = (
     "ORA-02290", "ORA-02291", "ORA-02292",  # check / FK constraints
     "ORA-12899",  # value too large for column
     "ORA-40441",  # JSON syntax error
+    "ORA-00060",  # deadlock detected: lock contention (e.g. bulk sync vs. lifecycle upsert)
 )
+
+
+class _TxAborted(RuntimeError):
+    """The caller's transaction (``tx_conn``) can no longer be used: the session
+    broke, or ROLLBACK TO SAVEPOINT itself failed. Never retried on that
+    connection, never answered with a NULL-embedding fallback there, and never
+    a reason for the ONNX cooldown. The caller rolls the whole transaction back."""
+
+
+class _PolicyError(RuntimeError):
+    """Raised by this plugin's own checks before any SQL runs (for example "the
+    embedding model is not configured"). Says nothing about the connection, so
+    _acquire_checked() must not drop a healthy pooled session for it."""
 
 
 def _is_session_error(err: Any) -> bool:
@@ -202,10 +216,30 @@ def _close_pool_when_idle(pool: Any, budget: float | None = None, poll: float = 
             if not _is_pool_busy_error(e):
                 logger.debug("oracle deferred pool close: %s", e)
                 return
+    logger.info("oracle deferred pool close: connections still borrowed after %.0fs; forcing close", budget)
     try:
         pool.close(force=True)
     except Exception as e:
         logger.warning("oracle deferred pool close (forced) failed: %s", e)
+
+
+def _retire_pool(pool: Any, reason: str) -> None:
+    """Close a pool this provider no longer uses. A non-forced close fails while
+    connections are borrowed (DPY-1005); then close it in the background once
+    they come back, exactly like the normal teardown path."""
+    if pool is None:
+        return
+    try:
+        pool.close()
+        logger.info("oracle: closed %s pool", reason)
+    except Exception as e:
+        if not _is_pool_busy_error(e):
+            logger.debug("oracle %s pool close: %s", reason, e)
+            return
+        logger.info("oracle %s pool close deferred until busy connections return: %s", reason, e)
+        threading.Thread(
+            target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
+        ).start()
 
 
 _RESERVED_SESSION_IDS = frozenset({"skills", "none", "null"})
@@ -484,6 +518,16 @@ class _CallTimeoutPool:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._p, name)
 _FETCH_ARRAYSIZE = 64
+# Embedding backfill (rows written with a NULL embedding during an ONNX cooldown
+# or a transient error). Failed batches back off exponentially; a row is dropped
+# from the in-memory queue after _BACKFILL_MAX_ATTEMPTS (it keeps its NULL
+# embedding in the table and is picked up again by the startup re-queue scan).
+_BACKFILL_BASE_DELAY_SECS = 2.0
+_BACKFILL_MAX_DELAY_SECS = 300.0
+_BACKFILL_MAX_ATTEMPTS = 8
+_BACKFILL_STARTUP_LIMIT = 500
+_BACKFILL_SCANNED: set[str] = set()  # pool fingerprints already scanned in this process
+_BACKFILL_SCANNED_LOCK = threading.Lock()
 _EMBED_TIMEOUT_SECS = 10.0
 # --- Timeouts (1.1.1.3) -------------------------------------------------------
 # Read-path budget for one recall query (oracle_search / prefetch / oracle_get).
@@ -1032,7 +1076,10 @@ class OracleMemoryProvider(MemoryProvider):
         self._embed_cache: OrderedDict[str, tuple[array.array, str | None]] = OrderedDict()
         self._embed_cache_lock = threading.Lock()
         self._embed_pending: deque[tuple[str, str]] = deque()
+        self._embed_attempts: dict[str, int] = {}
         self._embed_worker: threading.Thread | None = None
+        self._backfill_scan_thread: threading.Thread | None = None
+        self._pool_lock = threading.RLock()
         self._oci_embed_failed_at: float | None = None
         self._oci_client: Any | None = None
         self._oci_signer: Any | None = None
@@ -1208,6 +1255,15 @@ class OracleMemoryProvider(MemoryProvider):
             f":ct={pool_call_timeout}:wt={pool_wait_ms}:it={pool_idle_s}"
         )
 
+        with self._pool_lock:
+            self._initialize_pool_locked(password, current_fingerprint, pool_call_timeout, pool_wait_ms, pool_idle_s)
+
+    def _initialize_pool_locked(
+        self, password: str, current_fingerprint: str, pool_call_timeout: int, pool_wait_ms: int, pool_idle_s: int
+    ) -> None:
+        """Reuse, or (re)build, the session pool. Runs under _pool_lock so a
+        deferred teardown (_finish_shutdown_when_idle) cannot close a pool that
+        this call is re-arming, and a rebuild always retires the pool it replaces."""
         # Idempotent initialization: reuse existing pool if configuration matches
         if self._pool is not None and self._initialized and self._pool_fingerprint == current_fingerprint:
             # Re-arm after a "busy" shutdown(), which returns early with the pool
@@ -1217,6 +1273,9 @@ class OracleMemoryProvider(MemoryProvider):
             logger.debug("Oracle memory pool already initialized with matching config; reusing pool.")
             return
 
+        # A changed fingerprint (credentials, DSN, table or timeouts) replaces the
+        # pool; the old one is closed below instead of being left open.
+        old_pool: Any = self._pool
         new_pool: Any = None
         try:
             import oracledb
@@ -1308,6 +1367,10 @@ class OracleMemoryProvider(MemoryProvider):
             _register_live_provider(self)
             self._init_error = ""
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
+            if old_pool is not None and old_pool is not new_pool:
+                _retire_pool(old_pool, "replaced")
+                old_pool = None
+            self._start_backfill_scan()
         except Exception as e:
             err_msg = str(e)
             if password and password in err_msg:
@@ -1326,6 +1389,10 @@ class OracleMemoryProvider(MemoryProvider):
                     new_pool.close(force=True)
                 except Exception as close_e:
                     logger.debug("oracle pool close after failed init: %s", close_e)
+            if old_pool is not None and old_pool is not new_pool:
+                # The provider is unusable until the next successful initialize;
+                # never leak the previous configuration's sessions meanwhile.
+                _retire_pool(old_pool, "replaced")
 
     def _ensure_schema(self) -> None:
         if not self._pool:
@@ -1448,6 +1515,13 @@ class OracleMemoryProvider(MemoryProvider):
         return failed_at is not None and (
             time.monotonic() - failed_at < _ONNX_RETRY_AFTER_SECS
         )
+
+    def _onnx_cooldown_remaining(self) -> float:
+        with self._embed_lock:
+            failed_at = self._onnx_failed_at
+        if failed_at is None:
+            return 0.0
+        return max(0.0, _ONNX_RETRY_AFTER_SECS - (time.monotonic() - failed_at))
 
     def _onnx_mark_failed(self, err: Any = None) -> None:
         if not _is_onnx_model_failure(err):
@@ -1682,22 +1756,31 @@ class OracleMemoryProvider(MemoryProvider):
         Writes stay off the network. Text CONTAINS is live immediately; the
         vector index catches up in batches of _EMBED_BATCH.
         """
-        if not content:
+        if not content or not memory_id:
             return
         with self._embed_lock:
+            if any(mid == memory_id for mid, _ in self._embed_pending):
+                return
             self._embed_pending.append((memory_id, content))
-            need_worker = (
-                self._embed_worker is None or not self._embed_worker.is_alive()
-            )
-        if need_worker:
+        self._ensure_embed_worker()
+
+    def _ensure_embed_worker(self) -> threading.Thread | None:
+        """Start the backfill worker when rows are pending and none is running.
+        The check and the start happen under _embed_lock, so two callers can
+        never start two workers."""
+        with self._embed_lock:
+            if not self._embed_pending:
+                return self._embed_worker
+            if self._embed_worker is not None and self._embed_worker.is_alive():
+                return self._embed_worker
             t = threading.Thread(
                 target=self._embed_worker_loop,
                 daemon=True,
                 name="oracle-embed-backfill",
             )
-            with self._embed_lock:
-                self._embed_worker = t
+            self._embed_worker = t
             t.start()
+            return t
 
     def _queue_background_insert(
         self,
@@ -1776,18 +1859,50 @@ class OracleMemoryProvider(MemoryProvider):
                 self._write_queue.task_done()
 
     def _embed_worker_loop(self) -> None:
+        """Embed queued NULL-embedding rows in batches.
+
+        A failed batch is re-queued with exponential backoff
+        (_BACKFILL_BASE_DELAY_SECS doubling up to _BACKFILL_MAX_DELAY_SECS); a
+        row that failed _BACKFILL_MAX_ATTEMPTS times leaves the in-memory queue
+        (it keeps its NULL embedding and the next startup re-queues it). During
+        an ONNX cooldown the worker waits for the cooldown to end instead of
+        burning attempts. After shutdown() has begun each pending batch gets one
+        attempt (no backoff), so teardown drains what it can within its join
+        budget; nothing is written to local files."""
+        fails = 0
         while True:
             with self._embed_lock:
                 if not self._embed_pending:
-                    self._embed_worker = None
+                    if self._embed_worker is threading.current_thread():
+                        self._embed_worker = None
                     return
-                batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
-            if not self._pool:
-                # Provider torn down while a batch was pending; stop cleanly.
-                self._embed_worker = None
-                return
+                stopping = self._write_stop.is_set()
+                cooling = self._onnx_failed_at is not None and (
+                    time.monotonic() - self._onnx_failed_at < _ONNX_RETRY_AFTER_SECS
+                )
+                if self._pool is None or (stopping and cooling):
+                    left = len(self._embed_pending)
+                    self._embed_pending.clear()
+                    self._embed_attempts.clear()
+                    if self._embed_worker is threading.current_thread():
+                        self._embed_worker = None
+                    logger.info(
+                        "embed backfill: %d row(s) keep NULL embeddings (%s); the next startup re-queues them",
+                        left,
+                        "provider shut down" if self._pool is None else "ONNX cooldown at shutdown",
+                    )
+                    return
+                batch: list[tuple[str, str]] = []
+                if not cooling:
+                    batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
+            if cooling:
+                self._write_stop.wait(self._onnx_cooldown_remaining() + 0.5)
+                continue
+            pool = self._pool
             done: set[str] = set()
             try:
+                if pool is None:
+                    raise RuntimeError("pool not initialized")
                 tagged = self._embed_many_tagged([c for _, c in batch])
                 binds = [
                     (vec, model, mid)
@@ -1795,7 +1910,7 @@ class OracleMemoryProvider(MemoryProvider):
                     if vec is not None
                 ]
                 if binds:
-                    with self._pool.acquire() as conn:
+                    with pool.acquire() as conn:
                         with conn.cursor() as cur:
                             # Bulk update embeddings in a single round-trip,
                             # stamping provenance alongside the vector.
@@ -1810,15 +1925,100 @@ class OracleMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("embed backfill batch failed: %s", e)
             remaining = [item for item in batch if item[0] not in done]
-            if remaining and not self._write_stop.is_set():
+            dropped = 0
+            keep: list[tuple[str, str]] = []
+            with self._embed_lock:
+                for mid in done:
+                    self._embed_attempts.pop(mid, None)
+                stopping = self._write_stop.is_set()
+                for mid, content in remaining:
+                    n = self._embed_attempts.get(mid, 0) + 1
+                    if stopping or n >= _BACKFILL_MAX_ATTEMPTS:
+                        self._embed_attempts.pop(mid, None)
+                        dropped += 1
+                    else:
+                        self._embed_attempts[mid] = n
+                        keep.append((mid, content))
+                self._embed_pending.extendleft(reversed(keep))
+            if dropped:
                 logger.warning(
-                    "embed backfill: %d/%d rows still missing embeddings; re-queueing",
-                    len(remaining),
-                    len(batch),
+                    "embed backfill: %d row(s) left with NULL embeddings after %s; the next startup re-queues them",
+                    dropped,
+                    "shutdown" if stopping else f"{_BACKFILL_MAX_ATTEMPTS} attempts",
                 )
-                time.sleep(2.0)
-                with self._embed_lock:
-                    self._embed_pending.extendleft(reversed(remaining))
+            if not remaining:
+                fails = 0
+                continue
+            fails += 1
+            if keep:
+                delay = min(_BACKFILL_BASE_DELAY_SECS * (2 ** (fails - 1)), _BACKFILL_MAX_DELAY_SECS)
+                logger.warning(
+                    "embed backfill: %d/%d rows still missing embeddings; retrying in %.0fs",
+                    len(keep),
+                    len(batch),
+                    delay,
+                )
+                self._write_stop.wait(delay)
+
+    def _requeue_null_embeddings(self, limit: int = _BACKFILL_STARTUP_LIMIT) -> int:
+        """Queue rows that still have a NULL embedding (left by a cooldown, a
+        transient error or a shutdown that could not drain the backfill).
+        Read-only apart from the backfill UPDATEs it schedules. Returns the
+        number of rows queued."""
+        pool = self._pool
+        if pool is None or not self._onnx_model:
+            return 0
+        import oracledb
+
+        def _lob_as_str(cursor, metadata):
+            if metadata.type_code is oracledb.DB_TYPE_CLOB:
+                return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+
+        sql = f"""
+            SELECT memory_id, content FROM {self._table}
+            WHERE embedding IS NULL AND content IS NOT NULL
+            ORDER BY created_at DESC
+            FETCH FIRST :n ROWS ONLY
+        """  # nosec B608
+        with self._acquire_checked() as conn:
+            try:
+                conn.call_timeout = _SEARCH_TIMEOUT_MS
+            except Exception:
+                pass
+            with conn.cursor() as cur:
+                cur.outputtypehandler = _lob_as_str
+                cur.execute(sql, {"n": int(limit)})
+                rows = cur.fetchall() or []
+        queued = 0
+        for row in rows:
+            mid, content = row[0], _lob_text(row[1])
+            if mid and content:
+                self._queue_embed_backfill(str(mid), content)
+                queued += 1
+        if queued:
+            logger.info("embed backfill: re-queued %d row(s) with NULL embeddings at startup", queued)
+        return queued
+
+    def _start_backfill_scan(self) -> None:
+        """Once per pool configuration per process, re-queue NULL-embedding rows
+        in the background (primary agents only; never blocks initialize())."""
+        if self._agent_context != "primary" or not self._onnx_model:
+            return
+        key = self._pool_fingerprint
+        with _BACKFILL_SCANNED_LOCK:
+            if key in _BACKFILL_SCANNED:
+                return
+            _BACKFILL_SCANNED.add(key)
+
+        def _run() -> None:
+            try:
+                self._requeue_null_embeddings()
+            except Exception as e:
+                logger.info("embed backfill startup scan skipped: %s", e)
+
+        t = threading.Thread(target=_run, daemon=True, name="oracle-backfill-scan")
+        self._backfill_scan_thread = t
+        t.start()
 
     def _contains_query(self, query: str) -> str:
         cleaned = _CONTAINS_CLEAN_RE.sub(" ", query or "")
@@ -1945,29 +2145,8 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert hit transient/shape error (%s); inserting row with null embedding to prevent turn loss",
                     err_str,
                 )
-                null_sql = f"""
-                    INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                        (memory_id, session_id, agent_id, role, content, embedding,
-                         created_at, target, metadata, content_txt,
-                         embedding_model, embedding_updated_at)
-                    VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                         NULL, SYSTIMESTAMP)
-                """
-                null_binds = (
-                    memory_id,
-                    session_id or self._session_id or "none",
-                    self._agent_id,
-                    role,
-                    content,
-                    target,
-                    meta,
-                    txt,
-                )
                 try:
-                    with self._pool.acquire() as conn, conn.cursor() as cur:
-                        cur.execute(null_sql, null_binds)
-                        conn.commit()
-                    self._queue_embed_backfill(memory_id, content)
+                    self._insert_null_row(memory_id, session_id, role, content, target, meta, txt)
                     return
                 except Exception as null_e:
                     logger.error(
@@ -1978,7 +2157,13 @@ class OracleMemoryProvider(MemoryProvider):
                     ) from null_e
 
         if vec is None:
-            raise RuntimeError(
+            if self._onnx_model:
+                # ONNX cooldown: keep the row (text search finds it at once) and
+                # let the backfill embed it when the cooldown ends.
+                logger.info("ONNX in cooldown; writing %s with a NULL embedding and queueing backfill", memory_id)
+                self._insert_null_row(memory_id, session_id, role, content, target, meta, txt)
+                return
+            raise _PolicyError(
                 "In-database ONNX embedding model is unavailable; external fallback is disabled"
             )
 
@@ -2010,6 +2195,36 @@ class OracleMemoryProvider(MemoryProvider):
         if vec is None:
             self._queue_embed_backfill(memory_id, content)
 
+    def _insert_null_row(
+        self, memory_id: str, session_id: str, role: str, content: str, target: str, meta: str, txt: str
+    ) -> None:
+        """INSERT one row with a NULL embedding, commit, then queue its backfill."""
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError(self._init_error or "pool not initialized")
+        null_sql = f"""
+            INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                (memory_id, session_id, agent_id, role, content, embedding,
+                 created_at, target, metadata, content_txt,
+                 embedding_model, embedding_updated_at)
+            VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                 NULL, SYSTIMESTAMP)
+        """  # nosec B608
+        null_binds = (
+            memory_id,
+            session_id or self._session_id or "none",
+            self._agent_id,
+            role,
+            content,
+            target,
+            meta,
+            txt,
+        )
+        with pool.acquire() as conn, conn.cursor() as cur:
+            cur.execute(null_sql, null_binds)
+            conn.commit()
+        self._queue_embed_backfill(memory_id, content)
+
     def _update_row(self, mid: str, content: str | None, tags: list[str] | None = None) -> int:
         """Update a row's content (re-embedded in-database) and/or replace its
         metadata.tags. Returns the number of rows updated (0 = not found)."""
@@ -2035,15 +2250,29 @@ class OracleMemoryProvider(MemoryProvider):
                 conn.commit()
             return n
         if not self._onnx_model:
-            raise RuntimeError(
+            raise _PolicyError(
                 "In-database ONNX model is not configured; external fallback is disabled"
-            )
-        if self._onnx_in_cooldown():
-            raise RuntimeError(
-                "In-database ONNX embedding model is in cooldown; external fallback is disabled"
             )
         txt = self._safe_varchar_bytes(content, 4000)
         embed_txt = self._safe_embed_text(content)
+        if self._onnx_in_cooldown():
+            # Same fallback as an ONNX transient error: store the new content
+            # now (text search sees it at once) and re-embed it in the backfill.
+            null_upd_sql = f"""
+                UPDATE /*+ NO_PARALLEL */ {self._table}
+                SET content = :c, embedding = NULL, content_txt = :t,
+                    embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
+                WHERE memory_id = :id
+            """  # nosec B608
+            with self._acquire_checked() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
+                    n = cur.rowcount
+                conn.commit()
+            if n:
+                self._queue_embed_backfill(mid, content)
+            return n
+        backfill_after_commit = False
         with self._acquire_checked() as conn:
             with conn.cursor() as cur:
                 succeeded = False
@@ -2120,13 +2349,15 @@ class OracleMemoryProvider(MemoryProvider):
                         """  # nosec B608
                         try:
                             cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
-                            self._queue_embed_backfill(mid, content)
+                            backfill_after_commit = True
                         except Exception as null_e:
                             raise RuntimeError(
                                 f"In-database ONNX update failed ({err_str}) and fallback update failed ({null_e})"
                             ) from null_e
                 n = cur.rowcount
             conn.commit()
+        if backfill_after_commit and n:
+            self._queue_embed_backfill(mid, content)
         return n
 
     def _upsert_fact(
@@ -2298,6 +2529,8 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 self._exec_insert(sql, binds_list, tx_conn)
                 return []
+            except _TxAborted:
+                raise
             except Exception as e:
                 err_str = str(e)
                 is_51815 = "ORA-51815" in err_str
@@ -2311,6 +2544,8 @@ class OracleMemoryProvider(MemoryProvider):
                             time.sleep(0.05 * (attempt + 1))
                             self._exec_insert(sql, binds_list, tx_conn)
                             return []
+                        except _TxAborted:
+                            raise
                         except Exception as retry_e:
                             err_str = str(retry_e)
                             if "ORA-51815" not in err_str:
@@ -2351,6 +2586,8 @@ class OracleMemoryProvider(MemoryProvider):
                     try:
                         self._exec_insert(sql, conservative_binds_list, tx_conn)
                         return []
+                    except _TxAborted:
+                        raise
                     except Exception as retry_e:
                         err_str = str(retry_e)
                         is_51815 = "ORA-51815" in err_str
@@ -2374,52 +2611,10 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert_many hit transient/shape error (%s); inserting rows with null embedding to prevent turn loss",
                     err_str,
                 )
-                null_sql = f"""
-                    INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                        (memory_id, session_id, agent_id, role, content, embedding,
-                         created_at, target, metadata, content_txt,
-                         embedding_model, embedding_updated_at,
-                         turn_index, chunk_index, turn_id, conv_ref)
-                    VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                         NULL, SYSTIMESTAMP, :9, :10, :11, :12)
-                """
-                null_binds_list = []
-                for row in rows:
-                    memory_id = row.get("memory_id")
-                    session_id = row.get("session_id") or self._session_id or "none"
-                    role = row.get("role")
-                    content = row.get("content")
-                    target = row.get("target")
-                    metadata = row.get("metadata")
-                    meta = json.dumps(metadata or {})
-                    txt = self._safe_varchar_bytes(content, 4000)
-                    binds = (
-                        memory_id,
-                        session_id,
-                        self._agent_id,
-                        role,
-                        content,
-                        target,
-                        meta,
-                        txt,
-                        row.get("turn_index"),
-                        row.get("chunk_index"),
-                        row.get("turn_id"),
-                        row.get("conv_ref"),
-                    )
-                    null_binds_list.append(binds)
                 try:
-                    self._exec_insert(null_sql, null_binds_list, tx_conn)
-                    backfill = [
-                        (str(row["memory_id"]), str(row["content"]))
-                        for row in rows
-                        if row.get("memory_id") and row.get("content")
-                    ]
-                    if tx_conn is not None:
-                        return backfill  # caller queues after its commit
-                    for mid, cnt in backfill:
-                        self._queue_embed_backfill(mid, cnt)
-                    return []
+                    return self._insert_many_null(rows, tx_conn)
+                except _TxAborted:
+                    raise
                 except Exception as null_e:
                     logger.error(
                         "Null-embedding insert_many fallback failed (%s)", null_e
@@ -2429,7 +2624,12 @@ class OracleMemoryProvider(MemoryProvider):
                     ) from null_e
 
         if any(r.get("embedding") is None for r in rows):
-            raise RuntimeError(
+            if self._onnx_model:
+                # ONNX cooldown: write the rows now with NULL embeddings and let
+                # the backfill embed them once the cooldown ends.
+                logger.info("ONNX in cooldown; writing %d row(s) with NULL embeddings and queueing backfill", len(rows))
+                return self._insert_many_null(rows, tx_conn)
+            raise _PolicyError(
                 "In-database ONNX embedding model is unavailable; external fallback is disabled"
             )
 
@@ -2478,12 +2678,63 @@ class OracleMemoryProvider(MemoryProvider):
         self._exec_insert(sql, binds_list, tx_conn)
         return []
 
+    def _insert_many_null(self, rows: list[dict[str, Any]], tx_conn: Any = None) -> list[tuple[str, str]]:
+        """INSERT *rows* with NULL embeddings. Without *tx_conn* the backfill is
+        queued here (after the commit in _exec_insert) and [] is returned; with
+        *tx_conn* the (memory_id, content) pairs are returned for the caller to
+        queue after its own commit."""
+        null_sql = f"""
+            INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                (memory_id, session_id, agent_id, role, content, embedding,
+                 created_at, target, metadata, content_txt,
+                 embedding_model, embedding_updated_at,
+                 turn_index, chunk_index, turn_id, conv_ref)
+            VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                 NULL, SYSTIMESTAMP, :9, :10, :11, :12)
+        """  # nosec B608
+        null_binds_list = []
+        for row in rows:
+            content = row.get("content")
+            null_binds_list.append((
+                row.get("memory_id"),
+                row.get("session_id") or self._session_id or "none",
+                self._agent_id,
+                row.get("role"),
+                content,
+                row.get("target"),
+                json.dumps(row.get("metadata") or {}),
+                self._safe_varchar_bytes(content, 4000),
+                row.get("turn_index"),
+                row.get("chunk_index"),
+                row.get("turn_id"),
+                row.get("conv_ref"),
+            ))
+        self._exec_insert(null_sql, null_binds_list, tx_conn)
+        backfill = [
+            (str(row["memory_id"]), str(row["content"]))
+            for row in rows
+            if row.get("memory_id") and row.get("content")
+        ]
+        if tx_conn is not None:
+            return backfill  # caller queues after its commit
+        for mid, cnt in backfill:
+            self._queue_embed_backfill(mid, cnt)
+        return []
+
     def _exec_insert(self, sql: str, binds_list: list[Any], tx_conn: Any = None) -> None:
         """executemany on a fresh pooled connection (and commit), or inside the
         caller's open transaction on *tx_conn* (no commit; a failure is rolled
-        back to a savepoint so earlier statements in that transaction survive)."""
+        back to a savepoint so earlier statements in that transaction survive).
+
+        With *tx_conn*, a session-level error or a failed savepoint rollback
+        raises _TxAborted: the connection cannot run another attempt, so the
+        retry/clamp/NULL-fallback ladder in _insert_many must stop and let the
+        caller roll back the whole transaction."""
         if tx_conn is None:
-            with self._pool.acquire() as conn, conn.cursor() as cur:
+            pool = self._pool
+            if pool is None:
+                raise RuntimeError(self._init_error or "pool not initialized")
+            with pool.acquire() as conn, conn.cursor() as cur:
                 cur.executemany(sql, binds_list)
                 conn.commit()
             return
@@ -2491,11 +2742,13 @@ class OracleMemoryProvider(MemoryProvider):
             cur.execute("SAVEPOINT hermes_insert_many")
             try:
                 cur.executemany(sql, binds_list)
-            except Exception:
+            except Exception as e:
+                if _is_session_error(e):
+                    raise _TxAborted(f"transaction connection broken: {e}") from e
                 try:
                     cur.execute("ROLLBACK TO SAVEPOINT hermes_insert_many")
                 except Exception as rb_e:
-                    logger.debug("rollback to savepoint failed: %s", rb_e)
+                    raise _TxAborted(f"{e} (rollback to savepoint failed: {rb_e})") from e
                 raise
 
     _JUNK = (
@@ -3076,7 +3329,11 @@ class OracleMemoryProvider(MemoryProvider):
                 # that session produced ORA-01002 and then "'NoneType' object is
                 # not iterable" on later searches. A reconnect is far cheaper.
                 bad = _is_session_error(exc) or _is_timeout_error(exc)
-                bad = bad or (isinstance(exc, Exception) and not _ORA_CODE_RE.search(str(exc)))
+                bad = bad or (
+                    isinstance(exc, Exception)
+                    and not isinstance(exc, _PolicyError)
+                    and not _ORA_CODE_RE.search(str(exc))
+                )
                 if bad:
                     try:
                         pool.drop(conn)
@@ -4555,12 +4812,15 @@ class OracleMemoryProvider(MemoryProvider):
         with _LIVE_PROVIDERS_LOCK:
             _LIVE_PROVIDERS.discard(self)
         self._write_stop.set()
-        busy = False
-        for t in (self._write_worker, self._embed_worker):
-            if t and t.is_alive():
-                t.join(timeout=30.0)
-                busy = busy or t.is_alive()
-        # Skill-lifecycle writers (DELETE + re-INSERT of a skill, one transaction).
+        busy: list[threading.Thread] = []
+        # 1. The turn writer feeds the backfill queue, so it goes first.
+        wt = self._write_worker
+        if wt and wt.is_alive():
+            wt.join(timeout=30.0)
+            if wt.is_alive():
+                busy.append(wt)
+        # 2. Skill-lifecycle writers (DELETE + re-INSERT of a skill, one
+        # transaction; they queue backfills after their commit).
         # _write_stop is already set, so _start_sync_thread() refuses new ones and
         # this snapshot (same lock) contains every writer that did start.
         with self._sync_threads_lock:
@@ -4568,32 +4828,62 @@ class OracleMemoryProvider(MemoryProvider):
         deadline = time.monotonic() + 30.0
         for t in sync_threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
-            busy = busy or t.is_alive()
-        # Prefetch only reads; do not hold shutdown (or leak the pool) for it.
-        pf = self._prefetch_thread
-        if pf and pf.is_alive():
-            pf.join(timeout=3.0)
+            if t.is_alive():
+                busy.append(t)
+        # 3. Drain the embedding backfill: with _write_stop set every pending
+        # batch gets one attempt and no backoff (rows it cannot embed keep NULL
+        # embeddings and are re-queued by the next startup scan).
+        et = self._ensure_embed_worker()
+        if et and et.is_alive():
+            et.join(timeout=30.0)
+            if et.is_alive():
+                busy.append(et)
+        # Prefetch and the startup backfill scan only read; do not hold
+        # shutdown (or leak the pool) for them.
+        for rt in (self._prefetch_thread, self._backfill_scan_thread):
+            if rt and rt.is_alive():
+                rt.join(timeout=3.0)
         if busy:
-            # A writer still holds a pooled connection; closing the pool under
-            # it raised "list.remove(x): x not in list" and failed every queued
-            # row with "pool not initialized". Leave the pool to process exit.
-            logger.warning("oracle shutdown: worker still busy after 30s; pool left open")
+            # A writer still holds a pooled connection (an ingest call may run
+            # for the whole write budget). Closing the pool under it raised
+            # "list.remove(x): x not in list" and failed every queued row with
+            # "pool not initialized", so keep the pool for it and finish the
+            # teardown in the background once it is done. A re-initialize()
+            # with the same configuration in the meantime re-arms the pool.
+            logger.warning(
+                "oracle shutdown: %d worker(s) still busy after their join budget; pool closes when they finish",
+                len(busy),
+            )
+            pool = self._pool
+            threading.Thread(
+                target=self._finish_shutdown_when_idle,
+                args=(busy, pool),
+                daemon=True,
+                name="oracle-shutdown-finish",
+            ).start()
             return
-        pool, self._pool = self._pool, None
-        if pool is not None:
-            try:
-                pool.close()
-            except Exception as e:
-                if not _is_pool_busy_error(e):
-                    logger.debug("oracle pool close: %s", e)
-                    return
-                # A connection is still checked out (a prefetch read or a tool
-                # call on another thread). Never kill it mid-call, and never leak
-                # the pool: close it once the connection comes back.
-                logger.info("oracle pool close deferred until busy connections return: %s", e)
-                threading.Thread(
-                    target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
-                ).start()
+        with self._pool_lock:
+            pool, self._pool = self._pool, None
+        _retire_pool(pool, "shutdown")
+
+    def _finish_shutdown_when_idle(self, threads: list[threading.Thread], pool: Any) -> None:
+        """Deferred end of a busy shutdown(): wait for the busy workers (bounded
+        by the longest call budget), then close the pool unless initialize()
+        re-armed this provider with it in the meantime."""
+        budget = max(_SEARCH_TIMEOUT_SECS, _ingest_timeout_secs()) + _pool_wait_timeout_ms() / 1000.0 + 30.0
+        deadline = time.monotonic() + budget
+        for t in threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in threads):
+            # Still holding a connection past every call budget: never close
+            # the pool under it; process exit releases it.
+            logger.warning("oracle shutdown: worker still busy after %.0fs; pool left open", budget)
+            return
+        with self._pool_lock:
+            if not self._write_stop.is_set() or pool is None or self._pool is not pool:
+                return  # re-armed by initialize(), or already replaced/closed
+            self._pool = None
+        _retire_pool(pool, "shutdown")
 
     def _start_sync_thread(self, thread: threading.Thread) -> bool:
         """Start a skill-lifecycle writer and record it so shutdown() waits for it.
