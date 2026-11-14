@@ -200,6 +200,9 @@ Reliability + capability release — full details in `RELEASE_NOTES_1.1.1.3.md`:
 - **Skill-lifecycle hook survives provider shutdown** instead of failing every event with `pool not initialized`.
 - **Bounded timeouts**: pool acquire waits at most 20 s (it could hang for minutes), `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now really controls recall (default 30 s), idle sessions are kept 300 s, prefetch waits up to 3 s.
 - **Handoff rows**: stable `memory_id` + `tags` on `oracle_add`, tag filters on `oracle_search`/`oracle_update`, and the new `oracle_get` exact-read tool.
+- **Security and data safety**: `oracle_chunk(file_path=...)` refuses credential and system files (they would land in the shared database); `oracle_delete` can no longer purge the shared skill corpus; `oracle_sync_skills` validates its arguments (a string `dirs` no longer scans `/`).
+- **Skill sync that actually runs**: the skill-lifecycle hook works inside Hermes (it failed silently on an import collision), archived skills are pruned, and a skill update replaces its rows in one transaction, so an interrupted update keeps the old rows instead of dropping the skill on every host.
+- **Clean shutdown and recovery**: timed-out sessions are dropped instead of reused (`ORA-01002`), shutdown waits for skill writers and closes the pool once borrowed connections return, and a failed `initialize()` cleans up after itself.
 - **Safe test suite**: tests no longer touch an installed plugin or `~/.hermes/skills`; CI runs them with a sandboxed `HOME`. Do not run the test suite of v1.1.1.2 or older on a host with a live install.
 
 ## What's new in v1.1.1.2
