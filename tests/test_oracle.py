@@ -228,7 +228,8 @@ class TestOraclePlugin(unittest.TestCase):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._onnx_model = "BGE_BASE_EN_V1_5"
         provider._pool = MagicMock()
-        provider._pool.acquire.side_effect = Exception("model unavailable")
+        # A real model failure surfaces as a server ORA- error.
+        provider._pool.acquire.side_effect = Exception("ORA-40284: model does not exist")
 
         with self.assertRaises(RuntimeError):
             provider._embed_many(["first"])
@@ -237,6 +238,49 @@ class TestOraclePlugin(unittest.TestCase):
 
         self.assertEqual(provider._pool.acquire.call_count, 1)
         self.assertTrue(provider._onnx_in_cooldown())
+
+    def test_session_and_driver_errors_do_not_trip_onnx_cooldown(self):
+        """ORA-01002 on one pooled connection, client timeouts, and plain Python
+        exceptions are not model failures and must not lock out embeddings."""
+        for err in (
+            "ORA-01002: fetch out of sequence",
+            "DPY-4011: the database or network closed the connection",
+            "DPY-4024: call timeout of 13000 ms exceeded",
+            "'NoneType' object is not iterable",
+        ):
+            provider = oracle_plugin.OracleMemoryProvider()
+            provider._onnx_model = "BGE_BASE_EN_V1_5"
+            provider._pool = MagicMock()
+            provider._pool.acquire.side_effect = Exception(err)
+            with self.assertRaises(RuntimeError):
+                provider._embed_many(["x"])
+            self.assertFalse(provider._onnx_in_cooldown(), err)
+
+    def test_search_retries_once_on_session_error_and_drops_connection(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        bad, good = MagicMock(name="bad"), MagicMock(name="good")
+        provider._pool.acquire.side_effect = [bad, good]
+        provider._execute_hybrid_search = MagicMock(
+            side_effect=[RuntimeError("In-database ONNX hybrid search failed (ORA-01002: fetch out of sequence)"), []]
+        )
+        provider._apply_weights = MagicMock(side_effect=lambda rows, cur=None: rows)
+
+        self.assertEqual(provider._search("q"), [])
+        self.assertEqual(provider._execute_hybrid_search.call_count, 2)
+        provider._pool.drop.assert_called_once_with(bad)   # poisoned session never reused
+        good.close.assert_called_once()                    # healthy one returned to pool
+
+    def test_search_does_not_retry_timeouts(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        provider._execute_hybrid_search = MagicMock(side_effect=TimeoutError("oracle_search query timed out after 13s"))
+        with self.assertRaises(TimeoutError):
+            provider._search("q")
+        self.assertEqual(provider._execute_hybrid_search.call_count, 1)
+        provider._pool.drop.assert_not_called()
 
     def test_search_does_not_client_embed_when_onnx_is_configured(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2000,7 +2044,6 @@ class TestOraclePlugin(unittest.TestCase):
             "test_plugin.py",
             "test_provider_live.py",
             "test_reembed.py",
-            "test_skill_bundles.py",
             "test_sync_skills.py",
         }
         found_names = {f.name for f in test_files}
@@ -2363,94 +2406,66 @@ class TestOraclePlugin(unittest.TestCase):
                 self.assertIn(rev, expected)
 
     def test_zero_drift_with_installed_plugin(self):
+        """READ-ONLY drift check between this checkout and an installed plugin.
+
+        Opt-in: set HERMES_ORACLE_DRIFT_DIR to the installed plugin directory.
+        This test never copies, deletes, or symlinks anything. (Before 1.1.1.3 it
+        synced the checkout over ~/.hermes/plugins/oracle and every profile copy,
+        so running the suite from any clone or PR branch silently replaced the
+        live plugin.)"""
         import filecmp
         import os
-        import shutil
         from pathlib import Path
+
+        target = os.environ.get("HERMES_ORACLE_DRIFT_DIR", "").strip()
+        if not target:
+            self.skipTest("set HERMES_ORACLE_DRIFT_DIR=<installed plugin dir> to run the read-only drift check")
         repo_dir = Path(__file__).resolve().parent.parent
-        plugin_dir = Path.home() / ".hermes" / "plugins" / "oracle"
-        # Cleanup scratch verify_drift.py if present
-        scratch = repo_dir / "scripts" / "verify_drift.py"
-        if scratch.exists():
-            scratch.unlink()
-        for old_name in ["RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
-            old_rel_notes = repo_dir / old_name
-            if old_rel_notes.exists():
-                old_rel_notes.unlink()
-        if not plugin_dir.exists():
-            return
-        
-        ignored_patterns = {
-            ".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist",
-            "hermes_oracle_memory.egg-info", "uv.lock", "backups", "backfills",
-            ".entire", ".claude", ".agents",
+        plugin_dir = Path(target).expanduser()
+        if not plugin_dir.is_dir():
+            self.skipTest(f"{plugin_dir} is not a directory")
+        if plugin_dir.resolve() == repo_dir.resolve():
+            self.skipTest("checkout and installed plugin are the same directory")
+
+        ignored = {
+            ".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist", "uv.lock",
+            "backups", "backfills", ".entire", ".claude", ".agents", ".jules",
         }
 
-        # Dynamically discover all profile plugin directories under ~/.hermes/profiles
-        profiles_dir = Path.home() / ".hermes" / "profiles"
-        dest_dirs = [plugin_dir]
-        symlink_dirs = []
+        def files(base: Path) -> set:
+            out = set()
+            for root, dirs, names in os.walk(base):
+                dirs[:] = [d for d in dirs if d not in ignored and not d.endswith(".egg-info")]
+                for n in names:
+                    if n.endswith((".pyc", ".lock", ".bak")) or ".bak-" in n or n == "CLAUDE.md":
+                        continue
+                    out.add((Path(root) / n).relative_to(base))
+            return out
 
-        if profiles_dir.exists():
-            for prof in sorted(profiles_dir.iterdir()):
-                if not prof.is_dir() or prof.name.startswith("."):
-                    continue
-                prof_plugins = prof / "plugins"
-                if not prof_plugins.exists():
-                    continue
-                prof_oracle = prof_plugins / "oracle"
-                if prof_oracle.is_symlink():
-                    symlink_dirs.append(prof_oracle)
-                elif prof_oracle.is_dir():
-                    dest_dirs.append(prof_oracle)
-                elif not prof_oracle.exists():
-                    if plugin_dir.exists():
-                        prof_oracle.symlink_to(plugin_dir)
-                        symlink_dirs.append(prof_oracle)
+        repo_files, inst_files = files(repo_dir), files(plugin_dir)
+        self.assertEqual(sorted(map(str, repo_files - inst_files)), [], "files missing from installed plugin")
+        self.assertEqual(sorted(map(str, inst_files - repo_files)), [], "extra files in installed plugin")
+        drift = [str(r) for r in sorted(repo_files)
+                 if not filecmp.cmp(str(repo_dir / r), str(plugin_dir / r), shallow=False)]
+        self.assertEqual(drift, [], "content drift between checkout and installed plugin")
 
-        for dest in dest_dirs:
-            if dest.exists() and repo_dir.resolve() != dest.resolve():
-                for root, dirs, files in os.walk(dest):
-                    dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
-                    for f in files:
-                        if f.endswith((".pyc", ".lock")):
-                            continue
-                        dst_file = Path(root) / f
-                        rel = dst_file.relative_to(dest)
-                        src_file = repo_dir / rel
-                        if not src_file.exists():
-                            dst_file.unlink()
-
-                for root, dirs, files in os.walk(repo_dir):
-                    dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
-                    for f in files:
-                        if f.endswith((".pyc", ".lock")):
-                            continue
-                        src_file = Path(root) / f
-                        rel = src_file.relative_to(repo_dir)
-                        dst_file = dest / rel
-                        dst_file.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src_file, dst_file)
-
-        for target_dir in dest_dirs:
-            if not target_dir.exists() or repo_dir.resolve() == target_dir.resolve():
-                continue
-            for base, other, label in [(repo_dir, target_dir, f"target {target_dir.name}"), (target_dir, repo_dir, "repository")]:
-                for root, dirs, files in os.walk(base):
-                    dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.endswith(".egg-info")]
-                    for f in files:
-                        if f.endswith((".pyc", ".lock")):
-                            continue
-                        full_path = Path(root) / f
-                        rel = full_path.relative_to(base)
-                        target_file = other / rel
-                        self.assertTrue(target_file.exists(), f"File missing in {label}: {rel}")
-                        self.assertTrue(filecmp.cmp(str(full_path), str(target_file), shallow=False), f"Drift detected in {rel} ({target_dir})")
-
-        # Verify all profile symlinks point to ~/.hermes/plugins/oracle
-        for symlink in symlink_dirs:
-            self.assertTrue(symlink.is_symlink(), f"Expected symlink at {symlink}")
-            self.assertEqual(symlink.resolve(), plugin_dir.resolve(), f"Symlink target mismatch for {symlink}")
+    def test_suite_never_writes_outside_checkout(self):
+        """Guard: no test may copy into, delete from, or symlink the installed plugin."""
+        import re
+        from pathlib import Path
+        tests_dir = Path(__file__).resolve().parent
+        bad = []
+        for f in tests_dir.glob("test_*.py"):
+            src = f.read_text(encoding="utf-8")
+            for pat in (r"shutil\.copy", r"\.symlink_to\(", r"shutil\.rmtree\(\s*(?:plugin_dir|dest)"):
+                if re.search(pat, src) and f.name != Path(__file__).name:
+                    bad.append(f"{f.name}: {pat}")
+        own = Path(__file__).read_text(encoding="utf-8")
+        body = own[own.index("def test_zero_drift_with_installed_plugin"):own.index("def test_suite_never_writes_outside_checkout")]
+        for pat in ("copy2(", "unlink(", "symlink_to(", "rmtree("):
+            if pat in body:
+                bad.append(f"drift test uses {pat}")
+        self.assertEqual(bad, [])
 
 
 if __name__ == "__main__":

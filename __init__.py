@@ -62,7 +62,82 @@ _ONNX_TRANSIENT_PREFIXES = (
     "ORA-10859",  # connection load too high
     "ORA-12801",  # parallel server: not enough memory
     "ORA-12826",  # slave: out of memory area
+    "DPY-4024",  # client call_timeout: DB slow, not an ONNX model failure
+    # Session/connection-state errors: the connection is bad, not the model or
+    # the row. Degrade to NULL-embedding insert + backfill on a fresh connection.
+    "ORA-00028",  # session killed
+    "ORA-01001",  # invalid cursor
+    "ORA-01002",  # fetch out of sequence
+    "ORA-03113",  # end-of-file on communication channel
+    "ORA-03114",  # not connected
+    "ORA-03135",  # connection lost contact
 )
+
+# Errors that say the *connection/session* is broken (or the client timed out)
+# rather than the in-database ONNX model. These must never trip the ONNX
+# cooldown: doing so locked out every embedding read/write for 60s after an
+# ORA-01002 on a single pooled connection.
+_SESSION_ERROR_MARKERS = (
+    "ORA-00028", "ORA-00603", "ORA-01001", "ORA-01002", "ORA-01012", "ORA-01013",
+    "ORA-02396", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12537",
+    "ORA-12541", "ORA-25408",
+    "DPI-1067", "DPI-1040", "DPY-4011", "DPY-4024", "DPY-1001", "DPY-1002",
+    "timed out", "timeout",
+)
+_ORA_CODE_RE = re.compile(r"\bORA-\d{5}\b")
+
+
+def _is_session_error(err: Any) -> bool:
+    """True when *err* indicates a bad connection/session or client timeout."""
+    s = str(err)
+    return isinstance(err, TimeoutError) or any(m in s for m in _SESSION_ERROR_MARKERS)
+
+
+def _is_onnx_model_failure(err: Any) -> bool:
+    """Only a server-side ORA- error that is not a session/connection error can
+    indicate a broken ONNX model. Client/driver (DPY-/DPI-) errors and plain
+    Python exceptions (e.g. "'NoneType' object is not iterable") cannot."""
+    if err is None:
+        return True  # legacy callers without context keep the old behaviour
+    if _is_session_error(err):
+        return False
+    return bool(_ORA_CODE_RE.search(str(err)))
+
+
+# Live (initialized, pool open) providers in this process. The plugin's global
+# on_skill_lifecycle hook is re-bound to the NEWEST provider instance on every
+# load; when that instance's agent shuts down, the hook would otherwise keep
+# writing through a provider whose pool is gone ("pool not initialized").
+import weakref as _weakref
+
+_LIVE_PROVIDERS: "_weakref.WeakSet[Any]" = _weakref.WeakSet()
+_LIVE_PROVIDERS_LOCK = threading.Lock()
+
+
+class _CallTimeoutPool:
+    """Pool proxy that re-applies the default call_timeout on EVERY acquire.
+
+    python-oracledb runs session_callback only for newly created connections,
+    so a pooled connection whose call_timeout was tightened by a read path
+    (search/health/list -> 13s) kept that clamp when later reused by a write
+    -> DPY-4024 on inserts, which then tripped the ONNX cooldown
+    ("embedding model is unavailable"). Read paths still override after acquire.
+    """
+
+    def __init__(self, pool: Any, default_ms: int) -> None:
+        self._p = pool
+        self._default_ms = default_ms
+
+    def acquire(self, *args: Any, **kwargs: Any) -> Any:
+        conn = self._p.acquire(*args, **kwargs)
+        try:
+            conn.call_timeout = self._default_ms
+        except Exception:
+            pass
+        return conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._p, name)
 _FETCH_ARRAYSIZE = 64
 _EMBED_TIMEOUT_SECS = 10.0
 _SEARCH_TIMEOUT_SECS = float(os.environ.get("HERMES_ORACLE_SEARCH_TIMEOUT", "13.0"))
@@ -762,9 +837,12 @@ class OracleMemoryProvider(MemoryProvider):
 
             pool_kwargs["session_callback"] = _session_callback
 
-            self._pool = oracledb.SessionPool(**pool_kwargs)
+            self._pool = _CallTimeoutPool(oracledb.SessionPool(**pool_kwargs), pool_call_timeout)
             self._initialized = True
             self._pool_fingerprint = current_fingerprint
+            self._write_stop.clear()
+            with _LIVE_PROVIDERS_LOCK:
+                _LIVE_PROVIDERS.add(self)
             self._ensure_schema()
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
         except Exception as e:
@@ -897,7 +975,10 @@ class OracleMemoryProvider(MemoryProvider):
             time.monotonic() - failed_at < _ONNX_RETRY_AFTER_SECS
         )
 
-    def _onnx_mark_failed(self) -> None:
+    def _onnx_mark_failed(self, err: Any = None) -> None:
+        if not _is_onnx_model_failure(err):
+            logger.info("ONNX cooldown NOT tripped (session/driver error, not a model failure): %s", err)
+            return
         with self._embed_lock:
             self._onnx_failed_at = time.monotonic()
 
@@ -1096,7 +1177,7 @@ class OracleMemoryProvider(MemoryProvider):
 
             is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
             if not is_shape_err:
-                self._onnx_mark_failed()
+                self._onnx_mark_failed(err_str)
             logger.warning(
                 "In-database ONNX embed_many failed (%s); external fallback is disabled",
                 err_str,
@@ -1160,12 +1241,27 @@ class OracleMemoryProvider(MemoryProvider):
         daemon thread (and a new pooled connection) for every turn and
         contended on a small session pool.
         """
-        if self._pool is None and not self._initialized:
+        if self._pool is None or self._write_stop.is_set():
+            # Not initialized, or already shut down: the worker could only fail
+            # this row with "pool not initialized". Hand it to a live provider
+            # in this process if there is one; otherwise drop it loudly once.
+            live = self._live_provider_for(session_id) if self._initialized else None
+            if live is not None and live is not self:
+                live._queue_background_insert(
+                    memory_id=memory_id,
+                    session_id=session_id,
+                    role=role,
+                    content=content,
+                    target=target,
+                    metadata=metadata,
+                )
+                return
+            reason = "provider shut down" if self._initialized else "provider not initialized"
             if not self._bg_drop_warned:
                 self._bg_drop_warned = True
-                logger.warning("oracle background insert dropped: provider not initialized")
+                logger.warning("oracle background insert dropped: %s", reason)
             else:
-                logger.debug("oracle background insert dropped: provider not initialized")
+                logger.debug("oracle background insert dropped: %s", reason)
             return
         self._write_queue.put(
             {
@@ -1355,7 +1451,7 @@ class OracleMemoryProvider(MemoryProvider):
                         is_shape_err = is_51815 or is_54401
 
                 if not is_shape_err and not self._is_onnx_transient(err_str):
-                    self._onnx_mark_failed()
+                    self._onnx_mark_failed(err_str)
                     logger.warning(
                         "In-database ONNX insert failed (%s); external fallback is disabled",
                         err_str,
@@ -1554,7 +1650,7 @@ class OracleMemoryProvider(MemoryProvider):
                         is_shape_err = is_51815 or is_54401
 
                 if not is_shape_err and not self._is_onnx_transient(err_str):
-                    self._onnx_mark_failed()
+                    self._onnx_mark_failed(err_str)
                     logger.warning(
                         "In-database ONNX insert_many failed (%s); external fallback is disabled",
                         err_str,
@@ -1980,7 +2076,7 @@ class OracleMemoryProvider(MemoryProvider):
                     for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
                 )
                 if use_onnx and not is_text_err and not is_shape_err and not is_timeout_err:
-                    self._onnx_mark_failed()
+                    self._onnx_mark_failed(err_str)
 
                 if is_timeout_err:
                     logger.warning(
@@ -2030,7 +2126,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 vec_err,
                             )
                             if use_onnx and not is_vec_timeout and not any(code in vec_err_str for code in ("ORA-54401", "ORA-51815")):
-                                self._onnx_mark_failed()
+                                self._onnx_mark_failed(vec_err)
                             if is_vec_timeout:
                                 raise TimeoutError(
                                     f"oracle_search vector fallback query timed out after {timeout_s:.0f}s: {vec_err}"
@@ -2044,6 +2140,9 @@ class OracleMemoryProvider(MemoryProvider):
                     logger.warning(
                         "In-database ONNX hybrid search failed (%s); external fallback is disabled",
                         e,
+                        # Non-Oracle errors (e.g. "'NoneType' object is not iterable") are
+                        # driver/plugin bugs: keep the traceback so the next one is diagnosable.
+                        exc_info=not _ORA_CODE_RE.search(err_str),
                     )
                     raise RuntimeError(
                         f"In-database ONNX hybrid search failed ({e}); external fallback is disabled"
@@ -2236,7 +2335,57 @@ class OracleMemoryProvider(MemoryProvider):
             kept.append(row)
         return kept
 
-    def _search(
+    def _search(self, query: str, *args: Any, **kwargs: Any) -> list:
+        """Search; on a broken-session error (ORA-01002, lost connection, or a
+        driver-level non-Oracle exception) retry ONCE on a fresh connection.
+        The bad connection is dropped from the pool by _acquire_checked, so the
+        retry cannot be handed the same poisoned session. Timeouts are not
+        retried (they already consumed the caller's budget)."""
+        try:
+            return self._search_once(query, *args, **kwargs)
+        except Exception as e:
+            if isinstance(e, TimeoutError) or "timed out" in str(e):
+                raise
+            if not (_is_session_error(e) or not _ORA_CODE_RE.search(str(e))):
+                raise
+            logger.warning("oracle search hit a session-level error (%s); retrying once on a fresh connection", e)
+            return self._search_once(query, *args, **kwargs)
+
+    def _acquire_checked(self):
+        """Pool acquire that DROPS (rather than returns) a connection whose use
+        raised a session-level or non-Oracle error, so it is never reused."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            pool = self._pool
+            if pool is None:
+                raise RuntimeError(self._init_error or "pool not initialized")
+            conn = pool.acquire()
+            try:
+                yield conn
+            except BaseException as exc:
+                bad = _is_session_error(exc) and not isinstance(exc, TimeoutError) and "timed out" not in str(exc)
+                bad = bad or (isinstance(exc, Exception) and not _ORA_CODE_RE.search(str(exc))
+                              and not isinstance(exc, TimeoutError) and "timed out" not in str(exc))
+                if bad:
+                    try:
+                        pool.drop(conn)
+                        conn = None
+                        logger.info("oracle: dropped pooled connection after session-level error: %s", exc)
+                    except Exception as drop_e:
+                        logger.debug("oracle pool drop failed: %s", drop_e)
+                raise
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception as close_e:
+                        logger.debug("oracle conn release failed: %s", close_e)
+
+        return _cm()
+
+    def _search_once(
         self,
         query: str,
         top_k: int = 8,
@@ -2267,7 +2416,7 @@ class OracleMemoryProvider(MemoryProvider):
         fetch_k = max(top_k * 2, _MIN_CANDIDATE_POOL) if mode == "hybrid" else max(top_k, _MIN_CANDIDATE_POOL)
         query_timeout_s = float(timeout) if timeout is not None else _SEARCH_TIMEOUT_SECS
         query_timeout_ms = int(query_timeout_s * 1000)
-        with self._pool.acquire() as conn:
+        with self._acquire_checked() as conn:
             try:
                 conn.call_timeout = query_timeout_ms
             except Exception:
@@ -2341,7 +2490,7 @@ class OracleMemoryProvider(MemoryProvider):
                             e,
                         )
                         if use_onnx and not is_shape_err and not is_timeout_err:
-                            self._onnx_mark_failed()
+                            self._onnx_mark_failed(e)
                         if is_timeout_err:
                             raise TimeoutError(
                                 f"oracle_search vector query timed out after {query_timeout_s:.0f}s: {e}"
@@ -2565,7 +2714,35 @@ class OracleMemoryProvider(MemoryProvider):
         if isinstance(new_session_id, str) and new_session_id:
             self._session_id = new_session_id
 
-    def on_skill_lifecycle(
+    def _live_provider_for(self, session_id: str = "") -> "OracleMemoryProvider | None":
+        """Self if usable, else a live provider in this process (prefer the one
+        serving *session_id*). None when no provider has an open pool."""
+        if self._pool is not None and not self._write_stop.is_set():
+            return self
+        with _LIVE_PROVIDERS_LOCK:
+            live = [p for p in _LIVE_PROVIDERS
+                    if p is not self and p._pool is not None and not p._write_stop.is_set()]
+        if not live:
+            return None
+        if session_id:
+            for p in live:
+                if p._session_id == session_id:
+                    return p
+        return live[-1]
+
+    def on_skill_lifecycle(self, *args: Any, **kwargs: Any) -> None:
+        """Global hook entry point. Hermes binds this hook to whichever provider
+        instance loaded LAST; once that instance's agent shuts down its pool is
+        gone, so route to a live provider instead of failing every skill event
+        in every other session with "pool not initialized"."""
+        data = args[0] if args and isinstance(args[0], dict) else {}
+        sid = kwargs.get("session_id") or data.get("session_id") or ""
+        target = self._live_provider_for(sid if isinstance(sid, str) else "") or self
+        # (falling back to self is safe: _queue_background_insert now drops
+        # rather than enqueues when this instance has no usable pool)
+        target._on_skill_lifecycle_impl(*args, **kwargs)
+
+    def _on_skill_lifecycle_impl(
         self,
         *args: Any,
         **kwargs: Any,
@@ -3287,7 +3464,7 @@ class OracleMemoryProvider(MemoryProvider):
 
                             if not succeeded:
                                 if not is_shape_err and not self._is_onnx_transient(err_str):
-                                    self._onnx_mark_failed()
+                                    self._onnx_mark_failed(err_str)
                                     logger.warning(
                                         "In-database ONNX update failed (%s); external fallback is disabled",
                                         err_str,
@@ -3621,10 +3798,20 @@ class OracleMemoryProvider(MemoryProvider):
         # Stop accepting new background writes, then drain in-flight and
         # pending work before closing the pool so no turn is lost to a
         # connection closed underneath a running writer.
+        with _LIVE_PROVIDERS_LOCK:
+            _LIVE_PROVIDERS.discard(self)
         self._write_stop.set()
+        busy = False
         for t in (self._write_worker, self._embed_worker, self._prefetch_thread):
             if t and t.is_alive():
-                t.join(timeout=10.0)
+                t.join(timeout=30.0)
+                busy = busy or t.is_alive()
+        if busy:
+            # A writer still holds a pooled connection; closing the pool under
+            # it raised "list.remove(x): x not in list" and failed every queued
+            # row with "pool not initialized". Leave the pool to process exit.
+            logger.warning("oracle shutdown: worker still busy after 30s; pool left open")
+            return
         if self._pool is not None:
             try:
                 self._pool.close()

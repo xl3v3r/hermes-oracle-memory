@@ -234,5 +234,63 @@ class TestSkillLifecycleHook(unittest.TestCase):
             self.assertIn("probe_mod", sys.modules)
 
 
+class TestHookSurvivesProviderShutdown(unittest.TestCase):
+    """Hermes re-binds the global on_skill_lifecycle hook to the NEWEST provider
+    instance on every load. When that instance shuts down, skill events from
+    other live sessions must reach a live provider, not fail with
+    'pool not initialized'."""
+
+    def _live(self, sid):
+        p = oracle_plugin.OracleMemoryProvider()
+        p._pool = MagicMock()
+        p._initialized = True
+        p._session_id = sid
+        with oracle_plugin._LIVE_PROVIDERS_LOCK:
+            oracle_plugin._LIVE_PROVIDERS.add(p)
+        return p
+
+    def tearDown(self):
+        with oracle_plugin._LIVE_PROVIDERS_LOCK:
+            oracle_plugin._LIVE_PROVIDERS.clear()
+
+    def test_hook_on_dead_provider_routes_to_live_one(self):
+        a = self._live("sess-A")
+        b = self._live("sess-B")          # hook is bound to b (newest)
+        b._write_stop.set(); b._pool = None   # what shutdown() leaves behind
+        with oracle_plugin._LIVE_PROVIDERS_LOCK:
+            oracle_plugin._LIVE_PROVIDERS.discard(b)
+
+        with patch.object(a, "_queue_background_insert") as a_ins, \
+             patch.object(b, "_insert") as b_insert:
+            b.on_skill_lifecycle(action="loaded", skill_name="probe", session_id="sess-A")
+            a_ins.assert_called_once()
+            self.assertEqual(a_ins.call_args[1]["session_id"], "sess-A")
+            b_insert.assert_not_called()
+
+    def test_queue_on_dead_provider_is_handed_off_not_failed(self):
+        a = self._live("sess-A")
+        b = oracle_plugin.OracleMemoryProvider()
+        b._initialized = True; b._pool = None; b._write_stop.set()
+        with patch.object(a, "_queue_background_insert") as a_ins:
+            b._queue_background_insert(memory_id="m1", session_id="sess-A", role="fact",
+                                       content="c", target="memory", metadata={})
+            a_ins.assert_called_once()
+        self.assertTrue(b._write_queue.empty())
+
+    def test_queue_on_dead_provider_with_no_live_peer_drops_cleanly(self):
+        b = oracle_plugin.OracleMemoryProvider()
+        b._initialized = True; b._pool = None; b._write_stop.set()
+        b._queue_background_insert(memory_id="m1", session_id="s", role="fact",
+                                   content="c", target="memory", metadata={})
+        self.assertTrue(b._write_queue.empty())
+        self.assertIsNone(b._write_worker)
+
+    def test_shutdown_unregisters_provider(self):
+        a = self._live("sess-A")
+        a._write_worker = a._embed_worker = a._prefetch_thread = None
+        a.shutdown()
+        self.assertNotIn(a, list(oracle_plugin._LIVE_PROVIDERS))
+
+
 if __name__ == '__main__':
     unittest.main()
