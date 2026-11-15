@@ -80,6 +80,8 @@ class TestForeignCopiesJudgedByProfileRoots(unittest.TestCase):
         prov._insert_many.assert_not_called()
         self.assertNotIn("does not scan", res["hint"])
         self.assertIn("outside the default", res["hint"])
+        # replace_foreign would recreate the problem the rule prevents.
+        self.assertIn("without --dirs", res["hint"])
 
     def test_dirs_outside_defaults_replace_gone_default_copy(self):
         with tempfile.TemporaryDirectory() as td:
@@ -99,6 +101,7 @@ class TestForeignCopiesJudgedByProfileRoots(unittest.TestCase):
             res, prov = _bulk(home, None, str(old))
         self.assertEqual(res["skipped_foreign"], 1)
         self.assertIn("replace_foreign", res.get("hint", ""))
+        self.assertNotIn("without --dirs", res["hint"])
         prov._insert_many.assert_not_called()
 
     def test_replace_foreign_replaces_copy_from_removed_root(self):

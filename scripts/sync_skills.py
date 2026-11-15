@@ -1189,7 +1189,9 @@ def sync_skills_library(
                     # it, or it comes from a root no longer configured. Kept
                     # (not even force replaces it) unless replace_foreign.
                     foreign = [c for c in own if live_elsewhere(c.get("path"), skill.path, owner_roots)]
+                    reason = "outside_profile"
                     if not foreign and dirs and not path_in_roots(skill.path, default_roots):
+                        reason = "default_dir"
                         # A --dirs run outside the default roots never replaces
                         # a copy stored from a live SKILL.md under them: later
                         # default runs and the lifecycle hook would treat this
@@ -1201,7 +1203,9 @@ def sync_skills_library(
                         ]
                     if foreign and not replace_foreign:
                         stats["skipped_foreign"] += 1
-                        stats["foreign_skills"].append({"name": skill.name, "path": foreign[0].get("path")})
+                        stats["foreign_skills"].append(
+                            {"name": skill.name, "path": foreign[0].get("path"), "reason": reason}
+                        )
                         logger.warning(
                             "skill '%s': this host's copy is stored from %s, which still exists (another "
                             "profile, a dir no longer configured, or a default skill dir while this run "
@@ -1354,6 +1358,11 @@ def sync_skills_library(
             "--dirs dir outside the default dirs); see foreign_skills. Re-run with replace_foreign "
             "(--replace-foreign on the command line) to replace them with the copies this run found."
         )
+        if any(f.get("reason") == "default_dir" for f in stats["foreign_skills"]):
+            stats["hint"] += (
+                " For a skill kept because it is in a default skill dir (reason default_dir), sync without "
+                "--dirs instead: replacing it would make this run's copy foreign to every later default sync."
+            )
     return stats
 
 

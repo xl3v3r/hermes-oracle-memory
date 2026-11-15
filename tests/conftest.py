@@ -87,11 +87,17 @@ def check_link_paths(target, link, target_relative_to_link=True):
         raise AssertionError(
             f"the temp dir {tmp} contains the home dir {home}; set TMPDIR to a dedicated directory"
         )
-    plugins = home / ".hermes" / "plugins" if home is not None else None
-    if plugins is not None and (plugins.is_relative_to(tmp) or tmp.is_relative_to(plugins)):
-        raise AssertionError(
-            f"the temp dir {tmp} overlaps the installed plugin dir {plugins}; set TMPDIR to a dedicated directory"
-        )
+    # The real install, in either direction. A HERMES_HOME inside the temp
+    # dir is a test's fake home, so only a temp dir inside its plugin dir counts.
+    checks = [((home / ".hermes" / "plugins").resolve(), True)] if home is not None else []
+    if _os.environ.get("HERMES_HOME"):
+        checks.append(((_Path(_os.environ["HERMES_HOME"]) / "plugins").resolve(), False))
+    for plugins, both_ways in checks:
+        if tmp.is_relative_to(plugins) or (both_ways and plugins.is_relative_to(tmp)):
+            raise AssertionError(
+                f"the temp dir {tmp} overlaps the installed plugin dir {plugins}; "
+                "set TMPDIR to a dedicated directory"
+            )
     link_dir = _Path(_os.path.abspath(_os.fsdecode(link))).parent.resolve()
     tgt = _Path(_os.fsdecode(target))
     if not tgt.is_absolute():

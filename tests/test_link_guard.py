@@ -96,6 +96,38 @@ class TestRuntimeLinkGuard(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError, "plugin"):
                         guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
 
+    def test_plugin_dir_compared_after_resolving_links(self):
+        from tests.test_skill_ownership import _link_in_tmp
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            home = root / "home"
+            (home / ".hermes").mkdir(parents=True)
+            (root / "elsewhere").mkdir()
+            _link_in_tmp(home / ".hermes" / "plugins", root / "elsewhere")
+            with unittest.mock.patch.object(guard, "_real_home", return_value=home), \
+                    unittest.mock.patch("tempfile.gettempdir", return_value=str(root / "elsewhere" / "x")):
+                with self.assertRaisesRegex(AssertionError, "plugin"):
+                    guard.check_link_paths(str(root / "t"), str(root / "l"))
+
+    def test_hermes_home_plugin_dir_refuses_overlapping_temp_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            hh = root / "hh"
+            with unittest.mock.patch.dict(os.environ, {"HERMES_HOME": str(hh)}), \
+                    unittest.mock.patch("tempfile.gettempdir", return_value=str(hh / "plugins" / "x")):
+                with self.assertRaisesRegex(AssertionError, "plugin"):
+                    guard.check_link_paths(str(root / "t"), str(root / "l"))
+
+    def test_fake_hermes_home_inside_temp_dir_allows_links(self):
+        # Tests point HERMES_HOME at a fake home in the temp dir; its plugin
+        # dir is a fake too, so links there stay allowed.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            (root / "hh" / "plugins").mkdir(parents=True)
+            with unittest.mock.patch.dict(os.environ, {"HERMES_HOME": str(root / "hh")}):
+                guard.check_link_paths(str(root / "t"), str(root / "hh" / "plugins" / "l"))
+
     def test_pathlib_accessor_guarded_when_present(self):
         import pathlib
 
