@@ -1,7 +1,7 @@
 ---
 name: oracle-skill-corpus
 description: Discover and materialize shared cross-server skills from Oracle 26ai ADB memory at runtime without requiring local disk installation.
-version: 1.1.1.4
+version: 1.1.1.5
 author: Hermes Community
 metadata:
   hermes:
@@ -106,3 +106,4 @@ Specify the `variant` index, or `host` and/or `path`, to select a specific varia
 - Live updates: creating, editing, patching, or installing a skill locally immediately synchronizes it to Oracle via the `on_skill_lifecycle` hook.
 - Rows are `skill:<host>:<name>:c<N>`; a host only replaces or deletes its own copy. Host-less legacy rows are the shared corpus and are never pruned.
 - Pruning is opt-in (`oracle_sync_skills` with `prune=true`, preview with `dry_run=true`) and removes only this host's skills that are gone from disk.
+- A sync result with `skipped_foreign` > 0 lists copies stored from SKILL.md files outside this profile's skill dirs (another profile, or a removed dir). They are kept; `replace_foreign=true` replaces them with this profile's copies.

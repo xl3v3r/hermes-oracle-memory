@@ -1,0 +1,126 @@
+"""Runtime link guard (#14): while the suite runs, os.symlink and os.link (and
+so Path.symlink_to / Path.hardlink_to, which call them) refuse any link whose
+location or target lies outside the temp dir, so no test can link into the
+installed plugin or the checkout. Installed by tests/conftest.py."""
+
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import tests.conftest as guard  # noqa: E402
+
+CHECKOUT = Path(__file__).resolve().parent.parent
+_CHECKOUT_IN_TMP = CHECKOUT.is_relative_to(Path(tempfile.gettempdir()).resolve())
+
+
+@unittest.skipIf(_CHECKOUT_IN_TMP, "the checkout lies in the temp dir, so it is no outside target")
+class TestRuntimeLinkGuard(unittest.TestCase):
+    def test_guard_installed(self):
+        self.assertTrue(getattr(os.symlink, "_hom_link_guard", False))
+        self.assertTrue(getattr(os.link, "_hom_link_guard", False))
+
+    def test_symlink_to_outside_target_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "x"
+            with self.assertRaises(AssertionError):
+                os.symlink(str(CHECKOUT), str(link))
+            self.assertFalse(os.path.lexists(link))
+
+    def test_relative_target_escaping_temp_dir_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "x"
+            up = os.path.relpath(CHECKOUT, td)
+            with self.assertRaises(AssertionError):
+                os.symlink(up, str(link))
+            self.assertFalse(os.path.lexists(link))
+
+    def test_link_location_outside_temp_dir_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            # /dev/null is not a directory: without the guard this fails with
+            # an OSError instead, and nothing can be created there either way.
+            with self.assertRaises(AssertionError):
+                os.symlink(td, "/dev/null/hom-link")
+
+    def test_path_methods_guarded(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(AssertionError):
+                (Path(td) / "s").symlink_to(CHECKOUT)
+            with self.assertRaises(AssertionError):
+                (Path(td) / "h").hardlink_to(CHECKOUT / "VERSION")
+            self.assertEqual(sorted(os.listdir(td)), [])
+
+    def test_hardlink_to_outside_file_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(AssertionError):
+                os.link(str(CHECKOUT / "VERSION"), os.path.join(td, "v"))
+
+    def test_links_inside_temp_dir_allowed(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "t"
+            target.mkdir()
+            (target / "f").write_text("x", encoding="utf-8")
+            os.symlink(str(target), os.path.join(td, "s"))
+            os.symlink("t", os.path.join(td, "rel"))
+            os.link(str(target / "f"), os.path.join(td, "h"))
+            self.assertTrue((Path(td) / "s" / "f").is_file())
+            self.assertTrue((Path(td) / "rel" / "f").is_file())
+            self.assertTrue((Path(td) / "h").is_file())
+
+    def test_check_is_exposed_for_helpers(self):
+        with tempfile.TemporaryDirectory() as td:
+            guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
+            with self.assertRaises(AssertionError):
+                guard.check_link_paths(str(CHECKOUT), os.path.join(td, "l"))
+
+
+class TestStaticLinkScan(unittest.TestCase):
+    """The source scan in test_suite_never_writes_outside_checkout."""
+
+    def _scan(self, src, name="test_sample.py"):
+        from tests.test_oracle import _link_violations
+
+        return _link_violations(name, src)
+
+    def test_aliased_and_shell_links_flagged(self):
+        # Shell samples are split so the install scanner does not read these
+        # strings as calls in this file.
+        for src in (
+            "from os import symlink\nsymlink(a, b)\n",
+            "from os import link as mk\n",
+            "os.link(a, b)\n",
+            "p.hardlink_to(q)\n",
+            "subprocess" ".run(['ln', '-s', a, b])\n",
+            "os.sys" "tem('ln -s a b')\n",
+            "os.symlink(a, b)\n",
+            "p.symlink_to(q)\n",
+        ):
+            self.assertTrue(self._scan(src), src)
+
+    def test_helper_confinement_cannot_be_a_comment(self):
+        helper = (
+            "\ndef _link_in_tmp(link, target):\n"
+            "    # gettempdir() relative_to(tmp)\n"
+            "    os.symlink(target, link)\n"
+        )
+        self.assertTrue(self._scan(helper + "\nclass T:\n    pass\n"))
+
+    def test_confined_helper_accepted(self):
+        helper = (
+            "\ndef _link_in_tmp(link, target):\n"
+            "    tmp = Path(tempfile.gettempdir()).resolve()\n"
+            "    for p in (link.parent, target):\n"
+            "        Path(p).resolve().relative_to(tmp)\n"
+            "    os.symlink(target, link)\n"
+        )
+        self.assertEqual(self._scan(helper + "\nclass T:\n    pass\n"), [])
+
+    def test_plain_code_clean(self):
+        self.assertEqual(self._scan("x = Path(a).read_text()\n"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

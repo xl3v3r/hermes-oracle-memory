@@ -54,3 +54,54 @@ if 'oci' not in sys.modules:
     except ImportError:
         sys.modules['oci'] = MagicMock()
 
+
+
+# ---------------------------------------------------------------------------
+# Runtime link guard: while the suite runs, os.symlink and os.link (and so
+# Path.symlink_to / Path.hardlink_to, which call them) refuse a link whose
+# location or target lies outside the temp dir. No test can link into the
+# installed plugin or the checkout, however the call is spelled.
+# ---------------------------------------------------------------------------
+import os as _os
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+
+def check_link_paths(target, link, target_relative_to_link=True):
+    """Raise AssertionError unless the link's directory and its target both
+    resolve inside tempfile.gettempdir()."""
+    tmp = _Path(_tempfile.gettempdir()).resolve()
+    link_dir = _Path(_os.path.abspath(_os.fsdecode(link))).parent.resolve()
+    tgt = _Path(_os.fsdecode(target))
+    if not tgt.is_absolute():
+        tgt = (link_dir if target_relative_to_link else _Path.cwd()) / tgt
+    for p in (link_dir, tgt.resolve()):
+        if not p.is_relative_to(tmp):
+            raise AssertionError(f"test tried to create a link outside the temp dir: {link} -> {target}")
+
+
+def _install_link_guard():
+    if getattr(_os.symlink, "_hom_link_guard", False):
+        return  # conftest imported a second time (as tests.conftest)
+    real_symlink, real_link = _os.symlink, _os.link
+
+    def symlink(src, dst, target_is_directory=False, *, dir_fd=None):
+        if dir_fd is not None:
+            raise AssertionError("tests may not create links relative to a dir_fd")
+        check_link_paths(src, dst)
+        return real_symlink(src, dst, target_is_directory)
+
+    def link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+        if src_dir_fd is not None or dst_dir_fd is not None:
+            raise AssertionError("tests may not create links relative to a dir_fd")
+        check_link_paths(src, dst, target_relative_to_link=False)
+        if follow_symlinks:
+            return real_link(src, dst)
+        return real_link(src, dst, follow_symlinks=False)
+
+    symlink._hom_link_guard = True  # type: ignore[attr-defined]
+    link._hom_link_guard = True  # type: ignore[attr-defined]
+    _os.symlink, _os.link = symlink, link
+
+
+_install_link_guard()
