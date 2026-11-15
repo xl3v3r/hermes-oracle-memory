@@ -22,21 +22,19 @@ from typing import Any, Sequence
 
 logger = logging.getLogger("hermes.oracle_sync_skills")
 
-# CLI only: load the Hermes .env file when run as a script. When the plugin loads this
-# module in-process, Hermes has already loaded the environment, and importing
-# must not have side effects on the host process.
-if __name__ == "__main__":
-    env_file = Path.home() / ".hermes" / ".env"
-    if env_file.exists():
-        try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    v = v.strip().strip('"').strip("'")
-                    os.environ.setdefault(k.strip(), v)
-        except Exception as e:
-            logger.debug("Failed reading %s: %s", env_file, e)
+
+
+def load_env_file(env_file: Path) -> None:
+    """CLI --env-file: set KEY=VALUE lines that are not already in the
+    environment. The CLI never reads a credentials file on its own (1.1.1.4):
+    export OCI_DB_* or pass --env-file explicitly."""
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 # --- Interpreter guard -------------------------------------------------------
@@ -91,8 +89,8 @@ except ImportError:
 # Standalone shims for agent / tools if not present in sys.modules
 if "agent" not in sys.modules:
     try:
-        from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
-        from agent.secret_scope import get_secret
+        from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt  # noqa: F401
+        from agent.secret_scope import get_secret  # noqa: F401
     except ImportError:
         agent_mod = types.ModuleType("agent")
         mp_mod = types.ModuleType("agent.memory_provider")
@@ -126,7 +124,7 @@ if "agent" not in sys.modules:
 
 if "tools" not in sys.modules:
     try:
-        from tools.registry import tool_error
+        from tools.registry import tool_error  # noqa: F401
     except ImportError:
         tools_mod = types.ModuleType("tools")
         reg_mod = types.ModuleType("tools.registry")
@@ -264,7 +262,6 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
                 val = "\n".join(scalar_lines).strip()
             target_dict[current_key] = val
         current_scalar_mode = None
-        current_scalar_indent = None
         scalar_lines = []
 
     for line in fm_lines:
@@ -515,23 +512,44 @@ def parse_skill_file(skill_path: Path | str) -> SkillInfo | None:
     )
 
 
+def hermes_home() -> Path:
+    """The active Hermes home (profile-aware). Inside Hermes this is
+    hermes_constants.get_hermes_home(), which honours a per-context profile
+    override; standalone it is $HERMES_HOME, else ~/.hermes."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+
+        return Path(get_hermes_home())
+    except Exception:
+        pass
+    env = (os.environ.get("HERMES_HOME") or "").strip()
+    return Path(os.path.expanduser(env)) if env else Path.home() / ".hermes"
+
+
+def default_skill_roots() -> list[Path]:
+    """Skill roots scanned by default, by the bulk sync and the lifecycle hook
+    alike: the active profile's skills dir and the shared ~/.agents/skills."""
+    out: list[Path] = []
+    for d in (hermes_home() / "skills", Path.home() / ".agents" / "skills"):
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def resolve_skill_roots(dirs: Sequence[str | Path] | None = None) -> list[Path]:
+    """Existing, resolved, de-duplicated scan roots (*dirs* or the defaults)."""
+    raw: Sequence[str | Path] = dirs if dirs else default_skill_roots()
+    out: list[Path] = []
+    for d in raw:
+        p = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
+        if p.is_dir() and p not in out:
+            out.append(p)
+    return out
+
+
 def discover_skills(dirs: list[str | Path] | None = None) -> list[SkillInfo]:
     """Scan directories for SKILL.md files and return parsed SkillInfo objects."""
-    search_dirs: list[Path] = []
-    if dirs:
-        for d in dirs:
-            p = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
-            if p.is_dir():
-                search_dirs.append(p)
-    else:
-        default_dirs = [
-            Path.home() / ".agents" / "skills",
-            Path.home() / ".hermes" / "skills",
-        ]
-        for d in default_dirs:
-            p = d.resolve()
-            if p.is_dir():
-                search_dirs.append(p)
+    search_dirs = resolve_skill_roots(dirs)
 
     skills_by_name: dict[str, SkillInfo] = {}
     seen_canonical_paths: set[Path] = set()
@@ -609,7 +627,7 @@ def compute_host_root(skills_or_paths: Sequence[SkillInfo | Path] | None = None)
             elif isinstance(item, str):
                 paths.append(item)
     if not paths:
-        for d in (Path.home() / ".hermes" / "skills", Path.home() / ".agents" / "skills", Path.home() / "skills"):
+        for d in default_skill_roots():
             if d.exists():
                 paths.append(str(d))
     if not paths:
@@ -624,15 +642,40 @@ def compute_host_root(skills_or_paths: Sequence[SkillInfo | Path] | None = None)
 
 
 def get_host_id() -> str:
-    """Return local host identifier for skill tagging and pruning."""
-    host_id = os.environ.get("HERMES_HOST_ID") or os.environ.get("HOSTNAME") or ""
+    """This host's identity in skill-corpus ids (skill:<host>:<name>:c<N>).
+    HERMES_HOST_ID when set; otherwise the short host name, lower-cased (a
+    shell's HOSTNAME may be the FQDN while a systemd service sees none, and
+    both must give the same id). Keep identical to the plugin's get_host_id()."""
+    host_id = (os.environ.get("HERMES_HOST_ID") or "").strip()
     if not host_id:
-        try:
-            import socket
-            host_id = socket.gethostname().split(".")[0]
-        except Exception:
-            host_id = "hermes"
+        host_id = (os.environ.get("HOSTNAME") or "").strip()
+        if not host_id:
+            try:
+                import socket
+
+                host_id = socket.gethostname()
+            except Exception:
+                host_id = ""
+        host_id = host_id.split(".")[0].lower()
     return re.sub(r"[^a-zA-Z0-9._-]", "", host_id) or "hermes"
+
+
+def like_escape(text: str) -> str:
+    """Escape LIKE wildcards for `... LIKE :x ESCAPE '\\'`."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# Every row of one skill owned by one host: ids skill:<host>:<name>:c<N>.
+# Host and skill names cannot contain ':', so the prefix never matches another
+# skill, another host's copy, or the host-less legacy corpus (skill:<name>[:cN]),
+# and it is answered from the primary-key index.
+OWN_SKILL_ROWS_SQL = "role = 'skill' AND memory_id LIKE :pfx ESCAPE '\\'"
+
+
+def own_skill_rows_binds(host: str, name: str) -> dict[str, str]:
+    if not host or not name or ":" in host or ":" in name:
+        raise ValueError(f"invalid skill identity host={host!r} name={name!r}")
+    return {"pfx": like_escape(f"skill:{host}:{name}:c") + "%"}
 
 
 def format_skill_payload(skill: SkillInfo, mode: str = "meta", host: str = "") -> list[dict[str, Any]]:
@@ -671,7 +714,8 @@ def format_skill_payload(skill: SkillInfo, mode: str = "meta", host: str = "") -
         base_metadata["host"] = host
 
     prefix = f"skill:{host}:{skill.name}" if host else f"skill:{skill.name}"
-    conv_ref = skill.name
+    # Meta and full rows share one host-qualified conv_ref (1.1.1.4).
+    conv_ref = f"skill:{host}:{skill.name}" if host else skill.name
 
     if mode == "meta":
         # Canonical meta-row ID is `:c0`, identical to the full-mode chunk-0 row,
@@ -691,7 +735,7 @@ def format_skill_payload(skill: SkillInfo, mode: str = "meta", host: str = "") -
                 "turn_index": None,
                 "chunk_index": 0,
                 "turn_id": None,
-                "conv_ref": f"skill:{host}:{skill.name}" if host else conv_ref,
+                "conv_ref": conv_ref,
             }
         ]
 
@@ -789,9 +833,18 @@ def sync_skills_library(
     prune_host: str | None = None,
     prune_limit: int = 500,
     host_tag: str | None = None,
+    prune: bool = False,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Synchronize discovered skills into Oracle memory database."""
+    """Synchronize discovered skills into Oracle memory database.
+
+    Every row written belongs to this host (skill:<host>:<name>:c<N>). Each
+    changed skill is replaced in its own transaction (DELETE of this host's
+    rows + INSERT, one commit), so a failure keeps the previous copy. Pruning
+    is opt-in (*prune*, or *prune_host* = a path prefix): it deletes this
+    host's skills whose SKILL.md is no longer under the scanned roots (or under
+    *prune_host*), and never touches other hosts' copies or the host-less
+    legacy corpus."""
     target_provider_or_conn = provider if provider is not None else provider_or_conn
 
     if isinstance(skills_or_mode, (list, tuple)):
@@ -803,8 +856,13 @@ def sync_skills_library(
     else:
         skills = discover_skills(dirs=dirs)
 
-    effective_host_root = host_root or prune_host or compute_host_root(skills)
-    effective_prune_root = prune_host if prune_host is not None else effective_host_root
+    if prune_host:
+        prune_roots = [str(prune_host)]
+    elif prune:
+        prune_roots = [str(r) for r in resolve_skill_roots(dirs)] if not isinstance(skills_or_mode, (list, tuple)) \
+            else ([host_root] if host_root else [])
+    else:
+        prune_roots = []
 
     def _is_connection(obj: Any, prov_kw: Any) -> bool:
         if prov_kw is not None:
@@ -836,9 +894,9 @@ def sync_skills_library(
                 raise RuntimeError(err)
 
     table = getattr(target_provider_or_conn, "_table", "HERMES_AGENT_MEMORY")
-    agent_id_attr = getattr(target_provider_or_conn, "_agent_id", None)
-    agent_id_str = agent_id_attr if isinstance(agent_id_attr, str) and agent_id_attr else ""
-    effective_host = host_tag or os.environ.get("HERMES_HOST_ID") or agent_id_str
+    # One identity for every skill row this host writes, deletes or prunes
+    # (the lifecycle hook uses the same get_host_id()).
+    effective_host = host_tag or get_host_id()
 
     stats: dict[str, Any] = {
         "status": "dry_run" if dry_run else "success",
@@ -853,6 +911,7 @@ def sync_skills_library(
         "errors": [],
         "mode": mode,
         "dry_run": dry_run,
+        "host": effective_host,
     }
 
     if dry_run and not target_provider_or_conn:
@@ -958,125 +1017,115 @@ def sync_skills_library(
                         existing_by_name.setdefault(sname, []).append(item)
                     existing_map[mid] = item
 
+                own_prefix = f"skill:{effective_host}:"
                 to_upsert: list[SkillInfo] = []
                 for skill in skills:
                     copies = existing_by_name.get(skill.name, [])
+                    own = [c for c in copies if str(c.get("mid", "")).startswith(own_prefix)]
                     skill_hash = skill.hash or skill.content_hash
-                    # Skip if ANY copy matches this hash (prevents redundant cross-host duplicates)
-                    if not force and any(c.get("hash") == skill_hash for c in copies):
+                    # Up to date: this host's copy has the file's hash. With no
+                    # copy of its own, an identical copy from another host or
+                    # the shared corpus is enough (no redundant duplicates); a
+                    # stale copy of its own is always replaced.
+                    current = own if own else copies
+                    if not force and skill_hash and any(c.get("hash") == skill_hash for c in current):
                         stats["skipped"] += 1
                         continue
-                    meta_mid = f"skill:{effective_host}:{skill.name}:c0" if effective_host else f"skill:{skill.name}:c0"
-                    legacy_mid = f"skill:{skill.name}"
-                    if not force and (meta_mid in existing_map or legacy_mid in existing_map):
-                        ex_h = existing_map.get(meta_mid, {}).get("hash") or existing_map.get(legacy_mid, {}).get("hash")
-                        if ex_h and ex_h == skill_hash:
-                            stats["skipped"] += 1
-                            continue
-                    if copies:
+                    if own:
                         stats["updated"] += 1
                     else:
                         stats["indexed"] += 1
                     to_upsert.append(skill)
 
-                # Delete dead SQL leg 3: use (conv_ref = :1 OR memory_id = :2)
-                skills_to_delete = [
-                    s for s in to_upsert
-                    if (
-                        s.name in existing_by_name
-                        or s.name in existing_conv_refs
-                        or f"skill:{s.name}" in existing_map
-                        or f"skill:{s.name}:c0" in existing_map
-                        or (f"skill:{effective_host}:{s.name}:c0" if effective_host else "") in existing_map
-                    )
-                ]
-                if skills_to_delete and not dry_run:
-                    del_sql = f"DELETE /*+ NO_PARALLEL */ FROM {table} WHERE role = 'skill' AND (conv_ref = :1 OR memory_id = :2)"
-                    del_params = [
-                        (s.name, f"skill:{effective_host}:{s.name}:c0" if effective_host else f"skill:{s.name}:c0")
-                        for s in skills_to_delete
-                    ]
-                    for i in range(0, len(del_params), 500):
-                        chunk = del_params[i : i + 500]
-                        cur.executemany(del_sql, chunk)
-                    # FIX v1.1.0.1: commit the deletes BEFORE _insert_many() runs
-                    # the matching INSERTs on a second pool connection. The
-                    # provider's _insert_many acquires its own connection, and its
-                    # INSERT of the same memory_ids would wait on this
-                    # transaction's own uncommitted deletes (uniqueness check) —
-                    # a self-deadlock: this connection is parked inside the
-                    # _insert_many call and will never commit. Committing first
-                    # releases the row locks; the small delete/insert non-
-                    # atomicity window is self-healing (next sync reconciles
-                    # from the on-disk source of truth).
-                    conn.commit()
-
-                all_rows: list[dict[str, Any]] = []
+                use_provider_insert = hasattr(target_provider_or_conn, "_insert_many") and callable(
+                    getattr(target_provider_or_conn, "_insert_many")
+                )
+                del_sql = f"DELETE /*+ NO_PARALLEL */ FROM {table} WHERE {OWN_SKILL_ROWS_SQL}"
+                insert_sql = f"""
+                    INSERT INTO {table}
+                        (memory_id, session_id, agent_id, role, content,
+                         created_at, target, metadata, content_txt, conv_ref)
+                    VALUES (:1, :2, :3, :4, :5, SYSTIMESTAMP, :6, :7, :8, :9)
+                """
                 for skill in to_upsert:
-                    payloads = format_skill_payload(skill, mode=mode, host=effective_host)
-                    all_rows.extend(payloads)
+                    rows = format_skill_payload(skill, mode=mode, host=effective_host)
                     stats["upserted"] += 1
+                    if dry_run or not rows:
+                        continue
+                    # One transaction per skill on this connection: this host's
+                    # old rows go and the new ones arrive in the same commit.
+                    backfill: list[tuple[str, str]] = []
+                    try:
+                        cur.execute(del_sql, own_skill_rows_binds(effective_host, skill.name))
+                        if use_provider_insert:
+                            backfill = target_provider_or_conn._insert_many(rows, tx_conn=conn) or []
+                        else:
+                            binds = [
+                                (
+                                    r["memory_id"],
+                                    r.get("session_id", "skills"),
+                                    effective_host,
+                                    "skill",
+                                    r["content"],
+                                    "memory",
+                                    json.dumps(r["metadata"]),
+                                    (r["content"] or "")[:4000],
+                                    r.get("conv_ref"),
+                                )
+                                for r in rows
+                            ]
+                            for i in range(0, len(binds), max(1, batch_size)):
+                                cur.executemany(insert_sql, binds[i : i + max(1, batch_size)])
+                        conn.commit()
+                    except Exception as e:
+                        # This skill keeps its previous rows. Carry on with the
+                        # rest, but give up after 5 failures (likely a broken session).
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        stats["errors"].append(f"{skill.name}: {e}")
+                        stats["upserted"] -= 1
+                        if len(stats["errors"]) >= 5:
+                            raise
+                        continue
+                    except BaseException:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                    stats["total_rows_inserted"] += len(rows)
+                    queue = getattr(target_provider_or_conn, "_queue_embed_backfill", None)
+                    if callable(queue):
+                        for mid, cnt in backfill if isinstance(backfill, list) else []:
+                            queue(mid, cnt)
 
-                if not dry_run and all_rows:
-                    if hasattr(target_provider_or_conn, "_insert_many") and callable(getattr(target_provider_or_conn, "_insert_many")):
-                        for i in range(0, len(all_rows), batch_size):
-                            batch = all_rows[i : i + batch_size]
-                            target_provider_or_conn._insert_many(batch)
-                    else:
-                        insert_sql = f"""
-                            INSERT INTO {table}
-                                (memory_id, session_id, agent_id, role, content,
-                                 created_at, target, metadata, content_txt)
-                            VALUES (:1, :2, :3, :4, :5, SYSTIMESTAMP, :6, :7, :8)
-                        """
-                        binds = []
-                        for r in all_rows:
-                            meta_str = json.dumps(r["metadata"])
-                            txt_4k = (r["content"] or "")[:4000]
-                            binds.append((
-                                r["memory_id"],
-                                r.get("session_id", "skills"),
-                                effective_host,
-                                "skill",
-                                r["content"],
-                                "memory",
-                                meta_str,
-                                txt_4k,
-                            ))
-                        for i in range(0, len(binds), batch_size):
-                            chunk = binds[i : i + batch_size]
-                            cur.executemany(insert_sql, chunk)
-
-                stats["total_rows_inserted"] = len(all_rows) if not dry_run else 0
-
-                # Host-scoped zombie pruning
-                if prune_host:
+                # Host-scoped pruning: only this host's skills (own id prefix)
+                # whose SKILL.md sat under a pruned root and is no longer found.
+                if prune_roots:
                     alive = {s.name for s in skills}
+                    root_binds = {
+                        f"r{i}": like_escape(r.rstrip("/\\") + os.sep) + "%" for i, r in enumerate(prune_roots)
+                    }
+                    root_sql = " OR ".join(
+                        f"json_value(metadata, '$.path') LIKE :r{i} ESCAPE '\\'" for i in range(len(prune_roots))
+                    )
                     stale_sql = f"""
                         SELECT DISTINCT json_value(metadata, '$.skill_name')
                         FROM {table}
-                        WHERE role = 'skill' AND json_value(metadata, '$.path') LIKE :host_root || '%'
+                        WHERE role = 'skill' AND memory_id LIKE :own ESCAPE '\\' AND ({root_sql})
                     """
-                    cur.execute(stale_sql, {"host_root": effective_prune_root})
-                    stale_rows = cur.fetchall()
-                    stale = [r[0] for r in stale_rows if r and r[0] and r[0] not in alive]
-                    stale.sort()
-                    stale = stale[:prune_limit]
-
-                    prune_del_sql = f"""
-                        DELETE /*+ NO_PARALLEL */ FROM {table}
-                        WHERE role = 'skill'
-                          AND json_value(metadata, '$.skill_name') = :name
-                          AND json_value(metadata, '$.path') LIKE :host_root || '%'
-                    """
-                    for name in stale:
+                    cur.execute(stale_sql, {"own": like_escape(own_prefix) + "%", **root_binds})
+                    stale = sorted({r[0] for r in cur.fetchall() if r and r[0] and r[0] not in alive})
+                    stats["prune_candidates"] = len(stale)
+                    for name in stale[: max(0, prune_limit)]:
                         stats["pruned_skills"].append(name)
-                        if not dry_run:
-                            cur.execute(prune_del_sql, {"name": name, "host_root": effective_prune_root})
                         stats["pruned"] += 1
-
-                if not dry_run and (all_rows or stats["pruned"] > 0):
-                    conn.commit()
+                        if not dry_run:
+                            cur.execute(del_sql, own_skill_rows_binds(effective_host, name))
+                    if not dry_run and stats["pruned"]:
+                        conn.commit()
 
     except Exception as e:
         # Never return a pool connection with an uncommitted delete
@@ -1090,75 +1139,177 @@ def sync_skills_library(
             raise
         logger.warning("Dry run database interaction error: %s", e)
 
+    if stats["errors"] and stats["status"] == "success":
+        stats["status"] = "partial"
     return stats
 
 
-def migrate_host_tags(
+_LEGACY_ID_RE = re.compile(r"^skill:([^:]+)(?::c(\d+))?$")
+_HOSTED_ID_RE = re.compile(r"^skill:([^:]+):([^:]+):c\d+$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_NO_HOST = "json_value(metadata, '$.host') IS NULL"
+
+
+def list_local_skills(dirs: list[str | Path] | None = None) -> dict[str, Any]:
+    """This host's identity and live skills (name + SKILL.md path), as used by
+    migrate_host_identity(). No database access."""
+    return {
+        "host": get_host_id(),
+        "skills": [{"name": s.name, "path": str(s.path)} for s in discover_skills(dirs=dirs)],
+    }
+
+
+def migrate_host_identity(
     conn: Any,
     table: str,
-    host: str,
-    host_root: str,
-    dry_run: bool = False,
-) -> int:
-    """One-shot migration rewrites legacy untagged memory_ids to skill:{host}:{name}:cN.
+    listings: Sequence[dict[str, Any]],
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Give legacy (host-less) skill rows their owner's identity.
 
-    Only operates on rows whose metadata.path matches host_root. Idempotent.
-    """
-    if not host or not host_root:
-        logger.error("migrate_host_tags requires valid host and host_root")
-        return 0
+    *listings* are list_local_skills() outputs, one per host. A legacy skill is
+    relabelled only when one listing has a live SKILL.md with the same name AT
+    THE SAME PATH; its rows become skill:<host>:<name>:c<N> (a bare skill:<name>
+    becomes :c0) with conv_ref skill:<host>:<name> and metadata.host, and keep
+    metadata.legacy_id / legacy_conv_ref for reverse_host_identity(). Everything
+    else stays legacy: the shared corpus (archive rows, skills whose files are
+    gone) is never relabelled, so host-scoped pruning can never reach it. A
+    skill the host already stores under its own identity is reported as
+    superseded and left alone. One transaction; nothing is written on dry_run."""
+    owners: dict[tuple[str, str], set[str]] = {}
+    for listing in listings:
+        host = str(listing.get("host") or "")
+        if not _HOST_RE.match(host):
+            raise ValueError(f"invalid host in listing: {host!r}")
+        for s in listing.get("skills") or []:
+            owners.setdefault((str(s.get("name") or ""), str(s.get("path") or "")), set()).add(host)
 
-    count = 0
+    report: dict[str, Any] = {
+        "dry_run": dry_run,
+        "relabelled_skills": {},
+        "relabelled_rows": 0,
+        "superseded": [],
+        "ambiguous": [],
+        "skipped": [],
+        "legacy_skills_total": 0,
+        "left_shared_skills": 0,
+    }
     with conn.cursor() as cur:
         cur.execute(
-            f"""
-            SELECT memory_id, conv_ref, metadata
-            FROM {table}
-            WHERE role = 'skill'
-              AND json_value(metadata, '$.path') LIKE :host_root || '%'
-              AND (json_value(metadata, '$.host') IS NULL OR NOT regexp_like(memory_id, '^skill:[^:]+:[^:]+'))
-            """,
-            {"host_root": host_root},
+            f"""SELECT memory_id, conv_ref, json_value(metadata, '$.skill_name'), json_value(metadata, '$.path')
+                FROM {table} WHERE role = 'skill' AND {_NO_HOST}"""  # nosec B608
+        )
+        legacy: dict[tuple[str, str], list[tuple[str, Any]]] = {}
+        for mid, conv_ref, name, path in cur.fetchall():
+            legacy.setdefault((str(name or ""), str(path or "")), []).append((str(mid), conv_ref))
+        cur.execute(
+            f"SELECT memory_id FROM {table} WHERE role = 'skill' AND regexp_like(memory_id, '^skill:[^:]+:[^:]+:c[0-9]+$')"  # nosec B608
+        )
+        hosted = set()
+        for (mid,) in cur.fetchall():
+            m = _HOSTED_ID_RE.match(str(mid))
+            if m:
+                hosted.add((m.group(1), m.group(2)))
+
+        report["legacy_skills_total"] = len(legacy)
+        plan: list[dict[str, Any]] = []
+        for (name, path), rows in sorted(legacy.items()):
+            hosts = owners.get((name, path))
+            if not hosts:
+                continue
+            if len(hosts) > 1:
+                report["ambiguous"].append({"skill": name, "hosts": sorted(hosts)})
+                continue
+            host = next(iter(hosts))
+            if (host, name) in hosted:
+                report["superseded"].append({"skill": name, "host": host})
+                continue
+            new_ids = []
+            for mid, _ in rows:
+                m = _LEGACY_ID_RE.match(mid)
+                new_ids.append(f"skill:{host}:{name}:c{m.group(2) or 0}" if m and m.group(1) == name else None)
+            if None in new_ids or len(set(new_ids)) != len(new_ids):
+                report["skipped"].append({"skill": name, "reason": "unexpected or colliding ids"})
+                continue
+            for (mid, conv_ref), new_id in zip(rows, new_ids):
+                plan.append({
+                    "new_id": new_id,
+                    "new_ref": f"skill:{host}:{name}",
+                    "host": host,
+                    "old_id": mid,
+                    "old_ref": conv_ref,
+                })
+            report["relabelled_skills"].setdefault(host, []).append(name)
+            report["relabelled_rows"] += len(rows)
+        report["left_shared_skills"] = len(legacy) - sum(len(v) for v in report["relabelled_skills"].values())
+        report["relabelled_skill_counts"] = {h: len(v) for h, v in report["relabelled_skills"].items()}
+
+        if dry_run or not plan:
+            return report
+        sql = f"""
+            UPDATE {table}
+            SET memory_id = :new_id, conv_ref = :new_ref,
+                metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')),
+                                          SET '$.host' = :host,
+                                          SET '$.legacy_id' = :old_id,
+                                          SET '$.legacy_conv_ref' = :old_ref)
+            WHERE memory_id = :old_id AND role = 'skill' AND {_NO_HOST}
+        """  # nosec B608
+        try:
+            cur.executemany(sql, plan)
+            if (cur.rowcount or 0) != len(plan):
+                raise RuntimeError(f"migrate_host_identity: updated {cur.rowcount} rows, planned {len(plan)}; rolled back")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    logger.info("migrate_host_identity: relabelled %d rows", report["relabelled_rows"])
+    return report
+
+
+def reverse_host_identity(conn: Any, table: str, dry_run: bool = True) -> dict[str, Any]:
+    """Undo migrate_host_identity(): every row carrying metadata.legacy_id gets
+    its legacy id and conv_ref back and loses host/legacy_* metadata. Rows that
+    a later sync replaced no longer carry legacy_id and are not restored (keep
+    a table backup for that). One transaction; nothing is written on dry_run."""
+    report: dict[str, Any] = {"dry_run": dry_run, "restored_rows": 0, "collisions": []}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""SELECT memory_id, json_value(metadata, '$.legacy_id'), json_value(metadata, '$.legacy_conv_ref')
+                FROM {table}
+                WHERE role = 'skill'
+                  AND json_value(metadata, '$.legacy_id') IS NOT NULL"""  # nosec B608
         )
         rows = cur.fetchall()
-        for mid, conv_ref, meta in rows:
-            m = re.match(r"^skill:([^:]+)(?::c(\d+))?$", str(mid))
-            if not m:
-                continue
-            name = m.group(1)
-            c_idx = m.group(2)
-            if c_idx is not None:
-                new_mid = f"skill:{host}:{name}:c{c_idx}"
-            else:
-                new_mid = f"skill:{host}:{name}"
-            new_conv_ref = f"skill:{host}:{name}"
-
-            try:
-                meta_dict = json.loads(meta) if isinstance(meta, str) else dict(meta or {})
-            except Exception:
-                meta_dict = {}
-            meta_dict["host"] = host
-            new_meta_str = json.dumps(meta_dict)
-
-            if not dry_run:
-                cur.execute(
-                    f"""
-                    UPDATE {table}
-                    SET memory_id = :1,
-                        conv_ref = :2,
-                        metadata = :3,
-                        agent_id = :4
-                    WHERE memory_id = :5
-                    """,
-                    (new_mid, new_conv_ref, new_meta_str, host, mid),
-                )
-            count += 1
-
-        if not dry_run and count > 0:
+        plan = []
+        if rows:
+            cur.execute(
+                f"SELECT memory_id FROM {table} WHERE role = 'skill' AND regexp_like(memory_id, '^skill:[^:]+(:c[0-9]+)?$')"  # nosec B608
+            )
+            taken = {str(r[0]) for r in cur.fetchall()}
+            for mid, old_id, old_ref in rows:
+                if not old_id or old_id in taken:
+                    report["collisions"].append({"memory_id": mid, "legacy_id": old_id})
+                    continue
+                plan.append({"cur_id": mid, "old_id": old_id, "old_ref": old_ref})
+        report["restored_rows"] = len(plan)
+        if dry_run or not plan:
+            return report
+        sql = f"""
+            UPDATE {table}
+            SET memory_id = :old_id, conv_ref = :old_ref,
+                metadata = JSON_TRANSFORM(metadata, REMOVE '$.host', REMOVE '$.legacy_id', REMOVE '$.legacy_conv_ref')
+            WHERE memory_id = :cur_id AND role = 'skill'
+        """  # nosec B608
+        try:
+            cur.executemany(sql, plan)
+            if (cur.rowcount or 0) != len(plan):
+                raise RuntimeError(f"reverse_host_identity: updated {cur.rowcount} rows, planned {len(plan)}; rolled back")
             conn.commit()
-
-    logger.info("migrate_host_tags: migrated %d rows (dry_run=%s)", count, dry_run)
-    return count
+        except BaseException:
+            conn.rollback()
+            raise
+    return report
 
 
 def main() -> None:
@@ -1166,18 +1317,32 @@ def main() -> None:
     parser.add_argument("--mode", choices=["meta", "full"], default="meta", help="Ingestion mode: meta or full (default: meta)")
     parser.add_argument("--dirs", nargs="*", default=None, help="Custom directories to scan for skills")
     parser.add_argument("--force", action="store_true", help="Force re-indexing even if already up to date")
-    parser.add_argument("--dry-run", action="store_true", help="Discover and parse skills without modifying database")
+    parser.add_argument("--dry-run", action="store_true", help="Report what would change without modifying the database")
     parser.add_argument("--batch-size", type=int, default=50, help="Batch size for database inserts (default: 50)")
     parser.add_argument("--table", default=None, help="Oracle memory table name override")
-    parser.add_argument("--prune-host", default=None, help="Path prefix for host-scoped zombie skill pruning (default: auto-detect deepest common parent)")
+    parser.add_argument("--prune", action="store_true", help="Delete this host's skills that are no longer under the scanned roots")
+    parser.add_argument("--prune-host", default=None, help="Prune this host's skills whose SKILL.md path starts with this prefix")
     parser.add_argument("--prune-limit", type=int, default=500, help="Maximum number of stale skills to prune in one run (default: 500)")
-    parser.add_argument("--migrate-host-tags", action="store_true", help="One-shot migration rewrites legacy untagged memory_ids to host-tagged format")
+    parser.add_argument("--list-local", action="store_true", help="Print this host's id and live skills as JSON (no database)")
+    parser.add_argument("--migrate-host-identity", action="store_true",
+                        help="Relabel legacy (host-less) skill rows whose SKILL.md is live on a host; see --listing")
+    parser.add_argument("--listing", action="append", default=[],
+                        help="--list-local output file of a host (repeatable; default: this host)")
+    parser.add_argument("--reverse-host-identity", action="store_true", help="Undo --migrate-host-identity")
+    parser.add_argument("--env-file", default=None,
+                        help="Load KEY=VALUE settings (OCI_DB_*) from this file; by default only the environment is read")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    if args.dry_run and not args.migrate_host_tags:
+    if args.list_local:
+        print(json.dumps(list_local_skills(dirs=args.dirs), indent=2))
+        return
+    if args.env_file:
+        load_env_file(Path(args.env_file))
+
+    if args.dry_run and not (args.migrate_host_identity or args.reverse_host_identity):
         skills = discover_skills(dirs=args.dirs)
         print(f"Dry run: discovered {len(skills)} skills:")
         for s in skills:
@@ -1193,33 +1358,41 @@ def main() -> None:
         provider._table = args.table
     provider.initialize("skill-sync")
     if not provider.is_available():
-        if args.dry_run:
+        if args.dry_run and not (args.migrate_host_identity or args.reverse_host_identity):
             sys.exit(0)
         print(f"Error: Oracle memory provider unavailable: {provider.unavailable_reason()}", file=sys.stderr)
         sys.exit(1)
 
-    host_id = get_host_id()
-    if args.migrate_host_tags:
-        host_root = args.prune_host or compute_host_root()
-        table_name = args.table or provider._table
-        with provider._pool.acquire() as conn:
-            cnt = migrate_host_tags(conn, table_name, host_id, host_root, dry_run=args.dry_run)
-        print(f"Migration complete: {cnt} rows updated (dry_run={args.dry_run})")
-        sys.exit(0)
+    try:
+        if args.migrate_host_identity or args.reverse_host_identity:
+            table_name = args.table or provider._table
+            with provider._pool.acquire() as conn:
+                conn.call_timeout = _ingest_timeout_ms()
+                if args.reverse_host_identity:
+                    rep = reverse_host_identity(conn, table_name, dry_run=args.dry_run)
+                else:
+                    listings = [json.loads(Path(f).read_text(encoding="utf-8")) for f in args.listing] \
+                        or [list_local_skills(dirs=args.dirs)]
+                    rep = migrate_host_identity(conn, table_name, listings, dry_run=args.dry_run)
+            print(json.dumps(rep, indent=2))
+            return
 
-    res = sync_skills_library(
-        provider=provider,
-        mode=args.mode,
-        force=args.force,
-        dirs=args.dirs,
-        dry_run=args.dry_run,
-        batch_size=args.batch_size,
-        prune_host=args.prune_host,
-        prune_limit=args.prune_limit,
-        host_tag=host_id,
-    )
-    print("Sync complete:")
-    print(json.dumps(res, indent=2))
+        res = sync_skills_library(
+            provider=provider,
+            mode=args.mode,
+            force=args.force,
+            dirs=args.dirs,
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+            prune=args.prune,
+            prune_host=args.prune_host,
+            prune_limit=args.prune_limit,
+            host_tag=get_host_id(),
+        )
+        print("Sync complete:")
+        print(json.dumps(res, indent=2))
+    finally:
+        provider.shutdown()
 
 
 if __name__ == "__main__":

@@ -23,18 +23,12 @@ class TestLoadSkillList(unittest.TestCase):
 
     def test_list_pagination_and_more(self):
         """Verify pagination offset, page size limit, and 'more' flag calculation."""
-        # Return 501 rows to indicate more is True
-        names_page = [(f"skill-{i:03d}", "cat") for i in range(501)]
-        desc_rows = [(f"skill-{i:03d}", f"[skill_ingest] [skill:skill-{i:03d}] skill-{i:03d} — Description {i}\nWhen to use: always") for i in range(500)]
-
-        # Mock execute side effects: first call returns names, follow-up calls return descriptions
-        def mock_fetchall():
-            call_sql = self.mock_cursor.execute.call_args[0][0]
-            if "DISTINCT" in call_sql:
-                return names_page
-            return desc_rows
-
-        self.mock_cursor.fetchall.side_effect = mock_fetchall
+        # 501 rows (one per distinct name) -> more is True
+        rows = [
+            (f"skill-{i:03d}", "cat", f"[skill_ingest] [skill:skill-{i:03d}] skill-{i:03d} — Description {i}\nWhen to use: always", 1)
+            for i in range(501)
+        ]
+        self.mock_cursor.fetchall.return_value = rows
 
         raw_res = self.provider.handle_tool_call("oracle_load_skill", {"action": "list", "offset": 100})
         res = json.loads(raw_res)
@@ -45,6 +39,21 @@ class TestLoadSkillList(unittest.TestCase):
         self.assertEqual(len(res["skills"]), 500)
         self.assertEqual(res["skills"][0]["name"], "skill-000")
         self.assertEqual(res["skills"][0]["description"], "Description 0")
+        sql, binds = self.mock_cursor.execute.call_args[0][0], self.mock_cursor.execute.call_args[0][1]
+        self.assertEqual(binds["o"], 100)
+        self.assertEqual(binds["limit"], 501)
+        # Paging is over distinct names (one row per name), so pages never repeat a name.
+        self.assertIn("PARTITION BY json_value(metadata, '$.skill_name')", sql)
+        self.assertIn("WHERE rn = 1", sql)
+
+    def test_list_reports_copies(self):
+        self.mock_cursor.fetchall.return_value = [
+            ("dup", "cat", "[skill_ingest] [skill:dup] dup — Two copies", 2),
+            ("one", "cat", "[skill_ingest] [skill:one] one — One copy", 1),
+        ]
+        res = json.loads(self.provider.handle_tool_call("oracle_load_skill", {"action": "list"}))
+        self.assertEqual(res["skills"][0]["copies"], 2)
+        self.assertNotIn("copies", res["skills"][1])
 
     def test_description_regex_extraction(self):
         """Verify extraction of description after em-dash/hyphen, excluding 'When to use:'."""

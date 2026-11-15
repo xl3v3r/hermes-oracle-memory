@@ -953,7 +953,12 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "oracle_sync_skills",
-        "description": "Scan and index all local skills (~/.agents/skills and ~/.hermes/skills) into Oracle 26ai vector memory for semantic search and discovery.",
+        "description": (
+            "Scan and index this host's skills (the active profile's skills dir and ~/.agents/skills) into "
+            "Oracle 26ai vector memory. Rows are stored under this host's identity; each changed skill is "
+            "replaced in one transaction. prune=true also removes this host's skills that are no longer on "
+            "disk (never other hosts' copies or the shared corpus); use dry_run=true to preview."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -974,6 +979,18 @@ TOOL_SCHEMAS = [
                 "batch_size": {
                     "type": "integer",
                     "description": "Batch size for inserting rows into Oracle (default 50).",
+                },
+                "prune": {
+                    "type": "boolean",
+                    "description": "Also delete this host's skills that are no longer under the scanned dirs. Default false.",
+                },
+                "prune_limit": {
+                    "type": "integer",
+                    "description": "Maximum skills to prune in one call (1-500, default 100).",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Report what would be indexed/pruned without writing. Default false.",
                 },
             },
         },
@@ -998,6 +1015,10 @@ TOOL_SCHEMAS = [
                 "variant": {
                     "type": "integer",
                     "description": "action=fetch only: variant number from the variants list, when the skill exists in several copies.",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "action=fetch only: host of one copy (from the variants list), with or instead of 'path'.",
                 },
                 "filter": {"type": "string", "description": "action=list only: substring match on name/description."},
                 "offset": {"type": "integer", "description": "action=list only: pagination offset (default 0)."},
@@ -1063,14 +1084,21 @@ def _extract_skill_description(content: str, skill_name: str = "") -> str:
 
 
 def get_host_id() -> str:
-    """Return local host identifier for skill tagging and pruning."""
-    host_id = os.environ.get("HERMES_HOST_ID") or os.environ.get("HOSTNAME") or ""
+    """This host's identity in skill-corpus ids (skill:<host>:<name>:c<N>).
+    HERMES_HOST_ID when set; otherwise the short host name, lower-cased (a
+    shell's HOSTNAME may be the FQDN while a systemd service sees none, and
+    both must give the same id). Keep identical to scripts/sync_skills.py."""
+    host_id = (os.environ.get("HERMES_HOST_ID") or "").strip()
     if not host_id:
-        try:
-            import socket
-            host_id = socket.gethostname().split(".")[0]
-        except Exception:
-            host_id = "hermes"
+        host_id = (os.environ.get("HOSTNAME") or "").strip()
+        if not host_id:
+            try:
+                import socket
+
+                host_id = socket.gethostname()
+            except Exception:
+                host_id = ""
+        host_id = host_id.split(".")[0].lower()
     return re.sub(r"[^a-zA-Z0-9._-]", "", host_id) or "hermes"
 
 _PROMPT_BODY = (
@@ -1210,6 +1238,8 @@ class OracleMemoryProvider(MemoryProvider):
         self._last_restart_seen: float | None = None
         self._bg_drop_warned = False
         self._in_flight_lifecycle_skills: set[str] = set()
+        # Latest event that arrived while a skill's writer was busy (#6).
+        self._lifecycle_pending: dict[str, tuple[str, list[Path]]] = {}
         self._lifecycle_lock = threading.Lock()
         self._sync_threads: list[threading.Thread] = []
         self._sync_threads_lock = threading.Lock()
@@ -2080,12 +2110,6 @@ class OracleMemoryProvider(MemoryProvider):
         pool = self._pool
         if pool is None or not self._onnx_model:
             return 0
-        import oracledb
-
-        def _lob_as_str(cursor, metadata):
-            if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
-
         sql = f"""
             SELECT memory_id, content FROM {self._table}
             WHERE embedding IS NULL AND content IS NOT NULL
@@ -2098,8 +2122,8 @@ class OracleMemoryProvider(MemoryProvider):
             except Exception:
                 pass
             with conn.cursor() as cur:
-                cur.outputtypehandler = _lob_as_str
-                cur.execute(sql, {"n": int(limit)})
+                cur.arraysize = max(1, min(int(limit), 1000))
+                _execute_lobs_as_str(cur, sql, {"n": int(limit)})
                 rows = cur.fetchall() or []
         queued = 0
         for row in rows:
@@ -3942,172 +3966,153 @@ class OracleMemoryProvider(MemoryProvider):
                 logger.debug("oracle on_skill_lifecycle usage log failed: %s", exc)
             return
 
-        # Content actions: created, edited, patched, installed, restored
-        if action in ("created", "edited", "patched", "installed", "restored"):
+        # Content actions ingest the skill; "archived" retires this host's copy.
+        # The caller (the skill tool) only schedules: file lookup, parsing, the
+        # hash check and the write all run on the per-skill writer thread (#6).
+        if action in ("created", "edited", "patched", "installed", "restored", "archived"):
+            if not isinstance(skill_name, str) or not skill_name:
+                return
             try:
-                skill_file: Path | None = None
-                for root_candidate in (
-                    Path.home() / ".hermes" / "skills",
-                    Path.home() / ".agents" / "skills",
-                    Path.home() / "skills",
-                ):
-                    if root_candidate.exists():
-                        candidate = root_candidate / skill_name / "SKILL.md"
-                        if candidate.is_file():
-                            skill_file = candidate
-                            break
-                        for sub in _skill_md_matches(root_candidate, skill_name):
-                            if sub.is_file():
-                                skill_file = sub
-                                break
-                    if skill_file:
-                        break
-
-                if not skill_file or not skill_file.is_file():
-                    logger.debug("on_skill_lifecycle: local SKILL.md not found for '%s'; skipping live ingest", skill_name)
-                    return
-
-                _sync = _sync_skills_module()
-                parse_skill_file, format_skill_payload = _sync.parse_skill_file, _sync.format_skill_payload
-
-                skill_info = parse_skill_file(skill_file)
-                if not skill_info:
-                    return
-
-                # In-flight deduplication
-                with self._lifecycle_lock:
-                    if skill_name in self._in_flight_lifecycle_skills:
-                        return
-                    self._in_flight_lifecycle_skills.add(skill_name)
-
-                # Check idempotency: skip if stored c0 hash matches local file
-                host_id = get_host_id()
-                c0_id = f"skill:{host_id}:{skill_name}:c0"
-                if self._pool:
-                    try:
-                        with self._pool.acquire() as conn:
-                            with conn.cursor() as cur:
-                                chk_sql = f"""
-                                    SELECT json_value(metadata, '$.hash')
-                                    FROM {self._table}
-                                    WHERE role = 'skill' AND (memory_id = :1 OR memory_id = :2)
-                                """
-                                cur.execute(chk_sql, (c0_id, f"skill:{skill_name}:c0"))
-                                row = cur.fetchone()
-                                current_hash = getattr(skill_info, "hash", None) or getattr(skill_info, "content_hash", "")
-                                if row and row[0] == current_hash:
-                                    logger.debug("on_skill_lifecycle: skill '%s' hash unchanged (%s); skipping", skill_name, current_hash)
-                                    with self._lifecycle_lock:
-                                        self._in_flight_lifecycle_skills.discard(skill_name)
-                                    return
-                    except Exception as chk_e:
-                        logger.debug("on_skill_lifecycle hash check error: %s", chk_e)
-
-                def do_lifecycle_upsert():
-                    try:
-                        payload_rows = format_skill_payload(skill_info, mode="full", host=host_id)
-                        if not payload_rows:
-                            return
-                        if self._pool is None:
-                            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", skill_name)
-                            return
-
-                        conv_ref = f"skill:{host_id}:{skill_name}"
-                        # DELETE + INSERT commit together. If the insert fails
-                        # (ONNX cooldown, timeout, forced pool close at shutdown)
-                        # the transaction rolls back and the previous rows stay,
-                        # instead of the skill vanishing from every host. The
-                        # checked acquire reads the pool once and drops a session
-                        # broken by a timeout instead of returning it.
-                        with self._acquire_checked() as conn:
-                            try:
-                                with conn.cursor() as cur:
-                                    del_sql = f"DELETE FROM {self._table} WHERE role = 'skill' AND (conv_ref = :1 OR memory_id = :2)"
-                                    cur.execute(del_sql, (conv_ref, c0_id))
-                                backfill = self._insert_many(payload_rows, tx_conn=conn)
-                                conn.commit()
-                            except BaseException:
-                                try:
-                                    conn.rollback()
-                                except Exception as rb_e:
-                                    logger.debug("on_skill_lifecycle rollback failed: %s", rb_e)
-                                raise
-                        for mid, cnt in backfill or []:
-                            self._queue_embed_backfill(mid, cnt)
-                        logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", skill_name, len(payload_rows))
-                    except Exception as up_e:
-                        logger.warning("on_skill_lifecycle: background upsert failed for '%s': %s", skill_name, up_e)
-                    finally:
-                        with self._lifecycle_lock:
-                            self._in_flight_lifecycle_skills.discard(skill_name)
-
-                thread = threading.Thread(target=do_lifecycle_upsert, daemon=True, name=f"oracle-lifecycle-{skill_name}")
-                if not self._start_sync_thread(thread):
-                    logger.info("on_skill_lifecycle: provider shutting down; not ingesting '%s'", skill_name)
-                    with self._lifecycle_lock:
-                        self._in_flight_lifecycle_skills.discard(skill_name)
+                # Resolved here: the Hermes home can be a context-local
+                # (per-profile) override that a new thread does not inherit.
+                roots = list(_sync_skills_module().default_skill_roots())
             except Exception as e:
-                logger.debug("on_skill_lifecycle ingest error: %s", e)
-                with self._lifecycle_lock:
+                logger.debug("on_skill_lifecycle: cannot resolve skill roots: %s", e)
+                return
+            self._schedule_skill_lifecycle(skill_name, "archive" if action == "archived" else "ingest", roots)
+            return
+
+    def _schedule_skill_lifecycle(self, skill_name: str, op: str, roots: list[Path]) -> None:
+        """Run *op* for *skill_name* on a writer thread, one writer per skill.
+        An event for a skill whose writer is still busy is coalesced, not
+        dropped: the writer runs once more with the latest event afterwards."""
+        with self._lifecycle_lock:
+            if skill_name in self._in_flight_lifecycle_skills:
+                self._lifecycle_pending[skill_name] = (op, roots)
+                return
+            self._in_flight_lifecycle_skills.add(skill_name)
+        thread = threading.Thread(
+            target=self._run_skill_lifecycle,
+            args=(skill_name, op, roots),
+            daemon=True,
+            name=f"oracle-lifecycle-{skill_name}",
+        )
+        started = False
+        try:
+            started = self._start_sync_thread(thread)
+        except Exception as e:
+            logger.debug("on_skill_lifecycle: cannot start writer for '%s': %s", skill_name, e)
+        if not started:
+            logger.info("on_skill_lifecycle: provider shutting down; not processing '%s'", skill_name)
+            with self._lifecycle_lock:
+                self._in_flight_lifecycle_skills.discard(skill_name)
+                self._lifecycle_pending.pop(skill_name, None)
+
+    def _run_skill_lifecycle(self, skill_name: str, op: str, roots: list[Path]) -> None:
+        while True:
+            try:
+                if op == "archive":
+                    self._skill_archive_once(skill_name, roots)
+                else:
+                    self._skill_ingest_once(skill_name, roots)
+            except Exception as e:
+                logger.warning("on_skill_lifecycle: %s of '%s' failed: %s", op, skill_name, e)
+            with self._lifecycle_lock:
+                nxt = self._lifecycle_pending.pop(skill_name, None)
+                if nxt is None or self._write_stop.is_set():
                     self._in_flight_lifecycle_skills.discard(skill_name)
-            return
+                    return
+            op, roots = nxt
 
-        # Removal action: archived (retire from shared corpus only if local file is gone)
-        if action == "archived":
+    @staticmethod
+    def _find_skill_file(roots: list[Path], skill_name: str) -> Path | None:
+        for root in roots:
+            if not root.is_dir():
+                continue
+            candidate = root / skill_name / "SKILL.md"
+            if candidate.is_file():
+                return candidate
+            for sub in _skill_md_matches(root, skill_name):
+                if sub.is_file():
+                    return sub
+        return None
+
+    def _skill_ingest_once(self, skill_name: str, roots: list[Path]) -> None:
+        """Replace this host's copy of one skill (full mode) in one transaction;
+        skip the write when the stored hash already matches the file."""
+        skill_file = self._find_skill_file(roots, skill_name)
+        if skill_file is None:
+            logger.debug("on_skill_lifecycle: local SKILL.md not found for '%s'; skipping live ingest", skill_name)
+            return
+        _sync = _sync_skills_module()
+        skill_info = _sync.parse_skill_file(skill_file)
+        if not skill_info:
+            return
+        host_id = get_host_id()
+        payload_rows = _sync.format_skill_payload(skill_info, mode="full", host=host_id)
+        if not payload_rows:
+            return
+        current_hash = getattr(skill_info, "hash", None) or getattr(skill_info, "content_hash", "")
+        own_binds = _sync.own_skill_rows_binds(host_id, skill_name)
+        if self._pool is None:
+            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", skill_name)
+            return
+        # Hash check, DELETE of this host's rows and INSERT share one
+        # transaction: a failed insert rolls back and the previous rows stay.
+        # The checked acquire reads the pool once and drops a broken session.
+        with self._acquire_checked() as conn:
             try:
-                found = False
-                for root_candidate in (
-                    Path.home() / ".hermes" / "skills",
-                    Path.home() / ".agents" / "skills",
-                    Path.home() / "skills",
-                ):
-                    if root_candidate.exists():
-                        target_file = root_candidate / skill_name / "SKILL.md"
-                        if target_file.exists():
-                            found = True
-                            break
-                        for sub in _skill_md_matches(root_candidate, skill_name):
-                            if sub.exists():
-                                found = True
-                                break
-                    if found:
-                        break
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT json_value(metadata, '$.hash') FROM {self._table} "
+                        "WHERE memory_id = :1 AND role = 'skill'",
+                        (f"skill:{host_id}:{skill_name}:c0",),
+                    )
+                    row = cur.fetchone()
+                    if current_hash and row and row[0] == current_hash:
+                        logger.debug("on_skill_lifecycle: skill '%s' hash unchanged (%s); skipping", skill_name, current_hash)
+                        return
+                    cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)
+                backfill = self._insert_many(payload_rows, tx_conn=conn)
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception as rb_e:
+                    logger.debug("on_skill_lifecycle rollback failed: %s", rb_e)
+                raise
+        for mid, cnt in backfill or []:
+            self._queue_embed_backfill(mid, cnt)
+        logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", skill_name, len(payload_rows))
 
-                if not found:
-                    def do_archive_delete():
-                        pool = self._pool  # read once (see do_lifecycle_upsert)
-                        if pool is None:
-                            return
-                        host_id = get_host_id()
-                        compute_host_root = _sync_skills_module().compute_host_root
-                        host_root = compute_host_root()
-                        with pool.acquire() as conn:
-                            with conn.cursor() as cur:
-                                del_sql = f"""
-                                    DELETE FROM {self._table}
-                                    WHERE role = 'skill'
-                                      AND json_value(metadata, '$.skill_name') = :s
-                                      AND (
-                                          json_value(metadata, '$.host') = :h
-                                          OR (
-                                              json_value(metadata, '$.host') IS NULL
-                                              AND json_value(metadata, '$.path') LIKE :root || '%'
-                                          )
-                                      )
-                                """
-                                cur.execute(del_sql, {"s": skill_name, "h": host_id, "root": host_root})
-                            conn.commit()
-                        logger.info("on_skill_lifecycle: archived and pruned skill '%s' for host '%s'", skill_name, host_id)
-
-                    thread = threading.Thread(target=do_archive_delete, daemon=True, name="oracle-lifecycle-archive")
-                    if not self._start_sync_thread(thread):
-                        logger.info("on_skill_lifecycle: provider shutting down; not pruning '%s'", skill_name)
-            except Exception as e:
-                logger.debug("on_skill_lifecycle archive error: %s", e)
+    def _skill_archive_once(self, skill_name: str, roots: list[Path]) -> None:
+        """Delete this host's copy of an archived skill, unless a SKILL.md for
+        it is still live under the roots. Other hosts' copies and the host-less
+        shared corpus are never touched."""
+        if self._find_skill_file(roots, skill_name) is not None:
             return
+        _sync = _sync_skills_module()
+        host_id = get_host_id()
+        own_binds = _sync.own_skill_rows_binds(host_id, skill_name)
+        if self._pool is None:
+            return
+        with self._acquire_checked() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)
+                    deleted = cur.rowcount or 0
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        logger.info("on_skill_lifecycle: archived skill '%s': removed %d rows of host '%s'", skill_name, deleted, host_id)
 
-    def _load_skill_fetch(self, skill_name: str, path: str = "", variant: int | None = None) -> str:
-        """Load and reconstruct a skill document from its constituent chunks in the shared corpus."""
+    def _load_skill_fetch(self, skill_name: str, path: str = "", variant: int | None = None, host: str = "") -> str:
+        """Load and reconstruct a skill document from its constituent chunks in the shared corpus.
+        Copies are keyed by (host, path); the DB fetch is bounded per copy."""
         skill_name = (skill_name or "").strip()
         if not skill_name or not re.match(r"^[A-Za-z0-9._-]+$", skill_name):
             return tool_error(f"Invalid skill name '{skill_name}'. Skill name must match ^[A-Za-z0-9._-]+$")
@@ -4116,23 +4121,29 @@ class OracleMemoryProvider(MemoryProvider):
             return tool_error(f"Oracle memory not initialized: {self._init_error or self.unavailable_reason()}")
 
         try:
-            import oracledb
-
-            def fetch_lobs_as_strings(cursor, metadata):
-                if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                    return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
-
+            # At most _SKILL_FETCH_MAX_CHUNKS + 2 rows per copy (c0, the cap and
+            # one more to detect truncation). CLOBs arrive as str in the same
+            # round trip (_execute_lobs_as_str).
             sql = f"""
-                SELECT to_number(regexp_substr(memory_id, '[0-9]+$', 1, 1)) idx,
-                       content,
-                       json_value(metadata, '$.reference_file') ref,
-                       json_value(metadata, '$.total_chunks') total,
-                       metadata,
-                       memory_id
-                FROM {self._table}
-                WHERE role = 'skill' AND json_value(metadata, '$.skill_name') = :s
+                SELECT idx, content, ref, total, metadata, memory_id
+                FROM (
+                    SELECT to_number(regexp_substr(memory_id, '[0-9]+$', 1, 1)) idx,
+                           content,
+                           json_value(metadata, '$.reference_file') ref,
+                           json_value(metadata, '$.total_chunks') total,
+                           metadata,
+                           memory_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY json_value(metadata, '$.host'), json_value(metadata, '$.path')
+                               ORDER BY to_number(regexp_substr(memory_id, '[0-9]+$', 1, 1)) NULLS FIRST, memory_id
+                           ) rn
+                    FROM {self._table}
+                    WHERE role = 'skill' AND json_value(metadata, '$.skill_name') = :s
+                )
+                WHERE rn <= :cap
                 ORDER BY idx NULLS FIRST
             """
+            fetch_cap = max(1, _SKILL_FETCH_MAX_CHUNKS) + 2
 
             def _fetch_skill_rows(conn):
                 try:
@@ -4140,8 +4151,9 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
                 with conn.cursor() as cur:
-                    cur.outputtypehandler = fetch_lobs_as_strings
-                    cur.execute(sql, {"s": skill_name})
+                    cur.arraysize = min(fetch_cap * 2, 1000)
+                    cur.prefetchrows = cur.arraysize + 1
+                    _execute_lobs_as_str(cur, sql, {"s": skill_name, "cap": fetch_cap})
                     return cur.fetchall()
 
             try:
@@ -4160,23 +4172,26 @@ class OracleMemoryProvider(MemoryProvider):
             if not rows:
                 return tool_error(f"skill '{skill_name}' not in corpus — use action=list to search")
 
-            variants_map: dict[str, dict[str, Any]] = {}
+            variants_map: dict[tuple[str, str], dict[str, Any]] = {}
             parsed_rows = []
             for r in rows:
                 idx, content, ref, total, md_raw, mid = r[0], r[1], r[2], r[3], r[4], r[5]
                 if not re.search(r":c\d+$", str(mid or "")):
                     idx = None
-                md: dict[str, Any] = {}
-                if md_raw:
-                    md = json.loads(md_raw) if isinstance(md_raw, str) else dict(md_raw)
+                md = _metadata_dict(md_raw)
                 p = md.get("path") or ""
-                if p and p not in variants_map:
-                    variants_map[p] = {
+                h = md.get("host") or ""
+                if p and (h, p) not in variants_map:
+                    variants_map[(h, p)] = {
                         "path": p,
                         "hash": md.get("hash") or "",
                         "mtime": md.get("mtime") or "",
-                        "host": md.get("host") or "",
+                        "host": h,
                     }
+                if isinstance(content, (bytes, bytearray)):
+                    content = content.decode("utf-8", "replace")
+                elif content is not None and not isinstance(content, str):
+                    content = _lob_text(content)
                 parsed_rows.append({
                     "idx": idx,
                     "content": content or "",
@@ -4186,31 +4201,46 @@ class OracleMemoryProvider(MemoryProvider):
                     "memory_id": mid,
                 })
 
-            unique_variants = list(variants_map.values())
+            # Variants in a stable order: (host, path); legacy (host-less) first.
+            unique_variants = [variants_map[k] for k in sorted(variants_map)]
             if len(unique_variants) > 1:
-                selected_path = None
-                if path:
-                    matching = [v["path"] for v in unique_variants if v["path"] == path]
+                selected: dict[str, Any] | None = None
+                if path or host:
+                    matching = [
+                        v for v in unique_variants
+                        if (not path or v["path"] == path) and (not host or v["host"] == host)
+                    ]
                     if not matching:
-                        avail = ", ".join(v["path"] for v in unique_variants)
-                        return tool_error(f"Specified path '{path}' does not match any variant for skill '{skill_name}'. Available paths: {avail}")
-                    selected_path = path
+                        avail = ", ".join(f"{v['host'] or '(shared)'}:{v['path']}" for v in unique_variants)
+                        return tool_error(
+                            f"No variant of skill '{skill_name}' matches path='{path}' host='{host}'. Available: {avail}"
+                        )
+                    if len(matching) > 1:
+                        return tool_error(
+                            f"path '{path}' matches {len(matching)} copies of skill '{skill_name}' on different hosts; "
+                            "pass 'host' or 'variant' as well"
+                        )
+                    selected = matching[0]
                 elif variant is not None:
                     if not (0 <= variant < len(unique_variants)):
                         return tool_error(f"Variant index {variant} out of range (0-{len(unique_variants)-1}) for skill '{skill_name}'")
-                    selected_path = unique_variants[variant]["path"]
+                    selected = unique_variants[variant]
                 else:
                     return json.dumps({
                         "status": "multiple_variants",
                         "skill": skill_name,
                         "variants": [
-                            {"variant": i, "path": v["path"], "hash": v["hash"], "mtime": v["mtime"]}
+                            {"variant": i, "host": v["host"], "path": v["path"], "hash": v["hash"], "mtime": v["mtime"]}
                             for i, v in enumerate(unique_variants)
                         ],
-                        "message": f"Multiple variants exist for skill '{skill_name}'. Please specify 'path' or 'variant' to select one.",
-                    })
-                if selected_path:
-                    parsed_rows = [r for r in parsed_rows if r["metadata"].get("path") == selected_path]
+                        "message": f"Multiple variants exist for skill '{skill_name}'. Please specify 'variant' (or 'path' and 'host') to select one.",
+                    }, default=_json_default)
+                if selected is not None:
+                    parsed_rows = [
+                        r for r in parsed_rows
+                        if r["metadata"].get("path") == selected["path"]
+                        and (r["metadata"].get("host") or "") == selected["host"]
+                    ]
 
             meta_row = None
             body_chunks: list[tuple[int, str]] = []
@@ -4299,11 +4329,36 @@ class OracleMemoryProvider(MemoryProvider):
         page_size = 500
 
         try:
-            import oracledb
-
-            def fetch_lobs_as_strings(cursor, metadata):
-                if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                    return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+            # One row per skill name (paging is over distinct names, so a page
+            # is never short and never repeats a name), with the description
+            # from one meta row and the number of stored copies.
+            filt = (filter_str or "").strip()
+            where_filter = ""
+            binds: dict[str, Any] = {"o": offset, "limit": page_size + 1}
+            if filt:
+                where_filter = (
+                    "AND (UPPER(json_value(metadata, '$.skill_name')) LIKE UPPER(:f) "
+                    "OR UPPER(content) LIKE UPPER(:f))"
+                )
+                binds["f"] = f"%{filt}%"
+            sql = f"""
+                SELECT name, category, content, copies
+                FROM (
+                    SELECT json_value(metadata, '$.skill_name') AS name,
+                           json_value(metadata, '$.category') AS category,
+                           content,
+                           COUNT(*) OVER (PARTITION BY json_value(metadata, '$.skill_name')) AS copies,
+                           ROW_NUMBER() OVER (PARTITION BY json_value(metadata, '$.skill_name') ORDER BY memory_id) AS rn
+                    FROM {self._table}
+                    WHERE role = 'skill'
+                      AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
+                      AND json_value(metadata, '$.skill_name') IS NOT NULL
+                      {where_filter}
+                )
+                WHERE rn = 1
+                ORDER BY name
+                OFFSET :o ROWS FETCH FIRST :limit ROWS ONLY
+            """
 
             def _run_list(conn):
                 try:
@@ -4311,108 +4366,31 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
                 with conn.cursor() as cur:
-                    cur.outputtypehandler = fetch_lobs_as_strings
-
-                    if filter_str and filter_str.strip():
-                        filt = f"%{filter_str.strip()}%"
-                        sql = f"""
-                            SELECT json_value(metadata, '$.skill_name') as name,
-                                   json_value(metadata, '$.category') as category,
-                                   content
-                            FROM {self._table}
-                            WHERE role = 'skill'
-                              AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
-                              AND (UPPER(json_value(metadata, '$.skill_name')) LIKE UPPER(:f)
-                                   OR UPPER(content) LIKE UPPER(:f))
-                            ORDER BY name
-                            OFFSET :o ROWS FETCH FIRST :limit ROWS ONLY
-                        """
-                        cur.execute(sql, {"f": filt, "o": offset, "limit": page_size + 1})
-                        rows = cur.fetchall()
-                        more = len(rows) > page_size
-                        page_rows = rows[:page_size]
-
-                        skills_out = []
-                        seen_names = set()
-                        for row in page_rows:
-                            sname, scat, scontent = row[0], row[1] or "general", row[2] or ""
-                            if sname in seen_names:
-                                continue
-                            seen_names.add(sname)
-                            desc = _extract_skill_description(scontent, sname)
-                            skills_out.append({
-                                "name": sname,
-                                "category": scat,
-                                "description": desc,
-                            })
-
-                        return json.dumps({
-                            "count_in_page": len(skills_out),
-                            "offset": offset,
-                            "more": more,
-                            "skills": skills_out,
-                        })
-
-                    # No filter: fast distinct name and category fetch
-                    sql = f"""
-                        SELECT DISTINCT
-                               json_value(metadata, '$.skill_name') as name,
-                               json_value(metadata, '$.category') as category
-                        FROM {self._table}
-                        WHERE role = 'skill' AND json_value(metadata, '$.skill_name') IS NOT NULL
-                        ORDER BY name
-                        OFFSET :o ROWS FETCH FIRST :limit ROWS ONLY
-                    """
-                    cur.execute(sql, {"o": offset, "limit": page_size + 1})
+                    cur.arraysize = page_size + 1
+                    cur.prefetchrows = page_size + 2
+                    _execute_lobs_as_str(cur, sql, binds)
                     rows = cur.fetchall()
-                    more = len(rows) > page_size
-                    page_rows = rows[:page_size]
-
-                    if not page_rows:
-                        return json.dumps({
-                            "count_in_page": 0,
-                            "offset": offset,
-                            "more": False,
-                            "skills": [],
-                        })
-
-                    # Follow-up: retrieve descriptions for this page's skills
-                    page_names = [r[0] for r in page_rows if r[0]]
-                    desc_map: dict[str, str] = {}
-                    if page_names:
-                        for chunk_start in range(0, len(page_names), 500):
-                            name_chunk = page_names[chunk_start : chunk_start + 500]
-                            binds = {f"n{i}": name for i, name in enumerate(name_chunk)}
-                            in_clause = ", ".join(f":n{i}" for i in range(len(name_chunk)))
-                            desc_sql = f"""
-                                SELECT json_value(metadata, '$.skill_name'), content
-                                FROM {self._table}
-                                WHERE role = 'skill'
-                                  AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
-                                  AND json_value(metadata, '$.skill_name') IN ({in_clause})
-                            """
-                            cur.execute(desc_sql, binds)
-                            for drow in cur.fetchall():
-                                sname, scontent = drow[0], drow[1]
-                                if sname and sname not in desc_map:
-                                    desc_map[sname] = _extract_skill_description(scontent, sname)
-
-                    skills_out = []
-                    for r in page_rows:
-                        name = r[0]
-                        cat = r[1] or "general"
-                        skills_out.append({
-                            "name": name,
-                            "category": cat,
-                            "description": desc_map.get(name, ""),
-                        })
-
-                    return json.dumps({
-                        "count_in_page": len(skills_out),
-                        "offset": offset,
-                        "more": more,
-                        "skills": skills_out,
-                    }, default=_json_default)
+                more = len(rows) > page_size
+                skills_out = []
+                for row in rows[:page_size]:
+                    sname, scat, scontent = row[0], row[1] or "general", row[2] or ""
+                    if not isinstance(scontent, str):
+                        scontent = _lob_text(scontent)
+                    item: dict[str, Any] = {
+                        "name": sname,
+                        "category": scat,
+                        "description": _extract_skill_description(scontent, sname),
+                    }
+                    copies = row[3] if len(row) > 3 else None
+                    if isinstance(copies, (int, float)) and copies > 1:
+                        item["copies"] = int(copies)
+                    skills_out.append(item)
+                return json.dumps({
+                    "count_in_page": len(skills_out),
+                    "offset": offset,
+                    "more": more,
+                    "skills": skills_out,
+                }, default=_json_default)
 
             try:
                 with self._pool.acquire() as conn:
@@ -4835,7 +4813,19 @@ class OracleMemoryProvider(MemoryProvider):
                             return tool_error(f"not a directory: {d}")
                         dirs.append(dp)
                 batch_size = max(1, min(int(args.get("batch_size") or 50), 500))
-                res = self.sync_skills(mode=mode, force=force, dirs=dirs, batch_size=batch_size)
+                prune = _as_bool(args.get("prune", False))
+                dry_run = _as_bool(args.get("dry_run", False))
+                raw_limit = args.get("prune_limit")
+                try:
+                    prune_limit = 100 if raw_limit in (None, "") else int(raw_limit)
+                except (TypeError, ValueError):
+                    return tool_error("prune_limit must be an integer")
+                if not 1 <= prune_limit <= 500:
+                    return tool_error("prune_limit must be between 1 and 500")
+                res = self.sync_skills(
+                    mode=mode, force=force, dirs=dirs, batch_size=batch_size,
+                    prune=prune, prune_limit=prune_limit, dry_run=dry_run,
+                )
                 return json.dumps(res)
             if tool_name == "oracle_load_skill":
                 action = (args.get("action") or "fetch").lower().strip()
@@ -4846,13 +4836,14 @@ class OracleMemoryProvider(MemoryProvider):
                 elif action == "fetch":
                     skill = args.get("skill") or ""
                     path = args.get("path") or ""
+                    host = str(args.get("host") or "").strip()
                     variant = args.get("variant")
                     if variant is not None:
                         try:
                             variant = int(variant)
                         except (ValueError, TypeError):
                             variant = None
-                    return self._load_skill_fetch(skill, path=path, variant=variant)
+                    return self._load_skill_fetch(skill, path=path, variant=variant, host=host)
                 else:
                     return tool_error(f"Invalid action '{action}' for oracle_load_skill. Expected 'fetch' or 'list'.")
             return tool_error(f"Unknown tool: {tool_name}")
@@ -4986,14 +4977,22 @@ class OracleMemoryProvider(MemoryProvider):
         force: bool = False,
         dirs: list[str | Path] | None = None,
         batch_size: int = 50,
+        prune: bool = False,
+        prune_limit: int = 100,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Index local skills from ~/.agents/skills and ~/.hermes/skills into Oracle 26ai vector memory."""
+        """Index this host's skills (the profile's skills dir and ~/.agents/skills,
+        or *dirs*) under this host's identity; *prune* removes this host's
+        skills that are gone from those roots."""
         if not self._pool:
             raise RuntimeError(
                 self._init_error or self.unavailable_reason() or "Oracle memory pool not initialized"
             )
-        sync_skills_library = _sync_skills_module().sync_skills_library
-        return sync_skills_library(provider=self, mode=mode, force=force, dirs=dirs, dry_run=False, batch_size=batch_size)
+        sync = _sync_skills_module()
+        return sync.sync_skills_library(
+            provider=self, mode=mode, force=force, dirs=dirs, dry_run=dry_run, batch_size=batch_size,
+            prune=prune, prune_limit=prune_limit, host_tag=get_host_id(),
+        )
 
     def shutdown(self) -> None:
         # Stop accepting new background writes, then drain in-flight and

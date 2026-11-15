@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import unittest
@@ -13,140 +12,106 @@ import tests.conftest
 from scripts.sync_skills import SkillInfo, sync_skills_library
 
 
+def _stale_query(sql: str) -> bool:
+    return "SELECT DISTINCT json_value(metadata, '$.skill_name')" in sql and "memory_id LIKE :own" in sql
+
+
 class TestSyncPrune(unittest.TestCase):
+    """Pruning (1.1.1.4, #5) is host-scoped: only rows with this host's own id
+    prefix whose SKILL.md sat under a pruned root and is no longer found."""
+
     def setUp(self):
         self.mock_conn = MagicMock()
         self.mock_cur = MagicMock()
         self.mock_conn.cursor.return_value.__enter__.return_value = self.mock_cur
 
+    def _existing(self, rows):
+        def fetchall_side_effect():
+            last_sql = self.mock_cur.execute.call_args[0][0]
+            if "role = 'skill' AND (memory_id LIKE '%:c0'" in last_sql:
+                return rows["existing"]
+            if _stale_query(last_sql):
+                return rows["stale"]
+            return []
+
+        self.mock_cur.fetchall.side_effect = fetchall_side_effect
+
     def test_prune_scenario_table(self):
-        """Scenario table:
-        1. Alive local skills: untouched (never pruned).
-        2. Own-path stale skills: deleted up to prune_limit.
-        3. Foreign-path rows: never deleted.
-        4. Legacy null-path rows: never deleted.
-        """
+        """1. Alive local skills: never pruned.
+        2. This host's stale skills under the root: deleted up to prune_limit.
+        3. Other hosts' copies and host-less legacy rows: never matched (the
+           stale query and every DELETE are bound to this host's id prefix)."""
         host_root = "/srv/fixtures/.hermes/skills/"
         alive_skills = [
-            SkillInfo(
-                name="alive-1",
-                path=Path(f"{host_root}alive-1/SKILL.md"),
-                category="general",
-                description="Alive 1",
-                triggers="always",
-                hash="hash_alive_1",
-            ),
-            SkillInfo(
-                name="alive-2",
-                path=Path(f"{host_root}alive-2/SKILL.md"),
-                category="general",
-                description="Alive 2",
-                triggers="always",
-                hash="hash_alive_2",
-            ),
+            SkillInfo(name=n, path=Path(f"{host_root}{n}/SKILL.md"), category="general",
+                      description=n, triggers="always", hash=f"hash_{n}")
+            for n in ("alive-1", "alive-2")
         ]
-
-        # Existing meta rows returned by initial check:
-        # alive-1 has matching hash -> skipped
-        # alive-2 has matching hash -> skipped
-        existing_meta_rows = [
-            ("skill:hosta:alive-1:c0", "alive-1", "hash_alive_1", f"{host_root}alive-1/SKILL.md", "hosta"),
-            ("skill:hosta:alive-2:c0", "alive-2", "hash_alive_2", f"{host_root}alive-2/SKILL.md", "hosta"),
-        ]
-
-        # Stale query returns skill names under this host root:
-        # 'alive-1', 'alive-2' (alive)
-        # 'stale-local-1', 'stale-local-2', 'stale-local-3' (stale on this host)
-        stale_query_rows = [
-            ("alive-1",),
-            ("alive-2",),
-            ("stale-local-1",),
-            ("stale-local-2",),
-            ("stale-local-3",),
-        ]
-
-        def fetchall_side_effect():
-            # Determine which query was executed
-            last_sql = self.mock_cur.execute.call_args[0][0]
-            if "role = 'skill' AND (memory_id LIKE '%:c0'" in last_sql:
-                return existing_meta_rows
-            elif "WHERE role = 'skill'" in last_sql and "path') LIKE :host_root" in last_sql:
-                return stale_query_rows
-            return []
-
-        self.mock_cur.fetchall.side_effect = fetchall_side_effect
+        self._existing({
+            "existing": [
+                ("skill:hosta:alive-1:c0", "alive-1", "hash_alive-1", f"{host_root}alive-1/SKILL.md", "hosta"),
+                ("skill:hosta:alive-2:c0", "alive-2", "hash_alive-2", f"{host_root}alive-2/SKILL.md", "hosta"),
+            ],
+            "stale": [("alive-1",), ("alive-2",), ("stale-local-1",), ("stale-local-2",), ("stale-local-3",)],
+        })
 
         stats = sync_skills_library(
-            self.mock_conn,
-            alive_skills,
-            host_root,
-            prune_host=host_root,
-            prune_limit=2,  # Limit pruning to 2 to test prune_limit
-            dry_run=False,
-            host_tag="hosta",
+            self.mock_conn, alive_skills, host_root,
+            prune_host=host_root, prune_limit=2, dry_run=False, host_tag="hosta",
         )
 
-        # Asserts
         self.assertEqual(stats["scanned"], 2)
-        self.assertEqual(stats["skipped"], 2)  # Hashes matched
+        self.assertEqual(stats["skipped"], 2)
         self.assertEqual(stats["upserted"], 0)
-        self.assertEqual(stats["pruned"], 2)   # 2 pruned due to prune_limit=2
+        self.assertEqual(stats["prune_candidates"], 3)
+        self.assertEqual(stats["pruned"], 2)
         self.assertEqual(stats["pruned_skills"], ["stale-local-1", "stale-local-2"])
 
-        # Check all DELETE queries executed
-        delete_calls = [
-            call for call in self.mock_cur.execute.call_args_list
-            if "DELETE FROM" in str(call[0][0])
-        ]
+        stale_calls = [c for c in self.mock_cur.execute.call_args_list if _stale_query(c[0][0])]
+        self.assertEqual(len(stale_calls), 1)
+        sql, binds = stale_calls[0][0]
+        self.assertEqual(binds["own"], "skill:hosta:%")
+        self.assertEqual(binds["r0"], "/srv/fixtures/.hermes/skills/%")
+        self.assertIn("json_value(metadata, '$.path') LIKE :r0 ESCAPE", sql)
 
-        # Verify pruned queries specifically targeted host_root and skill name
-        for call in delete_calls:
-            sql = call[0][0]
-            binds = call[0][1]
-            if "json_value(metadata, '$.path') LIKE :host_root" in sql:
-                self.assertEqual(binds["host_root"], host_root)
-                self.assertIn(binds["name"], ["stale-local-1", "stale-local-2"])
-                # Foreign skills or alive skills should NEVER be in delete calls
-                self.assertNotIn(binds["name"], ["alive-1", "alive-2", "hostb-foreign"])
+        delete_calls = [c for c in self.mock_cur.execute.call_args_list if "DELETE" in str(c[0][0])]
+        self.assertEqual(
+            [c[0][1] for c in delete_calls],
+            [{"pfx": "skill:hosta:stale-local-1:c%"}, {"pfx": "skill:hosta:stale-local-2:c%"}],
+        )
+        for c in delete_calls:
+            self.assertIn("memory_id LIKE :pfx ESCAPE", c[0][0])
+            self.assertNotIn("conv_ref", c[0][0])
+        self.mock_conn.commit.assert_called_once()
 
     def test_dry_run_records_deletions_without_executing_delete(self):
-        """Verify dry-run mode identifies deletions without modifying database."""
         host_root = "/Users/dev/.hermes/skills/"
-        alive_skills = []
-        stale_query_rows = [("stale-1",), ("stale-2",)]
-
-        def fetchall_side_effect():
-            last_sql = self.mock_cur.execute.call_args[0][0]
-            if "role = 'skill' AND (memory_id LIKE '%:c0'" in last_sql:
-                return []
-            elif "WHERE role = 'skill'" in last_sql and "path') LIKE :host_root" in last_sql:
-                return stale_query_rows
-            return []
-
-        self.mock_cur.fetchall.side_effect = fetchall_side_effect
+        self._existing({"existing": [], "stale": [("stale-1",), ("stale-2",)]})
 
         stats = sync_skills_library(
-            self.mock_conn,
-            alive_skills,
-            host_root,
-            prune_host=host_root,
-            prune_limit=500,
-            dry_run=True,
-            host_tag="hostc",
+            self.mock_conn, [], host_root,
+            prune_host=host_root, prune_limit=500, dry_run=True, host_tag="hostc",
         )
 
         self.assertTrue(stats["dry_run"])
         self.assertEqual(stats["pruned"], 2)
         self.assertEqual(stats["pruned_skills"], ["stale-1", "stale-2"])
-
-        # No DELETE statement should be executed when dry_run=True
-        delete_calls = [
-            call for call in self.mock_cur.execute.call_args_list
-            if "DELETE FROM" in str(call[0][0])
-        ]
+        delete_calls = [c for c in self.mock_cur.execute.call_args_list if "DELETE" in str(c[0][0])]
         self.assertEqual(len(delete_calls), 0)
-        # Commit should not be called in dry_run
         self.mock_conn.commit.assert_not_called()
+
+    def test_no_prune_unless_asked(self):
+        self._existing({"existing": [], "stale": [("stale-1",)]})
+        stats = sync_skills_library(self.mock_conn, [], "/srv/fixtures/.hermes/skills/", host_tag="hosta")
+        self.assertEqual(stats["pruned"], 0)
+        self.assertFalse(any(_stale_query(c[0][0]) for c in self.mock_cur.execute.call_args_list))
+
+    def test_like_wildcards_in_host_and_root_are_escaped(self):
+        self._existing({"existing": [], "stale": []})
+        sync_skills_library(self.mock_conn, [], "/srv/my_skills%/", prune_host="/srv/my_skills%/", host_tag="host_a")
+        sql, binds = next(c[0] for c in self.mock_cur.execute.call_args_list if _stale_query(c[0][0]))
+        self.assertEqual(binds["own"], "skill:host\\_a:%")
+        self.assertEqual(binds["r0"], "/srv/my\\_skills\\%/%")
 
 
 if __name__ == "__main__":
