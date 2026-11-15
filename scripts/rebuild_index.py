@@ -16,16 +16,6 @@ import os
 import sys
 from pathlib import Path
 
-# Load ~/.hermes/.env
-env_file = Path.home() / ".hermes" / ".env"
-if env_file.exists():
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            v = v.strip().strip('"').strip("'")
-            os.environ.setdefault(k.strip(), v)
-
 root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
@@ -104,6 +94,22 @@ def rebuild_vector_index(
     }
 
 
+def load_env(env_file: str | None = None) -> None:
+    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
+    when the user passes --env-file. Otherwise the script reads the process
+    environment alone; values already set there win."""
+    if not env_file:
+        return
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Rebuild HNSW vector index in Oracle 26ai.")
     parser.add_argument("--table", default=None, help="Oracle memory table name (default from env or HERMES_AGENT_MEMORY)")
@@ -111,7 +117,9 @@ def main() -> None:
     parser.add_argument("--yes", "-y", action="store_true", help="Proceed without interactive confirmation")
     parser.add_argument("--no-gather-stats", action="store_true", help="Skip gathering table statistics after creation")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose log output")
+    parser.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
     args = parser.parse_args()
+    load_env(args.env_file)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

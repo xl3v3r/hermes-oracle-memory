@@ -42,12 +42,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("oracle-import-ordered")
 
 
-def load_env() -> None:
-    env_file = Path.home() / ".hermes" / ".env"
-    if not env_file.exists():
+def load_env(env_file: str | None = None) -> None:
+    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
+    when the user passes --env-file. Otherwise the script reads the process
+    environment alone; values already set there win."""
+    if not env_file:
         return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
         line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
@@ -182,7 +186,7 @@ def parse_conversations(data: Any) -> list[dict[str, Any]]:
 
 
 def run(args: argparse.Namespace) -> int:
-    load_env()
+    load_env(getattr(args, "env_file", None))
 
     # The plugin runs inside the Hermes gateway, which provides the `agent`
     # runtime modules. Standalone scripts stub them; get_secret must be REAL
@@ -294,6 +298,7 @@ def main() -> int:
     ap.add_argument("--max-words", type=int, default=80)
     ap.add_argument("--overlap", type=int, default=10)
     ap.add_argument("--limit-conversations", type=int, default=0, help="import only the first N (smoke test)")
+    ap.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
     args = ap.parse_args()
     try:
         return run(args)
