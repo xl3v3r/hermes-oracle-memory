@@ -1204,8 +1204,9 @@ def sync_skills_library(
                         stats["foreign_skills"].append({"name": skill.name, "path": foreign[0].get("path")})
                         logger.warning(
                             "skill '%s': this host's copy is stored from %s, which still exists (another "
-                            "profile, a dir no longer configured, or a default dir this --dirs run does not "
-                            "scan); not replacing it", skill.name, foreign[0].get("path"),
+                            "profile, a dir no longer configured, or a default skill dir while this run "
+                            "found the skill in a --dirs dir outside the default dirs); not replacing it",
+                            skill.name, foreign[0].get("path"),
                         )
                         continue
                     if foreign:
@@ -1349,9 +1350,9 @@ def sync_skills_library(
     if stats["skipped_foreign"]:
         stats["hint"] = (
             "Some of this host's copies are stored from other SKILL.md files that still exist (another "
-            "profile, a dir no longer configured, or a default skill dir that this --dirs run does not scan); "
-            "see foreign_skills. Re-run with replace_foreign (--replace-foreign on the command line) to "
-            "replace them with the copies this run found."
+            "profile, a dir no longer configured, or a default skill dir while this run found the skill in a "
+            "--dirs dir outside the default dirs); see foreign_skills. Re-run with replace_foreign "
+            "(--replace-foreign on the command line) to replace them with the copies this run found."
         )
     return stats
 

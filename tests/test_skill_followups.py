@@ -70,6 +70,17 @@ class TestForeignCopiesJudgedByProfileRoots(unittest.TestCase):
         self.assertEqual((forced["skipped_foreign"], forced["updated"]), (0, 1))
         prov2._insert_many.assert_called_once()
 
+    def test_dirs_listing_outside_dir_first_keep_default_copy_with_accurate_hint(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            mine = _write_skill(home / ".hermes" / "skills", "demo", "demo", "Default root")
+            _write_skill(home / "extra", "demo", "demo", "Extra root")
+            res, prov = _bulk(home, [str(home / "extra"), str(home / ".hermes" / "skills")], str(mine))
+        self.assertEqual(res["skipped_foreign"], 1)
+        prov._insert_many.assert_not_called()
+        self.assertNotIn("does not scan", res["hint"])
+        self.assertIn("outside the default", res["hint"])
+
     def test_dirs_outside_defaults_replace_gone_default_copy(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)

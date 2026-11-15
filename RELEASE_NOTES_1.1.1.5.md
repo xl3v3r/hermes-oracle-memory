@@ -25,7 +25,7 @@
   - When the driver cannot report per-row counts, every row of the group is re-checked: rows that got their vector are done, the rest are re-queued with the text the database holds.
 - **Test suite**:
   - `tests/conftest.py` wraps `os.symlink` and `os.link` for the whole run. `Path.symlink_to` and `Path.hardlink_to` call these, so they are covered too; on Python 3.10, where `pathlib` keeps its own references, its accessor is patched as well.
-  - The wrappers refuse any link whose directory or target resolves outside `tempfile.gettempdir()`, as well as links relative to a `dir_fd`. They refuse every link if the temp dir contains the user's real home, where the installed plugin lives.
+  - The wrappers refuse any link whose directory or target resolves outside `tempfile.gettempdir()`, as well as links relative to a `dir_fd`. They refuse every link if the temp dir contains the user's real home, or overlaps the installed plugin dir in either direction.
   - The source scan in `test_suite_never_writes_outside_checkout` parses the `_link_in_tmp` helper, so a comment or docstring no longer satisfies it. It also flags aliased calls (`o.symlink`, `o.link`, `from os import symlink`) and shell links (`ln -s`, `-fs`, `--symbolic`, `/bin/ln`).
 - Version bump `1.1.1.4` → `1.1.1.5` across `VERSION`, `plugin.yaml`, `pyproject.toml`, `__version__`, README/INSTALL badges, both `skills/*/SKILL.md` pins, `AGENTS.md` and `NEEDS.md`. Release notes rotated: `RELEASE_NOTES_1.1.1.4.md` → `RELEASE_NOTES_1.1.1.5.md`; the v1.1.1.4 details remain in `CHANGELOG.md`.
 
@@ -41,8 +41,8 @@
   The copy returns on that profile's next sync or edit. Set `HERMES_HOST_ID` per profile to keep profiles apart.
 
 ### Verification
-- Test suite: 479 passed, 4 skipped (sandboxed `HOME`), identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000`. The extra skip is the Python 3.10 accessor check, which runs only on 3.10.
-- Of the 29 new tests that run here, 25 fail against 1.1.1.4. The other 4 cover behaviour that was already right and must stay so: termination on link loops, links inside the temp dir being allowed, and a `--dirs` run replacing a default copy whose file is gone.
+- Test suite: 481 passed, 4 skipped (sandboxed `HOME`), identical with `HERMES_ORACLE_SEARCH_TIMEOUT_MS=13000` and with `TMPDIR` set to a scratch dir under the Hermes home. The extra skip is the Python 3.10 accessor check, which runs only on 3.10.
+- Of the 31 new tests that run here, 27 fail against 1.1.1.4. The other 4 cover behaviour that was already right and must stay so: termination on link loops, links inside the temp dir being allowed, and a `--dirs` run replacing a default copy whose file is gone.
 - The accessor patch was exercised on a real `pathlib._NormalAccessor` (Python 3.9, same layout as 3.10): `symlink_to` outside the temp dir is refused.
 - `mypy` (3.11) clean on `__init__.py`; `ruff` (F, E9) clean on `__init__.py` and `scripts/`.
 - Live, read-only against Oracle ADB 26ai on two hosts (48 and 78 skills):

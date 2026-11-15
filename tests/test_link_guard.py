@@ -83,6 +83,19 @@ class TestRuntimeLinkGuard(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "contains the home"):
                     guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
 
+    def test_temp_dir_overlapping_plugin_dir_refuses_every_link(self):
+        try:
+            import pwd
+
+            hermes = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".hermes")
+        except (ImportError, KeyError):
+            self.skipTest("no passwd entry")
+        with tempfile.TemporaryDirectory() as td:
+            for tmp in (hermes, os.path.join(hermes, "plugins", "oracle")):
+                with unittest.mock.patch("tempfile.gettempdir", return_value=tmp):
+                    with self.assertRaisesRegex(AssertionError, "plugin"):
+                        guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
+
     def test_pathlib_accessor_guarded_when_present(self):
         import pathlib
 

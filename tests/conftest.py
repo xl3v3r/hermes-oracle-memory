@@ -78,13 +78,19 @@ def _real_home():
 
 def check_link_paths(target, link, target_relative_to_link=True):
     """Raise AssertionError unless the link's directory and its target both
-    resolve inside tempfile.gettempdir(), and that temp dir does not contain
-    the user's real home (where the installed plugin lives; HOME may be faked)."""
+    resolve inside tempfile.gettempdir(), and that temp dir neither contains
+    the user's real home nor overlaps its installed plugin dir (HOME may be
+    faked, so the real home comes from the passwd entry)."""
     tmp = _Path(_tempfile.gettempdir()).resolve()
     home = _real_home()
     if home is not None and home.is_relative_to(tmp):
         raise AssertionError(
             f"the temp dir {tmp} contains the home dir {home}; set TMPDIR to a dedicated directory"
+        )
+    plugins = home / ".hermes" / "plugins" if home is not None else None
+    if plugins is not None and (plugins.is_relative_to(tmp) or tmp.is_relative_to(plugins)):
+        raise AssertionError(
+            f"the temp dir {tmp} overlaps the installed plugin dir {plugins}; set TMPDIR to a dedicated directory"
         )
     link_dir = _Path(_os.path.abspath(_os.fsdecode(link))).parent.resolve()
     tgt = _Path(_os.fsdecode(target))
