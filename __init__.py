@@ -354,6 +354,17 @@ def _sync_skills_module() -> Any:
         return mod
 
 
+# Skill names as stored in ids (skill:<host>:<name>:c<N>) and accepted from hooks/tools.
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Lifecycle writer bookkeeping is per process, keyed by (pool fingerprint,
+# table, skill): events reach whichever provider serves the session, and two
+# instances must never run two writers for one skill at the same time (#6).
+_LIFECYCLE_LOCK = threading.Lock()
+_LIFECYCLE_IN_FLIGHT: set[tuple[str, str, str]] = set()
+_LIFECYCLE_PENDING: dict[tuple[str, str, str], tuple[Any, str, list[Path]]] = {}
+
+
 def _skill_md_matches(root: Path, skill_name: str) -> list[Path]:
     """<root>/*/<skill_name>/SKILL.md, ignoring hidden trees such as .archive/
     (Hermes moves archived skills there before emitting 'archived')."""
@@ -1237,10 +1248,8 @@ class OracleMemoryProvider(MemoryProvider):
         self._last_write_at: str | None = None
         self._last_restart_seen: float | None = None
         self._bg_drop_warned = False
-        self._in_flight_lifecycle_skills: set[str] = set()
-        # Latest event that arrived while a skill's writer was busy (#6).
-        self._lifecycle_pending: dict[str, tuple[str, list[Path]]] = {}
-        self._lifecycle_lock = threading.Lock()
+        # Lifecycle writers are tracked per process (module-level
+        # _LIFECYCLE_* maps, keyed by _lifecycle_key), not per instance.
         self._sync_threads: list[threading.Thread] = []
         self._sync_threads_lock = threading.Lock()
         self._table = "hermes_agent_memory"
@@ -1901,9 +1910,15 @@ class OracleMemoryProvider(MemoryProvider):
         if not content or not memory_id:
             return
         with self._embed_lock:
-            if any(mid == memory_id for mid, _ in self._embed_pending):
-                return
-            self._embed_pending.append((memory_id, content))
+            # One pending entry per row, carrying the latest content: a row
+            # updated twice before its backfill must be embedded from the
+            # newer text, not the first one queued.
+            for i, (mid, _) in enumerate(self._embed_pending):
+                if mid == memory_id:
+                    self._embed_pending[i] = (memory_id, content)
+                    break
+            else:
+                self._embed_pending.append((memory_id, content))
         self._ensure_embed_worker()
 
     def _ensure_embed_worker(self) -> threading.Thread | None:
@@ -2046,24 +2061,39 @@ class OracleMemoryProvider(MemoryProvider):
                 if pool is None:
                     raise RuntimeError("pool not initialized")
                 tagged = self._embed_many_tagged([c for _, c in batch])
-                binds = [
-                    (vec, model, mid)
-                    for (mid, _), (vec, model) in zip(batch, tagged)
+                todo = [
+                    (vec, model, mid, text)
+                    for (mid, text), (vec, model) in zip(batch, tagged)
                     if vec is not None
                 ]
-                if binds:
+                if todo:
+                    import oracledb
+
                     with pool.acquire() as conn:
+                        # The text goes in as a temporary CLOB: a str bind over
+                        # 32,767 bytes fails in SQL (ORA-01460), even with a
+                        # CLOB input size.
+                        binds = [
+                            (vec, model, mid, conn.createlob(oracledb.DB_TYPE_CLOB, text))
+                            for vec, model, mid, text in todo
+                        ]
                         with conn.cursor() as cur:
-                            # Bulk update embeddings in a single round-trip,
-                            # stamping provenance alongside the vector.
+                            # Bulk update embeddings in one executemany,
+                            # stamping provenance alongside the vector. The
+                            # vector is written only for the text it was
+                            # computed from, and only while the row still has
+                            # none: a row updated meanwhile (here or on another
+                            # host) keeps its newer content's embedding, and the
+                            # newer content's own backfill entry fills it.
                             sql = (
                                 f"UPDATE /*+ NO_PARALLEL */ {self._table} SET embedding = :1, "
                                 "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
-                                "WHERE memory_id = :3"
+                                "WHERE memory_id = :3 AND embedding IS NULL "
+                                "AND DBMS_LOB.COMPARE(content, :4) = 0"
                             )  # nosec B608
                             cur.executemany(sql, binds)
                         conn.commit()
-                done = {mid for _, _, mid in binds}
+                done = {mid for _, _, mid, _ in todo}
             except Exception as e:
                 logger.warning("embed backfill batch failed: %s", e)
             remaining = [item for item in batch if item[0] not in done]
@@ -3970,27 +4000,33 @@ class OracleMemoryProvider(MemoryProvider):
         # The caller (the skill tool) only schedules: file lookup, parsing, the
         # hash check and the write all run on the per-skill writer thread (#6).
         if action in ("created", "edited", "patched", "installed", "restored", "archived"):
-            if not isinstance(skill_name, str) or not skill_name:
+            if not isinstance(skill_name, str) or not _SKILL_NAME_RE.match(skill_name):
+                logger.debug("on_skill_lifecycle: ignoring invalid skill name %r", skill_name)
                 return
             try:
                 # Resolved here: the Hermes home can be a context-local
                 # (per-profile) override that a new thread does not inherit.
-                roots = list(_sync_skills_module().default_skill_roots())
+                roots = list(_sync_skills_module().resolve_skill_roots())
             except Exception as e:
                 logger.debug("on_skill_lifecycle: cannot resolve skill roots: %s", e)
                 return
             self._schedule_skill_lifecycle(skill_name, "archive" if action == "archived" else "ingest", roots)
             return
 
+    def _lifecycle_key(self, skill_name: str) -> tuple[str, str, str]:
+        return (self._pool_fingerprint, self._table, skill_name)
+
     def _schedule_skill_lifecycle(self, skill_name: str, op: str, roots: list[Path]) -> None:
-        """Run *op* for *skill_name* on a writer thread, one writer per skill.
-        An event for a skill whose writer is still busy is coalesced, not
-        dropped: the writer runs once more with the latest event afterwards."""
-        with self._lifecycle_lock:
-            if skill_name in self._in_flight_lifecycle_skills:
-                self._lifecycle_pending[skill_name] = (op, roots)
+        """Run *op* for *skill_name* on a writer thread, one writer per skill
+        and database table in this process (whichever provider instance the
+        event reached). An event for a skill whose writer is still busy is
+        coalesced, not dropped: the writer runs once more with the latest event."""
+        key = self._lifecycle_key(skill_name)
+        with _LIFECYCLE_LOCK:
+            if key in _LIFECYCLE_IN_FLIGHT:
+                _LIFECYCLE_PENDING[key] = (self, op, roots)
                 return
-            self._in_flight_lifecycle_skills.add(skill_name)
+            _LIFECYCLE_IN_FLIGHT.add(key)
         thread = threading.Thread(
             target=self._run_skill_lifecycle,
             args=(skill_name, op, roots),
@@ -4004,28 +4040,34 @@ class OracleMemoryProvider(MemoryProvider):
             logger.debug("on_skill_lifecycle: cannot start writer for '%s': %s", skill_name, e)
         if not started:
             logger.info("on_skill_lifecycle: provider shutting down; not processing '%s'", skill_name)
-            with self._lifecycle_lock:
-                self._in_flight_lifecycle_skills.discard(skill_name)
-                self._lifecycle_pending.pop(skill_name, None)
+            with _LIFECYCLE_LOCK:
+                _LIFECYCLE_IN_FLIGHT.discard(key)
+                _LIFECYCLE_PENDING.pop(key, None)
 
     def _run_skill_lifecycle(self, skill_name: str, op: str, roots: list[Path]) -> None:
+        key = self._lifecycle_key(skill_name)
+        prov: OracleMemoryProvider = self
         while True:
             try:
                 if op == "archive":
-                    self._skill_archive_once(skill_name, roots)
+                    prov._skill_archive_once(skill_name, roots)
                 else:
-                    self._skill_ingest_once(skill_name, roots)
+                    prov._skill_ingest_once(skill_name, roots)
             except Exception as e:
                 logger.warning("on_skill_lifecycle: %s of '%s' failed: %s", op, skill_name, e)
-            with self._lifecycle_lock:
-                nxt = self._lifecycle_pending.pop(skill_name, None)
-                if nxt is None or self._write_stop.is_set():
-                    self._in_flight_lifecycle_skills.discard(skill_name)
+            with _LIFECYCLE_LOCK:
+                nxt = _LIFECYCLE_PENDING.pop(key, None)
+                # The coalesced event runs on the provider it reached, unless
+                # that provider (or this one) is shutting down.
+                if nxt is None or self._write_stop.is_set() or nxt[0]._write_stop.is_set():
+                    _LIFECYCLE_IN_FLIGHT.discard(key)
                     return
-            op, roots = nxt
+            prov, op, roots = nxt
 
     @staticmethod
     def _find_skill_file(roots: list[Path], skill_name: str) -> Path | None:
+        if not _SKILL_NAME_RE.match(skill_name or ""):
+            return None
         for root in roots:
             if not root.is_dir():
                 continue
@@ -4037,9 +4079,37 @@ class OracleMemoryProvider(MemoryProvider):
                     return sub
         return None
 
+    @staticmethod
+    def _live_elsewhere(stored_path: Any, own_file: Path | None, roots: list[Path]) -> bool:
+        """True when *stored_path* is a SKILL.md that still exists, is not
+        *own_file* and lies outside *roots*: another profile (or process) on
+        this host owns the stored copy, so this one must not replace or delete it."""
+        if not stored_path:
+            return False
+        try:
+            p = Path(str(stored_path))
+            if not p.is_file():
+                return False
+            rp = p.resolve()
+            if own_file is not None and rp == own_file.resolve():
+                return False
+            for root in roots:
+                try:
+                    rp.relative_to(root.resolve())
+                    return False
+                except ValueError:
+                    continue
+            return True
+        except OSError:
+            return False
+
     def _skill_ingest_once(self, skill_name: str, roots: list[Path]) -> None:
         """Replace this host's copy of one skill (full mode) in one transaction;
-        skip the write when the stored hash already matches the file."""
+        skip the write when the stored hash already matches the file.
+
+        The identity is the parsed skill name (the frontmatter name, else the
+        directory name), exactly as the bulk sync stores it; the event name only
+        locates the file."""
         skill_file = self._find_skill_file(roots, skill_name)
         if skill_file is None:
             logger.debug("on_skill_lifecycle: local SKILL.md not found for '%s'; skipping live ingest", skill_name)
@@ -4048,14 +4118,20 @@ class OracleMemoryProvider(MemoryProvider):
         skill_info = _sync.parse_skill_file(skill_file)
         if not skill_info:
             return
+        name = str(getattr(skill_info, "name", "") or "")
+        if not _SKILL_NAME_RE.match(name):
+            logger.warning("on_skill_lifecycle: skill '%s' has an invalid name %r; not stored", skill_name, name)
+            return
+        if name != skill_name:
+            logger.debug("on_skill_lifecycle: '%s' is stored as '%s' (its frontmatter name)", skill_name, name)
         host_id = get_host_id()
         payload_rows = _sync.format_skill_payload(skill_info, mode="full", host=host_id)
         if not payload_rows:
             return
         current_hash = getattr(skill_info, "hash", None) or getattr(skill_info, "content_hash", "")
-        own_binds = _sync.own_skill_rows_binds(host_id, skill_name)
+        own_binds = _sync.own_skill_rows_binds(host_id, name)
         if self._pool is None:
-            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", skill_name)
+            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", name)
             return
         # Hash check, DELETE of this host's rows and INSERT share one
         # transaction: a failed insert rolls back and the previous rows stay.
@@ -4064,13 +4140,21 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT json_value(metadata, '$.hash') FROM {self._table} "
-                        "WHERE memory_id = :1 AND role = 'skill'",
-                        (f"skill:{host_id}:{skill_name}:c0",),
+                        f"SELECT json_value(metadata, '$.hash'), json_value(metadata, '$.path') "  # nosec B608
+                        f"FROM {self._table} WHERE memory_id = :1 AND role = 'skill'",
+                        (f"skill:{host_id}:{name}:c0",),
                     )
                     row = cur.fetchone()
                     if current_hash and row and row[0] == current_hash:
-                        logger.debug("on_skill_lifecycle: skill '%s' hash unchanged (%s); skipping", skill_name, current_hash)
+                        logger.debug("on_skill_lifecycle: skill '%s' hash unchanged (%s); skipping", name, current_hash)
+                        return
+                    stored_path = row[1] if row is not None and len(row) > 1 else None
+                    if self._live_elsewhere(stored_path, skill_file, roots):
+                        logger.warning(
+                            "on_skill_lifecycle: skill '%s' of host '%s' is stored from %s, which still exists "
+                            "outside this profile's skill dirs; not replacing it (set HERMES_HOST_ID per "
+                            "profile to keep separate copies)", name, host_id, stored_path,
+                        )
                         return
                     cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)
                 backfill = self._insert_many(payload_rows, tx_conn=conn)
@@ -4083,12 +4167,17 @@ class OracleMemoryProvider(MemoryProvider):
                 raise
         for mid, cnt in backfill or []:
             self._queue_embed_backfill(mid, cnt)
-        logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", skill_name, len(payload_rows))
+        logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", name, len(payload_rows))
 
     def _skill_archive_once(self, skill_name: str, roots: list[Path]) -> None:
         """Delete this host's copy of an archived skill, unless a SKILL.md for
-        it is still live under the roots. Other hosts' copies and the host-less
-        shared corpus are never touched."""
+        it is still live under the roots. The copy is found by its id
+        (skill:<host>:<name>:c0) or by its stored path (.../<name>/SKILL.md,
+        for a skill whose frontmatter name differs from its directory); a copy
+        whose stored SKILL.md still exists elsewhere (another profile) is kept.
+        Other hosts' copies and the host-less shared corpus are never touched."""
+        if not _SKILL_NAME_RE.match(skill_name or ""):
+            return
         if self._find_skill_file(roots, skill_name) is not None:
             return
         _sync = _sync_skills_module()
@@ -4096,11 +4185,42 @@ class OracleMemoryProvider(MemoryProvider):
         own_binds = _sync.own_skill_rows_binds(host_id, skill_name)
         if self._pool is None:
             return
+        deleted = 0
+        removed: list[str] = []
         with self._acquire_checked() as conn:
             try:
                 with conn.cursor() as cur:
-                    cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)
-                    deleted = cur.rowcount or 0
+                    cur.execute(
+                        f"SELECT memory_id, json_value(metadata, '$.skill_name'), json_value(metadata, '$.path') "  # nosec B608
+                        f"FROM {self._table} WHERE role = 'skill' AND memory_id LIKE :own ESCAPE '\\' "
+                        "AND memory_id LIKE '%:c0' "
+                        "AND (memory_id = :c0 OR json_value(metadata, '$.path') LIKE :tail ESCAPE '\\')",
+                        {
+                            "own": _sync.like_escape(f"skill:{host_id}:") + "%",
+                            "c0": f"skill:{host_id}:{skill_name}:c0",
+                            "tail": "%" + _sync.like_escape(f"{os.sep}{skill_name}{os.sep}SKILL.md"),
+                        },
+                    )
+                    candidates = list(cur.fetchall() or [])
+                    for cand in candidates:
+                        mid = str(cand[0] or "")
+                        sname = str(cand[1] or "") if len(cand) > 1 else ""
+                        spath = cand[2] if len(cand) > 2 else None
+                        if not sname:
+                            m = re.match(r"^skill:[^:]+:([^:]+):c0$", mid)
+                            sname = m.group(1) if m else ""
+                        if not _SKILL_NAME_RE.match(sname) or self._live_elsewhere(spath, None, roots):
+                            continue
+                        cur.execute(
+                            f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}",  # nosec B608
+                            _sync.own_skill_rows_binds(host_id, sname),
+                        )
+                        deleted += cur.rowcount or 0
+                        removed.append(sname)
+                    if not candidates:
+                        # No meta row (partial legacy write): clear any chunk rows under the id.
+                        cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)  # nosec B608
+                        deleted += cur.rowcount or 0
                 conn.commit()
             except BaseException:
                 try:
@@ -4108,7 +4228,10 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
                 raise
-        logger.info("on_skill_lifecycle: archived skill '%s': removed %d rows of host '%s'", skill_name, deleted, host_id)
+        logger.info(
+            "on_skill_lifecycle: archived skill '%s': removed %d rows of host '%s' (%s)",
+            skill_name, deleted, host_id, ", ".join(removed) or "no copy",
+        )
 
     def _load_skill_fetch(self, skill_name: str, path: str = "", variant: int | None = None, host: str = "") -> str:
         """Load and reconstruct a skill document from its constituent chunks in the shared corpus.
@@ -4337,10 +4460,11 @@ class OracleMemoryProvider(MemoryProvider):
             binds: dict[str, Any] = {"o": offset, "limit": page_size + 1}
             if filt:
                 where_filter = (
-                    "AND (UPPER(json_value(metadata, '$.skill_name')) LIKE UPPER(:f) "
-                    "OR UPPER(content) LIKE UPPER(:f))"
+                    "AND (UPPER(json_value(metadata, '$.skill_name')) LIKE UPPER(:f) ESCAPE '\\' "
+                    "OR UPPER(content) LIKE UPPER(:f) ESCAPE '\\')"
                 )
-                binds["f"] = f"%{filt}%"
+                # The filter is a literal substring: % and _ are escaped.
+                binds["f"] = "%" + _sync_skills_module().like_escape(filt) + "%"
             sql = f"""
                 SELECT name, category, content, copies
                 FROM (
@@ -4650,6 +4774,8 @@ class OracleMemoryProvider(MemoryProvider):
                         f"session_id '{sid}' is shared by unrelated rows (skill corpus / rows without a "
                         "session) and cannot be purged; delete individual rows by memory_id"
                     )
+                if mid and mid.lower().startswith(_SKILL_ID_PREFIX):
+                    return tool_error(_SKILL_ROW_READONLY)
                 with self._acquire_checked() as conn:
                     with conn.cursor() as cur:
                         if sid:
@@ -4669,16 +4795,23 @@ class OracleMemoryProvider(MemoryProvider):
                                 }
                             )
                         else:
-                            query = f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                            # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
+                            query = (
+                                f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                                " AND NVL(role, 'fact') <> 'skill'"
+                            )
                             cur.execute(
                                 query,
                                 (mid,),
                             )
                             n = cur.rowcount
                             conn.commit()
-                            if not n:
-                                return tool_error(f"Memory not found: {mid}")
-                            return json.dumps({"result": "deleted", "memory_id": mid})
+                # Only the memory_id branch gets here (the thread purge returned above).
+                if not n:
+                    if self._is_skill_row(mid):
+                        return tool_error(_SKILL_ROW_READONLY)
+                    return tool_error(f"Memory not found: {mid}")
+                return json.dumps({"result": "deleted", "memory_id": mid})
             if tool_name == "oracle_chunk":
                 content = (args.get("content") or "").strip()
                 file_path = (args.get("file_path") or args.get("path") or "").strip()

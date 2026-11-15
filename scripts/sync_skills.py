@@ -821,7 +821,7 @@ def format_skill_payload(skill: SkillInfo, mode: str = "meta", host: str = "") -
 
 def sync_skills_library(
     provider_or_conn: Any = None,
-    skills_or_mode: Any = "meta",
+    skills_or_mode: Any = None,
     host_root: str = "",
     *,
     provider: Any = None,
@@ -847,11 +847,13 @@ def sync_skills_library(
     legacy corpus."""
     target_provider_or_conn = provider if provider is not None else provider_or_conn
 
+    # skills_or_mode: a skill list, or a positional mode string. The keyword
+    # *mode* applies otherwise (it used to be overridden by the positional
+    # default "meta", so mode="full" silently ran a meta sync).
     if isinstance(skills_or_mode, (list, tuple)):
         skills = list(skills_or_mode)
-        mode = kwargs.get("mode", mode)
     elif isinstance(skills_or_mode, str):
-        mode = skills_or_mode if "mode" not in kwargs else kwargs["mode"]
+        mode = skills_or_mode
         skills = discover_skills(dirs=dirs)
     else:
         skills = discover_skills(dirs=dirs)
@@ -973,7 +975,8 @@ def sync_skills_library(
                            json_value(metadata, '$.skill_name') as skill_name,
                            json_value(metadata, '$.hash') as hash,
                            json_value(metadata, '$.path') as path,
-                           json_value(metadata, '$.host') as host
+                           json_value(metadata, '$.host') as host,
+                           json_value(metadata, '$.total_chunks') as total_chunks
                     FROM {table}
                     WHERE role = 'skill' AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
                 """
@@ -984,11 +987,16 @@ def sync_skills_library(
                     shash = ""
                     spath = ""
                     shost = ""
+                    # full: True/False when the row says whether it holds the
+                    # whole document (total_chunks), None when unknown.
+                    sfull: bool | None = None
                     if len(row) >= 5:
                         sname = str(row[1] or "")
                         shash = str(row[2] or "")
                         spath = str(row[3] or "")
                         shost = str(row[4] or "")
+                        if len(row) >= 6:
+                            sfull = row[5] is not None
                     elif len(row) == 2 or len(row) == 3:
                         raw_meta = row[2] if len(row) >= 3 else row[1]
                         if len(row) >= 3 and row[1]:
@@ -1012,7 +1020,7 @@ def sync_skills_library(
                             if m:
                                 sname = m.group(1)
 
-                    item = {"mid": mid, "name": sname, "hash": shash, "path": spath, "host": shost}
+                    item = {"mid": mid, "name": sname, "hash": shash, "path": spath, "host": shost, "full": sfull}
                     if sname:
                         existing_by_name.setdefault(sname, []).append(item)
                     existing_map[mid] = item
@@ -1023,12 +1031,17 @@ def sync_skills_library(
                     copies = existing_by_name.get(skill.name, [])
                     own = [c for c in copies if str(c.get("mid", "")).startswith(own_prefix)]
                     skill_hash = skill.hash or skill.content_hash
-                    # Up to date: this host's copy has the file's hash. With no
-                    # copy of its own, an identical copy from another host or
-                    # the shared corpus is enough (no redundant duplicates); a
-                    # stale copy of its own is always replaced.
-                    current = own if own else copies
-                    if not force and skill_hash and any(c.get("hash") == skill_hash for c in current):
+                    # Up to date: this host's copy has the file's hash (and, for
+                    # a full sync, holds the whole document). With no copy of
+                    # its own, an identical host-less shared-corpus copy is
+                    # enough (it is never pruned); another host's copy is not,
+                    # since that host may archive or prune it. A stale copy of
+                    # its own is always replaced.
+                    current = own if own else [c for c in copies if not c.get("host")]
+                    if not force and skill_hash and any(
+                        c.get("hash") == skill_hash and (mode != "full" or c.get("full") is not False)
+                        for c in current
+                    ):
                         stats["skipped"] += 1
                         continue
                     if own:

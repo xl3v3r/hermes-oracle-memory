@@ -196,7 +196,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
         ins = self._fire(lambda rows, tx_conn=None: (self.events.append("insert"), [])[1])
         self.assertEqual(ins.call_args.kwargs["tx_conn"], self.conn)
         self.assertEqual([e for e in self.events if e != "sql"], ["delete", "insert", "commit"])
-        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self.assertNotIn(self.provider._lifecycle_key("atomic-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
 
     def test_failed_insert_rolls_back_the_delete(self):
         def boom(rows, tx_conn=None):
@@ -205,7 +205,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
         self.assertIn("rollback", self.events)
         self.assertNotIn("commit", self.events)
         self.provider._pool.drop.assert_called_once_with(self.conn)  # non-ORA error: session dropped
-        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self.assertNotIn(self.provider._lifecycle_key("atomic-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
 
     def test_pool_cleared_mid_upsert_still_commits_on_captured_connection(self):
         def clear_pool(rows, tx_conn=None):
@@ -230,7 +230,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
         start.assert_not_called()
         ins.assert_not_called()
         self.assertNotIn("delete", self.events)
-        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self.assertNotIn(self.provider._lifecycle_key("atomic-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
         self._sync.start()
 
 

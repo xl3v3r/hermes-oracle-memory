@@ -146,8 +146,8 @@ class TestLifecycleScheduling(unittest.TestCase):
             for t in list(p._sync_threads):
                 t.join(5)
         self.assertEqual(calls, ["sk", "sk"])
-        self.assertNotIn("sk", p._in_flight_lifecycle_skills)
-        self.assertEqual(p._lifecycle_pending, {})
+        self.assertNotIn(p._lifecycle_key("sk"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
+        self.assertNotIn(p._lifecycle_key("sk"), oracle_plugin._LIFECYCLE_PENDING)
 
     def test_latest_event_wins(self):
         p, conn, cur = _provider()
@@ -198,7 +198,7 @@ class TestLifecycleScheduling(unittest.TestCase):
             for t in list(p._sync_threads):
                 t.join(5)
         self.assertEqual(calls, ["sk"])
-        self.assertNotIn("sk", p._in_flight_lifecycle_skills)
+        self.assertNotIn(p._lifecycle_key("sk"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
 
     def test_hash_unchanged_skips_write(self):
         p, conn, cur = _provider()
