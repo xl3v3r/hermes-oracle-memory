@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -70,6 +71,27 @@ class TestRuntimeLinkGuard(unittest.TestCase):
             self.assertTrue((Path(td) / "rel" / "f").is_file())
             self.assertTrue((Path(td) / "h").is_file())
 
+    def test_temp_dir_containing_home_refuses_every_link(self):
+        try:
+            import pwd
+
+            real_home = pwd.getpwuid(os.getuid()).pw_dir
+        except (ImportError, KeyError):
+            self.skipTest("no passwd entry")
+        with tempfile.TemporaryDirectory() as td:
+            with unittest.mock.patch("tempfile.gettempdir", return_value=os.path.dirname(real_home) or "/"):
+                with self.assertRaisesRegex(AssertionError, "contains the home"):
+                    guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
+
+    def test_pathlib_accessor_guarded_when_present(self):
+        import pathlib
+
+        acc = getattr(pathlib, "_normal_accessor", None)  # Python 3.10 keeps its own os.symlink / os.link
+        if acc is None:
+            self.skipTest("pathlib calls os.symlink / os.link directly")
+        self.assertTrue(getattr(acc.symlink, "_hom_link_guard", False))
+        self.assertTrue(getattr(acc.link, "_hom_link_guard", False))
+
     def test_check_is_exposed_for_helpers(self):
         with tempfile.TemporaryDirectory() as td:
             guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
@@ -97,6 +119,11 @@ class TestStaticLinkScan(unittest.TestCase):
             "os.sys" "tem('ln -s a b')\n",
             "os.symlink(a, b)\n",
             "p.symlink_to(q)\n",
+            "cmd = 'ln -fs a b'\n",
+            "cmd = 'ln --symbolic a b'\n",
+            "cmd = ['/bin/ln', '-s', a, b]\n",
+            "import os as o\no.symlink(a, b)\n",
+            "import os as o\no.link(a, b)\n",
         ):
             self.assertTrue(self._scan(src), src)
 
@@ -119,7 +146,13 @@ class TestStaticLinkScan(unittest.TestCase):
         self.assertEqual(self._scan(helper + "\nclass T:\n    pass\n"), [])
 
     def test_plain_code_clean(self):
-        self.assertEqual(self._scan("x = Path(a).read_text()\n"), [])
+        for src in (
+            "x = Path(a).read_text()\n",
+            "self.assertTrue(p.is_symlink())\n",
+            "os.unlink(p)\nos.readlink(p)\n",
+            "n = math.log(x)  # ln of x\n",
+        ):
+            self.assertEqual(self._scan(src), [], src)
 
 
 if __name__ == "__main__":

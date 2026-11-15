@@ -48,11 +48,36 @@ class TestForeignCopiesJudgedByProfileRoots(unittest.TestCase):
     def test_explicit_dirs_subset_replaces_copy_from_profiles_other_root(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
+            mine = _write_skill(home / ".hermes" / "skills", "demo", "demo", "Skills dir")
+            _write_skill(home / ".agents" / "skills", "demo", "demo", "Agents dir")
+            res, prov = _bulk(home, [str(home / ".agents" / "skills")], str(mine))
+        self.assertEqual(res["skipped_foreign"], 0)
+        self.assertEqual(res["updated"], 1)
+        prov._insert_many.assert_called_once()
+
+    def test_dirs_outside_defaults_keep_live_default_copy(self):
+        # A copy stored from the extra dir would be foreign to every later
+        # default sync and to the lifecycle hook, so the default copy stays.
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
             mine = _write_skill(home / ".hermes" / "skills", "demo", "demo", "Default root")
             _write_skill(home / "extra", "demo", "demo", "Extra root")
             res, prov = _bulk(home, [str(home / "extra")], str(mine))
-        self.assertEqual(res["skipped_foreign"], 0)
-        self.assertEqual(res["updated"], 1)
+            forced, prov2 = _bulk(home, [str(home / "extra")], str(mine), replace_foreign=True)
+        self.assertEqual(res["skipped_foreign"], 1)
+        self.assertIn("replace_foreign", res.get("hint", ""))
+        prov._insert_many.assert_not_called()
+        self.assertEqual((forced["skipped_foreign"], forced["updated"]), (0, 1))
+        prov2._insert_many.assert_called_once()
+
+    def test_dirs_outside_defaults_replace_gone_default_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / ".hermes" / "skills").mkdir(parents=True)
+            _write_skill(home / "extra", "demo", "demo", "Extra root")
+            gone = home / ".hermes" / "skills" / "demo" / "SKILL.md"
+            res, prov = _bulk(home, [str(home / "extra")], str(gone))
+        self.assertEqual((res["skipped_foreign"], res["updated"]), (0, 1))
         prov._insert_many.assert_called_once()
 
     def test_copy_from_removed_root_kept_with_hint(self):

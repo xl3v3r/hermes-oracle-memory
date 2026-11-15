@@ -987,8 +987,11 @@ def sync_skills_library(
 
     This host's copy whose stored SKILL.md still exists outside the profile's
     skill roots (its default roots plus *dirs*) is foreign: another profile
-    stored it, or it comes from a root no longer configured. It is kept and
-    reported in skipped_foreign / foreign_skills, unless *replace_foreign*."""
+    stored it, or it comes from a root no longer configured. So is a copy
+    stored from a live SKILL.md under the default roots when this run's file
+    lies outside them (a --dirs run must not take over a default skill). It
+    is kept and reported in skipped_foreign / foreign_skills, unless
+    *replace_foreign*."""
     target_provider_or_conn = provider if provider is not None else provider_or_conn
 
     # skills_or_mode: a skill list, or a positional mode string. The keyword
@@ -1064,6 +1067,7 @@ def sync_skills_library(
     # The profile's own roots (defaults plus *dirs*, so a run over a subset
     # still owns the copies it stored from the other roots).
     owner_roots = profile_skill_roots(dirs)
+    default_roots = resolve_skill_roots(None)
 
     if dry_run and not target_provider_or_conn:
         return {
@@ -1185,12 +1189,23 @@ def sync_skills_library(
                     # it, or it comes from a root no longer configured. Kept
                     # (not even force replaces it) unless replace_foreign.
                     foreign = [c for c in own if live_elsewhere(c.get("path"), skill.path, owner_roots)]
+                    if not foreign and dirs and not path_in_roots(skill.path, default_roots):
+                        # A --dirs run outside the default roots never replaces
+                        # a copy stored from a live SKILL.md under them: later
+                        # default runs and the lifecycle hook would treat this
+                        # run's copy as foreign.
+                        foreign = [
+                            c for c in own
+                            if is_live_skill_file(c.get("path")) and not same_file(c.get("path"), skill.path)
+                            and path_in_roots(c.get("path"), default_roots)
+                        ]
                     if foreign and not replace_foreign:
                         stats["skipped_foreign"] += 1
                         stats["foreign_skills"].append({"name": skill.name, "path": foreign[0].get("path")})
                         logger.warning(
-                            "skill '%s': this host's copy is stored from %s, which exists outside this "
-                            "profile's skill roots; not replacing it", skill.name, foreign[0].get("path"),
+                            "skill '%s': this host's copy is stored from %s, which still exists (another "
+                            "profile, a dir no longer configured, or a default dir this --dirs run does not "
+                            "scan); not replacing it", skill.name, foreign[0].get("path"),
                         )
                         continue
                     if foreign:
@@ -1333,9 +1348,10 @@ def sync_skills_library(
         stats["status"] = "partial"
     if stats["skipped_foreign"]:
         stats["hint"] = (
-            "Some of this host's copies are stored from SKILL.md files outside this profile's skill roots "
-            "(another profile, or a root no longer configured). Re-run with replace_foreign "
-            "(--replace-foreign on the command line) to replace them with this profile's copies."
+            "Some of this host's copies are stored from other SKILL.md files that still exist (another "
+            "profile, a dir no longer configured, or a default skill dir that this --dirs run does not scan); "
+            "see foreign_skills. Re-run with replace_foreign (--replace-foreign on the command line) to "
+            "replace them with the copies this run found."
         )
     return stats
 

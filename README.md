@@ -207,14 +207,14 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
 
 Follow-up release for #14 — full details in `RELEASE_NOTES_1.1.1.5.md`:
 
-- **Foreign skill copies**: ownership is judged against the profile's own skill dirs, so a sync over a `--dirs` subset updates the copies it stored from the other dirs; `replace_foreign` / `--replace-foreign` replaces a copy left from another profile or a removed root, and the sync result carries a hint when it skipped one.
+- **Foreign skill copies**: ownership is judged against the profile's own skill dirs, so a sync over a `--dirs` subset updates the copies it stored from the other dirs (a `--dirs` run outside the defaults never takes over a live default skill); `replace_foreign` / `--replace-foreign` replaces a copy left from another profile or a removed root, and the sync result carries a hint when it skipped one.
 - **Lifecycle lookup**: a link into `.archive/` is no longer a live skill; the lookup walks any depth and ends on link loops, like the bulk sync.
 - **Backfill**: no re-check or re-queue once shutdown has begun; a write whose per-row counts the driver cannot report is re-checked instead of dropped.
 - **Test suite**: a runtime guard refuses any link outside the temp dir; the source scan also catches aliased and shell links.
 
 ## What's new in v1.1.1.4
 
-Robustness release with per-host skill identity — full details in `RELEASE_NOTES_1.1.1.4.md`:
+Robustness release with per-host skill identity — full details in the `[1.1.1.4]` section of `CHANGELOG.md`:
 
 - **Per-host skill copies**: skill rows are `skill:{host}:{name}:cN`; a host only replaces or deletes its own copy, pruning is opt-in, and a dry-run-first migration (with a reverse step) relabels existing rows.
 - **Lifecycle hook off the caller's thread**: one writer per skill, coalesced events, profile-aware skill roots.

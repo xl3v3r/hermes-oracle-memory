@@ -2546,11 +2546,11 @@ _LINK_PATTERNS = (
     r"shutil\.copy",
     r"\bsymlink_to\(",
     r"\bhardlink_to\(",
-    r"\bos\.symlink\b",
-    r"\bos\.link\b",
+    r"\.symlink\b",  # os.symlink, or the call under a module alias
+    r"\.link\(",
     r"\bfrom\s+os\s+import\s+[^\n]*\b(?:symlink|link)\b",
-    r"\bln\s+-s",
-    r"""['"]ln['"]""",
+    r"\bln\s+(?:-[\w-]*\s+)*-(?:[a-zA-Z]*s[a-zA-Z]*|-symbolic)\b",  # ln -s, -fs, --symbolic
+    r"""['"/]ln['"]""",  # 'ln' or '/bin/ln' as an argv item
     r"shutil\.rmtree\(\s*(?:plugin_dir|dest)",
 )
 

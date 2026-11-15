@@ -67,10 +67,25 @@ import tempfile as _tempfile
 from pathlib import Path as _Path
 
 
+def _real_home():
+    try:
+        import pwd
+
+        return _Path(pwd.getpwuid(_os.getuid()).pw_dir).resolve()
+    except (ImportError, KeyError, AttributeError, OSError):
+        return None
+
+
 def check_link_paths(target, link, target_relative_to_link=True):
     """Raise AssertionError unless the link's directory and its target both
-    resolve inside tempfile.gettempdir()."""
+    resolve inside tempfile.gettempdir(), and that temp dir does not contain
+    the user's real home (where the installed plugin lives; HOME may be faked)."""
     tmp = _Path(_tempfile.gettempdir()).resolve()
+    home = _real_home()
+    if home is not None and home.is_relative_to(tmp):
+        raise AssertionError(
+            f"the temp dir {tmp} contains the home dir {home}; set TMPDIR to a dedicated directory"
+        )
     link_dir = _Path(_os.path.abspath(_os.fsdecode(link))).parent.resolve()
     tgt = _Path(_os.fsdecode(target))
     if not tgt.is_absolute():
@@ -102,6 +117,16 @@ def _install_link_guard():
     symlink._hom_link_guard = True  # type: ignore[attr-defined]
     link._hom_link_guard = True  # type: ignore[attr-defined]
     _os.symlink, _os.link = symlink, link
+    # Python 3.10's pathlib keeps its own references to os.symlink / os.link
+    # (Path.symlink_to / hardlink_to call them through _NormalAccessor).
+    import pathlib as _pathlib
+
+    accessor = getattr(_pathlib, "_NormalAccessor", None)
+    if accessor is not None:
+        if hasattr(accessor, "symlink"):
+            accessor.symlink = staticmethod(symlink)
+        if hasattr(accessor, "link"):
+            accessor.link = staticmethod(link)
 
 
 _install_link_guard()
