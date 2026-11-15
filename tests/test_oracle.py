@@ -895,7 +895,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.1.1.3")
+        self.assertEqual(oracle_plugin.__version__, "1.1.1.4")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -948,6 +948,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": ["Fact 1: server is Linux", "Fact 2: Python 3.12 active"],
@@ -957,13 +958,17 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("Batch facts stored (2)", data["result"])
         self.assertEqual(len(data["memory_ids"]), 2)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
 
     def test_oracle_add_batch_facts_via_content_list(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "content": ["Fact A", "Fact B", "Fact C"],
@@ -971,13 +976,17 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 3)
-        self.assertEqual(provider._insert.call_count, 3)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 3)
 
     def test_oracle_add_stringified_json_array(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": '["Fact X: parsed from JSON string", "Fact Y: JSON string"]',
@@ -985,26 +994,34 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
 
     def test_oracle_add_content_stringified_json_array(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "content": '["Fact Alpha", "Fact Beta"]',
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
 
     def test_oracle_add_dict_facts(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": [{"fact": "Dict fact 1"}, {"text": "Dict fact 2"}],
@@ -1012,11 +1029,15 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
         # Invalid target must normalize to "memory"
-        self.assertEqual(provider._insert.call_args_list[0][1]["target"], "memory")
-        self.assertEqual(provider._insert.call_args_list[0][1]["content"], "Dict fact 1")
-        self.assertEqual(provider._insert.call_args_list[1][1]["content"], "Dict fact 2")
+        rows = provider._insert_many.call_args[0][0]
+        self.assertEqual(rows[0]["target"], "memory")
+        self.assertEqual([r["content"] for r in rows], ["Dict fact 1", "Dict fact 2"])
+        self.assertEqual(data["memory_ids"], [r["memory_id"] for r in rows])
 
     def test_oracle_add_missing_content(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2371,45 +2392,57 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.1.1.3")
+        self.assertEqual(oracle_plugin.__version__, "1.1.1.4")
 
         # 2. VERSION
         version_file = repo_dir / "VERSION"
         self.assertTrue(version_file.is_file())
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.1.1.3")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.1.1.4")
 
         # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.1.3", plugin_yaml)
-        self.assertIn("version-1.1.1.3-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.1.1.4", plugin_yaml)
+        self.assertIn("version-1.1.1.4-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.1.1.3"', pyproject)
+        self.assertIn('version = "1.1.1.4"', pyproject)
 
         # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.1.3", skill_md)
+        self.assertIn("version: 1.1.1.4", skill_md)
 
         # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.1.1.3-blue.svg", readme)
-        self.assertIn("v1.1.1.3", readme)
+        self.assertIn("version-1.1.1.4-blue.svg", readme)
+        self.assertIn("v1.1.1.4", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.1.1.3-blue.svg", install_md)
-        self.assertIn("v1.1.1.3", install_md)
+        self.assertIn("version-1.1.1.4-blue.svg", install_md)
+        self.assertIn("v1.1.1.4", install_md)
+
+        # 6b. Agent docs carry the version too (they drifted until 1.1.1.4)
+        agents_md = (repo_dir / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("RELEASE_NOTES_1.1.1.4.md", agents_md)
+        self.assertIn("(1.1.1.4)", agents_md)
+        needs_md = (repo_dir / "NEEDS.md").read_text(encoding="utf-8")
+        self.assertIn("**Version in play:** 1.1.1.4", needs_md)
+        self.assertIn("tag `v1.1.1.4`", needs_md)
+        corpus_md = (repo_dir / "skills" / "oracle-skill-corpus" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("version: 1.1.1.4", corpus_md)
+        changelog = (repo_dir / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## [1.1.1.4]", changelog)
 
         # 7. Release notes policy (only current version maintained)
-        self.assertTrue((repo_dir / "RELEASE_NOTES_1.1.1.3.md").is_file())
-        for old_name in ["RELEASE_NOTES_1.1.1.2.md", "RELEASE_NOTES_1.1.1.md", "RELEASE_NOTES_1.1.0.1.md", "RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
+        self.assertTrue((repo_dir / "RELEASE_NOTES_1.1.1.4.md").is_file())
+        for old_name in ["RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.2.md", "RELEASE_NOTES_1.1.1.md", "RELEASE_NOTES_1.1.0.1.md", "RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
             # read-only: a test must never delete files from the checkout
             self.assertFalse((repo_dir / old_name).exists(), old_name)
 
-        # 8. Git tag v1.1.1.3 points to master commit if tag file exists
-        tag_file = repo_dir / ".git" / "refs" / "tags" / "v1.1.1.3"
+        # 8. Git tag v1.1.1.4 points to master commit if tag file exists
+        tag_file = repo_dir / ".git" / "refs" / "tags" / "v1.1.1.4"
         if tag_file.is_file():
             master_file = repo_dir / ".git" / "refs" / "heads" / "master"
             if master_file.is_file():
@@ -2428,7 +2461,7 @@ class TestOraclePlugin(unittest.TestCase):
                 self.assertTrue(
                     rev,
                     "install-metadata revision must not be empty")
-                expected = {"v1.1.1.3"}
+                expected = {"v1.1.1.4"}
                 installed = Path.home() / ".hermes" / "plugins" / "oracle"
                 if (installed / ".git").is_dir():
                     head = _subprocess_run(
@@ -2437,7 +2470,7 @@ class TestOraclePlugin(unittest.TestCase):
                     if head and len(head) == 40:
                         expected.add(head)
                 tag_git = _subprocess_run(
-                    ["git", "-C", str(repo_dir), "rev-parse", "v1.1.1.3^{commit}"],
+                    ["git", "-C", str(repo_dir), "rev-parse", "v1.1.1.4^{commit}"],
                     capture_output=True, text=True).stdout.strip()
                 if tag_git and len(tag_git) == 40:
                     expected.add(tag_git)
@@ -2495,7 +2528,16 @@ class TestOraclePlugin(unittest.TestCase):
         bad = []
         for f in tests_dir.glob("test_*.py"):
             src = f.read_text(encoding="utf-8")
-            for pat in (r"shutil\.copy", r"\.symlink_to\(", r"shutil\.rmtree\(\s*(?:plugin_dir|dest)"):
+            # A test may symlink only through a _link_in_tmp() helper that
+            # confines link and target to the temp dir.
+            helper = re.search(r"\ndef _link_in_tmp\(.*?(?=\n(?:def |class ))", src, flags=re.S)
+            if helper:
+                if "gettempdir()" not in helper.group(0) or "relative_to(tmp)" not in helper.group(0):
+                    bad.append(f"{f.name}: _link_in_tmp is not confined to the temp dir")
+                src = src.replace(helper.group(0), "")
+            for pat in (
+                r"shutil\.copy", r"\.symlink_to\(", r"os\.symlink\(", r"shutil\.rmtree\(\s*(?:plugin_dir|dest)"
+            ):
                 if re.search(pat, src) and f.name != Path(__file__).name:
                     bad.append(f"{f.name}: {pat}")
         own = Path(__file__).read_text(encoding="utf-8")

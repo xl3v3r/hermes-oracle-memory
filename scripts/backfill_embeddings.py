@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -33,19 +32,20 @@ _DEFAULT_BATCH_SIZE = 64
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/embeddings"
 
 
-def load_env() -> None:
-    """Load credentials and configurations from ~/.hermes/.env if present."""
-    env_file = Path.home() / ".hermes" / ".env"
-    if not env_file.exists():
+def load_env(env_file: str | None = None) -> None:
+    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
+    when the user passes --env-file. Otherwise the script reads the process
+    environment alone; values already set there win."""
+    if not env_file:
         return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
         line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        os.environ.setdefault(k, v)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def get_db_connection() -> Any:
@@ -230,12 +230,13 @@ def run_backfill(
     dimensions: int = _DEFAULT_DIM,
     onnx_model: str | None = None,
     workers: int = 1,
+    env_file: str | None = None,
 ) -> int:
     """Execute the backfill process."""
-    load_env()
+    load_env(env_file)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY not found in environment or ~/.hermes/.env")
+        raise RuntimeError("OPENROUTER_API_KEY not found in the environment (or the --env-file)")
 
     # Sanitize the ONNX model identifier before it is interpolated into SQL in
     # process_batch(). It originates from a CLI flag / environment variable and
@@ -517,6 +518,7 @@ def main() -> None:
             "instead - it is ONNX-only, serial-safe, and resumable."
         ),
     )
+    parser.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
     args = parser.parse_args()
 
     if not args.i_know_this_uses_external_embeddings:
@@ -542,6 +544,7 @@ def main() -> None:
         dimensions=args.dimensions,
         onnx_model=args.onnx_model,
         workers=args.workers,
+        env_file=args.env_file,
     )
 
 

@@ -4,21 +4,11 @@
 import json
 import logging
 import os
-import sys
 import time
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("setup_onnx")
-
-# Load ~/.hermes/.env
-env_file = Path.home() / ".hermes" / ".env"
-if env_file.exists():
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 from onnx2oracle.presets import ModelSpec
 from onnx2oracle.pipeline import build_augmented
@@ -26,6 +16,22 @@ import oracledb
 
 MODEL_NAME = "BGE_BASE_EN_V1_5"
 FILE_NAME = "bge_base_en_v1_5.onnx"
+
+def load_env(env_file: str | None = None) -> None:
+    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
+    when the user passes --env-file. Otherwise the script reads the process
+    environment alone; values already set there win."""
+    if not env_file:
+        return
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
 
 def main():
     spec = ModelSpec(
@@ -165,4 +171,9 @@ def main():
     conn.close()
 
 if __name__ == "__main__":
+    import argparse
+
+    _ap = argparse.ArgumentParser(description=__doc__)
+    _ap.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
+    load_env(_ap.parse_args().env_file)
     main()

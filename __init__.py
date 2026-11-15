@@ -33,7 +33,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.1.3"
+__version__ = "1.1.1.4"
 
 VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -115,17 +115,28 @@ _SESSION_ERROR_MARKERS = (
     "ORA-02396", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12537",
     "ORA-12541", "ORA-25408",
     "DPI-1067", "DPI-1040", "DPY-4005", "DPY-4011", "DPY-4024", "DPY-1001", "DPY-1002",
-    "timed out", "timeout",
 )
 _ORA_CODE_RE = re.compile(r"\bORA-\d{5}\b")
 
 # Client/pool timeouts: the caller's budget is already spent, so never retry.
-# (DPI-1040 / DPY-4005 = pool wait exceeded; DPI-1067 / DPY-4024 = call timeout.)
-_TIMEOUT_MARKERS = ("timed out", "timeout", "DPI-1040", "DPI-1067", "DPY-4005", "DPY-4024")
+# (DPI-1040 / DPY-4005 = pool wait exceeded; DPI-1067 / DPY-4024 = call timeout;
+# ORA-01013 = the server cancelled the call, which is how a call timeout ends.)
+_TIMEOUT_MARKERS = ("DPI-1040", "DPI-1067", "DPY-4005", "DPY-4024", "ORA-01013")
+_TIMEOUT_PHRASE_RE = re.compile(r"\b(?:timed out|time ?out)\b", re.IGNORECASE)
 
 
 def _is_timeout_error(err: Any) -> bool:
-    return isinstance(err, TimeoutError) or any(m in str(err) for m in _TIMEOUT_MARKERS)
+    """A client/pool/call timeout. The bare words "timeout"/"timed out" count only
+    in messages without an ORA- code (Python and driver errors): an unrelated
+    server error that merely mentions a timeout (e.g. ORA-12170 "TNS:Connect
+    timeout", ORA-04021 "timeout occurred while waiting to lock object") is not
+    a search timeout and must keep its own handling."""
+    if isinstance(err, TimeoutError):
+        return True
+    s = str(err)
+    if any(m in s for m in _TIMEOUT_MARKERS):
+        return True
+    return not _ORA_CODE_RE.search(s) and bool(_TIMEOUT_PHRASE_RE.search(s))
 
 # Row/data/constraint errors: the statement was wrong for this row (duplicate
 # caller-chosen memory_id, value too large, bad JSON), not the ONNX model.
@@ -137,13 +148,27 @@ _DATA_ERROR_MARKERS = (
     "ORA-02290", "ORA-02291", "ORA-02292",  # check / FK constraints
     "ORA-12899",  # value too large for column
     "ORA-40441",  # JSON syntax error
+    "ORA-00060",  # deadlock detected: lock contention (e.g. bulk sync vs. lifecycle upsert)
 )
+
+
+class _TxAborted(RuntimeError):
+    """The caller's transaction (``tx_conn``) can no longer be used: the session
+    broke, or ROLLBACK TO SAVEPOINT itself failed. Never retried on that
+    connection, never answered with a NULL-embedding fallback there, and never
+    a reason for the ONNX cooldown. The caller rolls the whole transaction back."""
+
+
+class _PolicyError(RuntimeError):
+    """Raised by this plugin's own checks before any SQL runs (for example "the
+    embedding model is not configured"). Says nothing about the connection, so
+    _acquire_checked() must not drop a healthy pooled session for it."""
 
 
 def _is_session_error(err: Any) -> bool:
     """True when *err* indicates a bad connection/session or client timeout."""
     s = str(err)
-    return isinstance(err, TimeoutError) or any(m in s for m in _SESSION_ERROR_MARKERS)
+    return _is_timeout_error(err) or any(m in s for m in _SESSION_ERROR_MARKERS)
 
 
 def _is_onnx_model_failure(err: Any) -> bool:
@@ -202,10 +227,30 @@ def _close_pool_when_idle(pool: Any, budget: float | None = None, poll: float = 
             if not _is_pool_busy_error(e):
                 logger.debug("oracle deferred pool close: %s", e)
                 return
+    logger.info("oracle deferred pool close: connections still borrowed after %.0fs; forcing close", budget)
     try:
         pool.close(force=True)
     except Exception as e:
         logger.warning("oracle deferred pool close (forced) failed: %s", e)
+
+
+def _retire_pool(pool: Any, reason: str) -> None:
+    """Close a pool this provider no longer uses. A non-forced close fails while
+    connections are borrowed (DPY-1005); then close it in the background once
+    they come back, exactly like the normal teardown path."""
+    if pool is None:
+        return
+    try:
+        pool.close()
+        logger.info("oracle: closed %s pool", reason)
+    except Exception as e:
+        if not _is_pool_busy_error(e):
+            logger.debug("oracle %s pool close: %s", reason, e)
+            return
+        logger.info("oracle %s pool close deferred until busy connections return: %s", reason, e)
+        threading.Thread(
+            target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
+        ).start()
 
 
 _RESERVED_SESSION_IDS = frozenset({"skills", "none", "null"})
@@ -309,6 +354,26 @@ def _sync_skills_module() -> Any:
         return mod
 
 
+# Skill names as stored in ids (skill:<host>:<name>:c<N>) and accepted from hooks/tools.
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _stored_file_exists(stored_path: Any) -> bool:
+    if not stored_path:
+        return False
+    try:
+        return Path(str(stored_path)).is_file()
+    except OSError:
+        return False
+
+# Lifecycle writer bookkeeping is per process, keyed by (pool fingerprint,
+# table, skill): events reach whichever provider serves the session, and two
+# instances must never run two writers for one skill at the same time (#6).
+_LIFECYCLE_LOCK = threading.Lock()
+_LIFECYCLE_IN_FLIGHT: set[tuple[str, str, str]] = set()
+_LIFECYCLE_PENDING: dict[tuple[str, str, str], tuple[Any, str, list[Path]]] = {}
+
+
 def _skill_md_matches(root: Path, skill_name: str) -> list[Path]:
     """<root>/*/<skill_name>/SKILL.md, ignoring hidden trees such as .archive/
     (Hermes moves archived skills there before emitting 'archived')."""
@@ -332,6 +397,18 @@ def _skill_md_matches(root: Path, skill_name: str) -> list[Path]:
 _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/\-]{0,127}$")
 _MAX_TAGS = 32
 _MAX_TAG_LEN = 64
+# Tool-surface bounds (1.1.1.4). One oracle_add call stores at most
+# _ADD_MAX_FACTS facts of at most _MAX_FACT_CHARS characters each (longer text
+# belongs in oracle_chunk); oracle_search returns at most
+# _SEARCH_CONTENT_MAX_CHARS characters of each row (oracle_get has the rest).
+_ADD_MAX_FACTS = 100
+_MAX_FACT_CHARS = 32000
+_SEARCH_CONTENT_MAX_CHARS = 4000
+# DBMS_VECTOR.UTL_TO_CHUNKS by words accepts max 10..1000 (ORA-30584 outside).
+_CHUNK_MIN_WORDS = 10
+_CHUNK_MAX_WORDS = 1000
+# Skill-corpus ids are owned by the skill sync; the generic tools refuse them.
+_SKILL_ID_PREFIX = "skill:"
 _GET_DEFAULT_LIMIT = 20
 _GET_MAX_LIMIT = 100
 
@@ -417,7 +494,9 @@ def _tag_filter_sql(tags: Any, match: str = "all", prefix: str = "tg") -> tuple[
     on existing installs) would otherwise answer the predicate, and that index
     syncs asynchronously -- a handoff row written and read back within ~2 s was
     not found. Wrapping the column makes Oracle evaluate the tags on the rows
-    themselves (read-your-writes)."""
+    themselves (read-your-writes). Matching is case-insensitive: the query tags
+    are lower-cased by _normalize_tags and the stored ones by @.lower(), so rows
+    written by other tools with mixed-case tags still match."""
     norm = _normalize_tags(tags)
     if not norm:
         return "", {}
@@ -427,7 +506,7 @@ def _tag_filter_sql(tags: Any, match: str = "all", prefix: str = "tg") -> tuple[
         name = f"{prefix}{i}"
         binds[name] = tag
         preds.append(
-            f"JSON_EXISTS(JSON_QUERY(metadata, '$.tags' RETURNING JSON), '$[*]?(@ == ${name})' "
+            f"JSON_EXISTS(JSON_QUERY(metadata, '$.tags' RETURNING JSON), '$[*]?(@.lower() == ${name})' "
             f"PASSING :{name} AS \"{name}\")"
         )
     joiner = " OR " if str(match or "all").lower() == "any" else " AND "
@@ -444,6 +523,21 @@ def _lob_text(value: Any) -> str:
     return str(value)
 
 
+def _execute_lobs_as_str(cur: Any, sql: str, binds: Any) -> None:
+    """Execute a query with CLOB columns fetched as str in the same round trip
+    (fetch_lobs=False). Fetching locators costs one more round trip per row
+    for every LOB value read. The value is not truncated (checked with a
+    96 KB CLOB on python-oracledb 26.1 thin). Every caller of one SQL text must
+    use the same setting: a connection's statement cache keeps the first
+    execution's column types for identical SQL."""
+    try:
+        cur.execute(sql, binds, fetch_lobs=False)
+    except TypeError as e:
+        if "fetch_lobs" not in str(e):
+            raise
+        cur.execute(sql, binds)  # driver without the per-execute option
+
+
 def _metadata_dict(value: Any) -> dict:
     if value is None:
         return {}
@@ -457,6 +551,66 @@ def _metadata_dict(value: Any) -> dict:
         except Exception:
             return {}
     return dict(value) if isinstance(value, dict) else {}
+
+
+_SKILL_ROW_READONLY = (
+    "skill-corpus rows (role='skill') are written by oracle_sync_skills and the skill "
+    "lifecycle hook; edit the SKILL.md and re-sync instead"
+)
+
+
+def _search_tool_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """oracle_search result: each row's content is cut to
+    _SEARCH_CONTENT_MAX_CHARS (flagged, with its full length) and internal
+    ranking fields are dropped."""
+    out_rows = []
+    cut = False
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        item = {k: v for k, v in r.items() if k not in ("dist",)}
+        body = item.get("content")
+        if isinstance(body, str) and len(body) > _SEARCH_CONTENT_MAX_CHARS:
+            item["content"] = body[:_SEARCH_CONTENT_MAX_CHARS]
+            item["content_truncated"] = True
+            item["content_chars"] = len(body)
+            cut = True
+        out_rows.append(item)
+    payload: dict[str, Any] = {"results": out_rows, "count": len(out_rows)}
+    if cut:
+        payload["note"] = "Some contents were cut; oracle_get(memory_id=...) returns the full text."
+    return payload
+
+
+def _chunk_params(max_words: Any, overlap: Any) -> tuple[int, int]:
+    """Validate oracle_chunk sizes: max_words 10..1000 (the UTL_TO_CHUNKS range)
+    and 0 <= overlap <= max_words / 2. Raises ValueError."""
+    try:
+        mw = 80 if max_words in (None, "") else int(max_words)
+        ov = 10 if overlap in (None, "") else int(overlap)
+    except (TypeError, ValueError):
+        raise ValueError("max_words and overlap must be integers") from None
+    if not _CHUNK_MIN_WORDS <= mw <= _CHUNK_MAX_WORDS:
+        raise ValueError(f"max_words must be between {_CHUNK_MIN_WORDS} and {_CHUNK_MAX_WORDS} (got {mw})")
+    if not 0 <= ov <= mw // 2:
+        raise ValueError(f"overlap must be between 0 and max_words/2 = {mw // 2} (got {ov})")
+    return mw, ov
+
+
+def _metadata_tags(value: Any) -> list[str]:
+    """Tags projected as JSON_QUERY(metadata, '$.tags') text (or a list)."""
+    if value is None:
+        return []
+    if hasattr(value, "read"):
+        value = value.read()
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return [str(t) for t in value if isinstance(t, (str, int, float))] if isinstance(value, list) else []
 
 
 class _CallTimeoutPool:
@@ -484,6 +638,20 @@ class _CallTimeoutPool:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._p, name)
 _FETCH_ARRAYSIZE = 64
+# Hybrid search: a row found only by Oracle Text scores 0.3 x its text score
+# (vector hits score 0.7 x similarity), on the fused path and on the
+# cooldown / degraded text-only paths alike.
+_HYBRID_TEXT_WEIGHT = 0.3
+# Embedding backfill (rows written with a NULL embedding during an ONNX cooldown
+# or a transient error). Failed batches back off exponentially; a row is dropped
+# from the in-memory queue after _BACKFILL_MAX_ATTEMPTS (it keeps its NULL
+# embedding in the table and is picked up again by the startup re-queue scan).
+_BACKFILL_BASE_DELAY_SECS = 2.0
+_BACKFILL_MAX_DELAY_SECS = 300.0
+_BACKFILL_MAX_ATTEMPTS = 8
+_BACKFILL_STARTUP_LIMIT = 500
+_BACKFILL_SCANNED: set[str] = set()  # pool fingerprints already scanned in this process
+_BACKFILL_SCANNED_LOCK = threading.Lock()
 _EMBED_TIMEOUT_SECS = 10.0
 # --- Timeouts (1.1.1.3) -------------------------------------------------------
 # Read-path budget for one recall query (oracle_search / prefetch / oracle_get).
@@ -694,7 +862,7 @@ TOOL_SCHEMAS = [
                 "facts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional list of facts to store in batch.",
+                    "description": "Optional list of facts to store in batch (max 100 facts of 32,000 chars each; all or none are stored).",
                 },
                 "target": {
                     "type": "string",
@@ -794,18 +962,23 @@ TOOL_SCHEMAS = [
                 },
                 "max_words": {
                     "type": "integer",
-                    "description": "Chunk size in words (default 80).",
+                    "description": "Chunk size in words, 10-1000 (default 80).",
                 },
                 "overlap": {
                     "type": "integer",
-                    "description": "Word overlap (default 10).",
+                    "description": "Word overlap, 0 to max_words/2 (default 10).",
                 },
             },
         },
     },
     {
         "name": "oracle_sync_skills",
-        "description": "Scan and index all local skills (~/.agents/skills and ~/.hermes/skills) into Oracle 26ai vector memory for semantic search and discovery.",
+        "description": (
+            "Scan and index this host's skills (the active profile's skills dir and ~/.agents/skills) into "
+            "Oracle 26ai vector memory. Rows are stored under this host's identity; each changed skill is "
+            "replaced in one transaction. prune=true also removes this host's skills that are no longer on "
+            "disk (never other hosts' copies or the shared corpus); use dry_run=true to preview."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -827,6 +1000,18 @@ TOOL_SCHEMAS = [
                     "type": "integer",
                     "description": "Batch size for inserting rows into Oracle (default 50).",
                 },
+                "prune": {
+                    "type": "boolean",
+                    "description": "Also delete this host's skills that are no longer under the scanned dirs. Default false.",
+                },
+                "prune_limit": {
+                    "type": "integer",
+                    "description": "Maximum skills to prune in one call (1-500, default 100).",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Report what would be indexed/pruned without writing. Default false.",
+                },
             },
         },
     },
@@ -843,6 +1028,18 @@ TOOL_SCHEMAS = [
             "properties": {
                 "action": {"type": "string", "enum": ["fetch", "list"], "default": "fetch"},
                 "skill": {"type": "string", "description": "Skill name (exact, from list). Required for action=fetch."},
+                "path": {
+                    "type": "string",
+                    "description": "action=fetch only: source path of one copy, when the skill exists in several (from the variants list).",
+                },
+                "variant": {
+                    "type": "integer",
+                    "description": "action=fetch only: variant number from the variants list, when the skill exists in several copies.",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "action=fetch only: host of one copy (from the variants list), with or instead of 'path'.",
+                },
                 "filter": {"type": "string", "description": "action=list only: substring match on name/description."},
                 "offset": {"type": "integer", "description": "action=list only: pagination offset (default 0)."},
             },
@@ -907,14 +1104,21 @@ def _extract_skill_description(content: str, skill_name: str = "") -> str:
 
 
 def get_host_id() -> str:
-    """Return local host identifier for skill tagging and pruning."""
-    host_id = os.environ.get("HERMES_HOST_ID") or os.environ.get("HOSTNAME") or ""
+    """This host's identity in skill-corpus ids (skill:<host>:<name>:c<N>).
+    HERMES_HOST_ID when set; otherwise the short host name, lower-cased (a
+    shell's HOSTNAME may be the FQDN while a systemd service sees none, and
+    both must give the same id). Keep identical to scripts/sync_skills.py."""
+    host_id = (os.environ.get("HERMES_HOST_ID") or "").strip()
     if not host_id:
-        try:
-            import socket
-            host_id = socket.gethostname().split(".")[0]
-        except Exception:
-            host_id = "hermes"
+        host_id = (os.environ.get("HOSTNAME") or "").strip()
+        if not host_id:
+            try:
+                import socket
+
+                host_id = socket.gethostname()
+            except Exception:
+                host_id = ""
+        host_id = host_id.split(".")[0].lower()
     return re.sub(r"[^a-zA-Z0-9._-]", "", host_id) or "hermes"
 
 _PROMPT_BODY = (
@@ -1032,7 +1236,10 @@ class OracleMemoryProvider(MemoryProvider):
         self._embed_cache: OrderedDict[str, tuple[array.array, str | None]] = OrderedDict()
         self._embed_cache_lock = threading.Lock()
         self._embed_pending: deque[tuple[str, str]] = deque()
+        self._embed_attempts: dict[str, int] = {}
         self._embed_worker: threading.Thread | None = None
+        self._backfill_scan_thread: threading.Thread | None = None
+        self._pool_lock = threading.RLock()
         self._oci_embed_failed_at: float | None = None
         self._oci_client: Any | None = None
         self._oci_signer: Any | None = None
@@ -1050,8 +1257,8 @@ class OracleMemoryProvider(MemoryProvider):
         self._last_write_at: str | None = None
         self._last_restart_seen: float | None = None
         self._bg_drop_warned = False
-        self._in_flight_lifecycle_skills: set[str] = set()
-        self._lifecycle_lock = threading.Lock()
+        # Lifecycle writers are tracked per process (module-level
+        # _LIFECYCLE_* maps, keyed by _lifecycle_key), not per instance.
         self._sync_threads: list[threading.Thread] = []
         self._sync_threads_lock = threading.Lock()
         self._table = "hermes_agent_memory"
@@ -1208,6 +1415,15 @@ class OracleMemoryProvider(MemoryProvider):
             f":ct={pool_call_timeout}:wt={pool_wait_ms}:it={pool_idle_s}"
         )
 
+        with self._pool_lock:
+            self._initialize_pool_locked(password, current_fingerprint, pool_call_timeout, pool_wait_ms, pool_idle_s)
+
+    def _initialize_pool_locked(
+        self, password: str, current_fingerprint: str, pool_call_timeout: int, pool_wait_ms: int, pool_idle_s: int
+    ) -> None:
+        """Reuse, or (re)build, the session pool. Runs under _pool_lock so a
+        deferred teardown (_finish_shutdown_when_idle) cannot close a pool that
+        this call is re-arming, and a rebuild always retires the pool it replaces."""
         # Idempotent initialization: reuse existing pool if configuration matches
         if self._pool is not None and self._initialized and self._pool_fingerprint == current_fingerprint:
             # Re-arm after a "busy" shutdown(), which returns early with the pool
@@ -1217,6 +1433,9 @@ class OracleMemoryProvider(MemoryProvider):
             logger.debug("Oracle memory pool already initialized with matching config; reusing pool.")
             return
 
+        # A changed fingerprint (credentials, DSN, table or timeouts) replaces the
+        # pool; the old one is closed below instead of being left open.
+        old_pool: Any = self._pool
         new_pool: Any = None
         try:
             import oracledb
@@ -1308,6 +1527,10 @@ class OracleMemoryProvider(MemoryProvider):
             _register_live_provider(self)
             self._init_error = ""
             logger.info("Oracle 26ai memory pool ready (session=%s)", self._session_id)
+            if old_pool is not None and old_pool is not new_pool:
+                _retire_pool(old_pool, "replaced")
+                old_pool = None
+            self._start_backfill_scan()
         except Exception as e:
             err_msg = str(e)
             if password and password in err_msg:
@@ -1326,6 +1549,10 @@ class OracleMemoryProvider(MemoryProvider):
                     new_pool.close(force=True)
                 except Exception as close_e:
                     logger.debug("oracle pool close after failed init: %s", close_e)
+            if old_pool is not None and old_pool is not new_pool:
+                # The provider is unusable until the next successful initialize;
+                # never leak the previous configuration's sessions meanwhile.
+                _retire_pool(old_pool, "replaced")
 
     def _ensure_schema(self) -> None:
         if not self._pool:
@@ -1448,6 +1675,13 @@ class OracleMemoryProvider(MemoryProvider):
         return failed_at is not None and (
             time.monotonic() - failed_at < _ONNX_RETRY_AFTER_SECS
         )
+
+    def _onnx_cooldown_remaining(self) -> float:
+        with self._embed_lock:
+            failed_at = self._onnx_failed_at
+        if failed_at is None:
+            return 0.0
+        return max(0.0, _ONNX_RETRY_AFTER_SECS - (time.monotonic() - failed_at))
 
     def _onnx_mark_failed(self, err: Any = None) -> None:
         if not _is_onnx_model_failure(err):
@@ -1682,22 +1916,37 @@ class OracleMemoryProvider(MemoryProvider):
         Writes stay off the network. Text CONTAINS is live immediately; the
         vector index catches up in batches of _EMBED_BATCH.
         """
-        if not content:
+        if not content or not memory_id:
             return
         with self._embed_lock:
-            self._embed_pending.append((memory_id, content))
-            need_worker = (
-                self._embed_worker is None or not self._embed_worker.is_alive()
-            )
-        if need_worker:
+            # One pending entry per row, carrying the latest content: a row
+            # updated twice before its backfill must be embedded from the
+            # newer text, not the first one queued.
+            for i, (mid, _) in enumerate(self._embed_pending):
+                if mid == memory_id:
+                    self._embed_pending[i] = (memory_id, content)
+                    break
+            else:
+                self._embed_pending.append((memory_id, content))
+        self._ensure_embed_worker()
+
+    def _ensure_embed_worker(self) -> threading.Thread | None:
+        """Start the backfill worker when rows are pending and none is running.
+        The check and the start happen under _embed_lock, so two callers can
+        never start two workers."""
+        with self._embed_lock:
+            if not self._embed_pending:
+                return self._embed_worker
+            if self._embed_worker is not None and self._embed_worker.is_alive():
+                return self._embed_worker
             t = threading.Thread(
                 target=self._embed_worker_loop,
                 daemon=True,
                 name="oracle-embed-backfill",
             )
-            with self._embed_lock:
-                self._embed_worker = t
+            self._embed_worker = t
             t.start()
+            return t
 
     def _queue_background_insert(
         self,
@@ -1775,50 +2024,243 @@ class OracleMemoryProvider(MemoryProvider):
             finally:
                 self._write_queue.task_done()
 
+    # Text up to this many UTF-8 bytes is bound as a plain string (it converts
+    # to CLOB in DBMS_LOB.COMPARE on any database); longer text goes in as a
+    # temporary CLOB, since a string bind over 32,767 bytes fails in SQL
+    # (ORA-01460) even with a CLOB input size.
+    _BACKFILL_STR_BIND_MAX_BYTES = 4000
+
+    def _backfill_write(self, conn: Any, todo: list[tuple[Any, Any, str, str]]) -> list[str]:
+        """Write the vectors in *todo* ((vec, model, memory_id, text) tuples) and
+        return the ids whose UPDATE matched no row. The vector is written only
+        for the text it was computed from, and only while the row still has
+        none: a row updated meanwhile (here or on another host) keeps its newer
+        content's embedding."""
+        import oracledb
+
+        sql = (
+            f"UPDATE /*+ NO_PARALLEL */ {self._table} SET embedding = :1, "
+            "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
+            "WHERE memory_id = :3 AND embedding IS NULL "
+            "AND DBMS_LOB.COMPARE(content, :4) = 0"
+        )  # nosec B608
+        limit = self._BACKFILL_STR_BIND_MAX_BYTES
+        small = [t for t in todo if len(t[3].encode("utf-8")) <= limit]
+        big = [t for t in todo if len(t[3].encode("utf-8")) > limit]
+        unmatched: list[str] = []
+        for group in (small, big):
+            if not group:
+                continue
+            if group is big:
+                binds: list[tuple[Any, ...]] = [
+                    (vec, model, mid, conn.createlob(oracledb.DB_TYPE_CLOB, text)) for vec, model, mid, text in group
+                ]
+            else:
+                binds = [tuple(t) for t in group]
+            with conn.cursor() as cur:
+                cur.executemany(sql, binds, arraydmlrowcounts=True)
+                try:
+                    counts = list(cur.getarraydmlrowcounts())
+                except Exception:
+                    counts = []
+            # Drop the temporary LOBs now: the driver frees them on the
+            # connection's next round trip (the commit).
+            del binds
+            if len(counts) == len(group):
+                unmatched.extend(t[2] for t, c in zip(group, counts) if not c)
+        return unmatched
+
+    def _backfill_reread(self, conn: Any, mids: list[str]) -> dict[str, str]:
+        """Current text of the rows among *mids* that still have no embedding."""
+        out: dict[str, str] = {}
+        for i in range(0, len(mids), 100):
+            part = mids[i : i + 100]
+            marks = ", ".join(f":{n + 1}" for n in range(len(part)))
+            with conn.cursor() as cur:
+                _execute_lobs_as_str(
+                    cur,
+                    f"SELECT memory_id, content FROM {self._table} "  # nosec B608
+                    f"WHERE memory_id IN ({marks}) AND embedding IS NULL",
+                    part,
+                )
+                for mid, content in cur.fetchall() or []:
+                    text = _lob_text(content) if not isinstance(content, str) else content
+                    if mid and text:
+                        out[str(mid)] = text
+        return out
+
     def _embed_worker_loop(self) -> None:
+        """Embed queued NULL-embedding rows in batches.
+
+        A failed batch is re-queued with exponential backoff
+        (_BACKFILL_BASE_DELAY_SECS doubling up to _BACKFILL_MAX_DELAY_SECS); a
+        row that failed _BACKFILL_MAX_ATTEMPTS times leaves the in-memory queue
+        (it keeps its NULL embedding and the next startup re-queues it). During
+        an ONNX cooldown the worker waits for the cooldown to end instead of
+        burning attempts. After shutdown() has begun each pending batch gets one
+        attempt (no backoff), so teardown drains what it can within its join
+        budget; nothing is written to local files."""
+        fails = 0
         while True:
             with self._embed_lock:
                 if not self._embed_pending:
-                    self._embed_worker = None
+                    if self._embed_worker is threading.current_thread():
+                        self._embed_worker = None
                     return
-                batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
-            if not self._pool:
-                # Provider torn down while a batch was pending; stop cleanly.
-                self._embed_worker = None
-                return
+                stopping = self._write_stop.is_set()
+                cooling = self._onnx_failed_at is not None and (
+                    time.monotonic() - self._onnx_failed_at < _ONNX_RETRY_AFTER_SECS
+                )
+                if self._pool is None or (stopping and cooling):
+                    left = len(self._embed_pending)
+                    self._embed_pending.clear()
+                    self._embed_attempts.clear()
+                    if self._embed_worker is threading.current_thread():
+                        self._embed_worker = None
+                    logger.info(
+                        "embed backfill: %d row(s) keep NULL embeddings (%s); the next startup re-queues them",
+                        left,
+                        "provider shut down" if self._pool is None else "ONNX cooldown at shutdown",
+                    )
+                    return
+                batch: list[tuple[str, str]] = []
+                if not cooling:
+                    batch = [self._embed_pending.popleft() for _ in range(min(_EMBED_BATCH, len(self._embed_pending)))]
+            if cooling:
+                self._write_stop.wait(self._onnx_cooldown_remaining() + 0.5)
+                continue
+            pool = self._pool
             done: set[str] = set()
+            requeued: set[str] = set()  # unmatched rows queued again with their stored text
             try:
+                if pool is None:
+                    raise RuntimeError("pool not initialized")
                 tagged = self._embed_many_tagged([c for _, c in batch])
-                binds = [
-                    (vec, model, mid)
-                    for (mid, _), (vec, model) in zip(batch, tagged)
+                todo = [
+                    (vec, model, mid, text)
+                    for (mid, text), (vec, model) in zip(batch, tagged)
                     if vec is not None
                 ]
-                if binds:
-                    with self._pool.acquire() as conn:
-                        with conn.cursor() as cur:
-                            # Bulk update embeddings in a single round-trip,
-                            # stamping provenance alongside the vector.
-                            sql = (
-                                f"UPDATE /*+ NO_PARALLEL */ {self._table} SET embedding = :1, "
-                                "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
-                                "WHERE memory_id = :3"
-                            )  # nosec B608
-                            cur.executemany(sql, binds)
+                if todo:
+                    with pool.acquire() as conn:
+                        unmatched = self._backfill_write(conn, todo)
                         conn.commit()
-                done = {mid for _, _, mid in binds}
+                        # Rows whose text did not match: done if they got an
+                        # embedding meanwhile or are gone; otherwise re-queued
+                        # once more with the text the database holds now.
+                        reread = self._backfill_reread(conn, unmatched) if unmatched else {}
+                    for mid, text in reread.items():
+                        with self._embed_lock:
+                            if any(m == mid for m, _ in self._embed_pending):
+                                continue  # a newer write already queued it
+                            n = self._embed_attempts.get(mid, 0) + 1
+                            if n >= _BACKFILL_MAX_ATTEMPTS:
+                                self._embed_attempts.pop(mid, None)
+                                logger.warning(
+                                    "embed backfill: %s never matched its stored text; it keeps a NULL "
+                                    "embedding until the next startup", mid,
+                                )
+                                continue
+                            self._embed_attempts[mid] = n
+                            self._embed_pending.append((mid, text))
+                            requeued.add(mid)
+                    if unmatched:
+                        logger.info(
+                            "embed backfill: %d row(s) changed or embedded meanwhile; %d re-queued with their "
+                            "stored text", len(unmatched), len(reread),
+                        )
+                done = {mid for _, _, mid, _ in todo}
             except Exception as e:
                 logger.warning("embed backfill batch failed: %s", e)
             remaining = [item for item in batch if item[0] not in done]
-            if remaining and not self._write_stop.is_set():
+            dropped = 0
+            keep: list[tuple[str, str]] = []
+            with self._embed_lock:
+                for mid in done - requeued:
+                    self._embed_attempts.pop(mid, None)
+                stopping = self._write_stop.is_set()
+                for mid, content in remaining:
+                    n = self._embed_attempts.get(mid, 0) + 1
+                    if stopping or n >= _BACKFILL_MAX_ATTEMPTS:
+                        self._embed_attempts.pop(mid, None)
+                        dropped += 1
+                    else:
+                        self._embed_attempts[mid] = n
+                        keep.append((mid, content))
+                self._embed_pending.extendleft(reversed(keep))
+            if dropped:
                 logger.warning(
-                    "embed backfill: %d/%d rows still missing embeddings; re-queueing",
-                    len(remaining),
-                    len(batch),
+                    "embed backfill: %d row(s) left with NULL embeddings after %s; the next startup re-queues them",
+                    dropped,
+                    "shutdown" if stopping else f"{_BACKFILL_MAX_ATTEMPTS} attempts",
                 )
-                time.sleep(2.0)
-                with self._embed_lock:
-                    self._embed_pending.extendleft(reversed(remaining))
+            if not remaining:
+                fails = 0
+                continue
+            fails += 1
+            if keep:
+                delay = min(_BACKFILL_BASE_DELAY_SECS * (2 ** (fails - 1)), _BACKFILL_MAX_DELAY_SECS)
+                logger.warning(
+                    "embed backfill: %d/%d rows still missing embeddings; retrying in %.0fs",
+                    len(keep),
+                    len(batch),
+                    delay,
+                )
+                self._write_stop.wait(delay)
+
+    def _requeue_null_embeddings(self, limit: int = _BACKFILL_STARTUP_LIMIT) -> int:
+        """Queue rows that still have a NULL embedding (left by a cooldown, a
+        transient error or a shutdown that could not drain the backfill).
+        Read-only apart from the backfill UPDATEs it schedules. Returns the
+        number of rows queued."""
+        pool = self._pool
+        if pool is None or not self._onnx_model:
+            return 0
+        sql = f"""
+            SELECT memory_id, content FROM {self._table}
+            WHERE embedding IS NULL AND content IS NOT NULL
+            ORDER BY created_at DESC
+            FETCH FIRST :n ROWS ONLY
+        """  # nosec B608
+        with self._acquire_checked() as conn:
+            try:
+                conn.call_timeout = _SEARCH_TIMEOUT_MS
+            except Exception:
+                pass
+            with conn.cursor() as cur:
+                cur.arraysize = max(1, min(int(limit), 1000))
+                _execute_lobs_as_str(cur, sql, {"n": int(limit)})
+                rows = cur.fetchall() or []
+        queued = 0
+        for row in rows:
+            mid, content = row[0], _lob_text(row[1])
+            if mid and content:
+                self._queue_embed_backfill(str(mid), content)
+                queued += 1
+        if queued:
+            logger.info("embed backfill: re-queued %d row(s) with NULL embeddings at startup", queued)
+        return queued
+
+    def _start_backfill_scan(self) -> None:
+        """Once per pool configuration per process, re-queue NULL-embedding rows
+        in the background (primary agents only; never blocks initialize())."""
+        if self._agent_context != "primary" or not self._onnx_model:
+            return
+        key = self._pool_fingerprint
+        with _BACKFILL_SCANNED_LOCK:
+            if key in _BACKFILL_SCANNED:
+                return
+            _BACKFILL_SCANNED.add(key)
+
+        def _run() -> None:
+            try:
+                self._requeue_null_embeddings()
+            except Exception as e:
+                logger.info("embed backfill startup scan skipped: %s", e)
+
+        t = threading.Thread(target=_run, daemon=True, name="oracle-backfill-scan")
+        self._backfill_scan_thread = t
+        t.start()
 
     def _contains_query(self, query: str) -> str:
         cleaned = _CONTAINS_CLEAN_RE.sub(" ", query or "")
@@ -1945,29 +2387,8 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert hit transient/shape error (%s); inserting row with null embedding to prevent turn loss",
                     err_str,
                 )
-                null_sql = f"""
-                    INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                        (memory_id, session_id, agent_id, role, content, embedding,
-                         created_at, target, metadata, content_txt,
-                         embedding_model, embedding_updated_at)
-                    VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                         NULL, SYSTIMESTAMP)
-                """
-                null_binds = (
-                    memory_id,
-                    session_id or self._session_id or "none",
-                    self._agent_id,
-                    role,
-                    content,
-                    target,
-                    meta,
-                    txt,
-                )
                 try:
-                    with self._pool.acquire() as conn, conn.cursor() as cur:
-                        cur.execute(null_sql, null_binds)
-                        conn.commit()
-                    self._queue_embed_backfill(memory_id, content)
+                    self._insert_null_row(memory_id, session_id, role, content, target, meta, txt)
                     return
                 except Exception as null_e:
                     logger.error(
@@ -1978,7 +2399,13 @@ class OracleMemoryProvider(MemoryProvider):
                     ) from null_e
 
         if vec is None:
-            raise RuntimeError(
+            if self._onnx_model:
+                # ONNX cooldown: keep the row (text search finds it at once) and
+                # let the backfill embed it when the cooldown ends.
+                logger.info("ONNX in cooldown; writing %s with a NULL embedding and queueing backfill", memory_id)
+                self._insert_null_row(memory_id, session_id, role, content, target, meta, txt)
+                return
+            raise _PolicyError(
                 "In-database ONNX embedding model is unavailable; external fallback is disabled"
             )
 
@@ -2010,9 +2437,41 @@ class OracleMemoryProvider(MemoryProvider):
         if vec is None:
             self._queue_embed_backfill(memory_id, content)
 
+    def _insert_null_row(
+        self, memory_id: str, session_id: str, role: str, content: str, target: str, meta: str, txt: str
+    ) -> None:
+        """INSERT one row with a NULL embedding, commit, then queue its backfill."""
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError(self._init_error or "pool not initialized")
+        null_sql = f"""
+            INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                (memory_id, session_id, agent_id, role, content, embedding,
+                 created_at, target, metadata, content_txt,
+                 embedding_model, embedding_updated_at)
+            VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                 NULL, SYSTIMESTAMP)
+        """  # nosec B608
+        null_binds = (
+            memory_id,
+            session_id or self._session_id or "none",
+            self._agent_id,
+            role,
+            content,
+            target,
+            meta,
+            txt,
+        )
+        with pool.acquire() as conn, conn.cursor() as cur:
+            cur.execute(null_sql, null_binds)
+            conn.commit()
+        self._queue_embed_backfill(memory_id, content)
+
     def _update_row(self, mid: str, content: str | None, tags: list[str] | None = None) -> int:
         """Update a row's content (re-embedded in-database) and/or replace its
-        metadata.tags. Returns the number of rows updated (0 = not found)."""
+        metadata.tags. Returns the number of rows updated (0 = not found).
+        Skill-corpus rows (role='skill') are never updated here: the next skill
+        sync would silently revert the edit."""
         if not self._pool:
             raise RuntimeError(self._init_error or "pool not initialized")
         meta_set = ""
@@ -2026,7 +2485,7 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')), SET '$.tags' = JSON(:tags))
-                WHERE memory_id = :id
+                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
             """  # nosec B608
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
@@ -2035,15 +2494,29 @@ class OracleMemoryProvider(MemoryProvider):
                 conn.commit()
             return n
         if not self._onnx_model:
-            raise RuntimeError(
+            raise _PolicyError(
                 "In-database ONNX model is not configured; external fallback is disabled"
-            )
-        if self._onnx_in_cooldown():
-            raise RuntimeError(
-                "In-database ONNX embedding model is in cooldown; external fallback is disabled"
             )
         txt = self._safe_varchar_bytes(content, 4000)
         embed_txt = self._safe_embed_text(content)
+        if self._onnx_in_cooldown():
+            # Same fallback as an ONNX transient error: store the new content
+            # now (text search sees it at once) and re-embed it in the backfill.
+            null_upd_sql = f"""
+                UPDATE /*+ NO_PARALLEL */ {self._table}
+                SET content = :c, embedding = NULL, content_txt = :t,
+                    embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
+                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+            """  # nosec B608
+            with self._acquire_checked() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
+                    n = cur.rowcount
+                conn.commit()
+            if n:
+                self._queue_embed_backfill(mid, content)
+            return n
+        backfill_after_commit = False
         with self._acquire_checked() as conn:
             with conn.cursor() as cur:
                 succeeded = False
@@ -2052,7 +2525,7 @@ class OracleMemoryProvider(MemoryProvider):
                         UPDATE /*+ NO_PARALLEL */ {self._table}
                         SET content = :c, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :e AS DATA), content_txt = :t,
                             embedding_model = :m, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                        WHERE memory_id = :id
+                        WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
                         """  # nosec B608
                     cur.execute(
                         sql,
@@ -2116,18 +2589,33 @@ class OracleMemoryProvider(MemoryProvider):
                             UPDATE /*+ NO_PARALLEL */ {self._table}
                             SET content = :c, embedding = NULL, content_txt = :t,
                                 embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                            WHERE memory_id = :id
+                            WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
                         """  # nosec B608
                         try:
                             cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
-                            self._queue_embed_backfill(mid, content)
+                            backfill_after_commit = True
                         except Exception as null_e:
                             raise RuntimeError(
                                 f"In-database ONNX update failed ({err_str}) and fallback update failed ({null_e})"
                             ) from null_e
                 n = cur.rowcount
             conn.commit()
+        if backfill_after_commit and n:
+            self._queue_embed_backfill(mid, content)
         return n
+
+    def _is_skill_row(self, mid: str) -> bool:
+        try:
+            with self._acquire_checked() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM {self._table} WHERE memory_id = :id AND role = 'skill'",  # nosec B608
+                        {"id": mid},
+                    )
+                    row = cur.fetchone()
+            return bool(row and row[0])
+        except Exception:
+            return False
 
     def _upsert_fact(
         self,
@@ -2184,6 +2672,8 @@ class OracleMemoryProvider(MemoryProvider):
             raise RuntimeError(self._init_error or "pool not initialized")
         where = ""
         binds: dict[str, Any] = {}
+        if memory_ids and len(memory_ids) > _GET_MAX_LIMIT:
+            raise ValueError(f"oracle_get takes at most {_GET_MAX_LIMIT} memory_ids per call")
         if memory_ids:
             names = []
             for i, m in enumerate(memory_ids):
@@ -2217,7 +2707,9 @@ class OracleMemoryProvider(MemoryProvider):
         with self._acquire_checked() as conn:
             conn.call_timeout = _SEARCH_TIMEOUT_MS
             with conn.cursor() as cur:
-                cur.execute(sql, binds)
+                cur.arraysize = max(_FETCH_ARRAYSIZE, binds["lim"] + 1)
+                cur.prefetchrows = cur.arraysize
+                _execute_lobs_as_str(cur, sql, binds)
                 for row in cur.fetchall():
                     meta = _metadata_dict(row[6])
                     out.append(
@@ -2298,6 +2790,8 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 self._exec_insert(sql, binds_list, tx_conn)
                 return []
+            except _TxAborted:
+                raise
             except Exception as e:
                 err_str = str(e)
                 is_51815 = "ORA-51815" in err_str
@@ -2311,6 +2805,8 @@ class OracleMemoryProvider(MemoryProvider):
                             time.sleep(0.05 * (attempt + 1))
                             self._exec_insert(sql, binds_list, tx_conn)
                             return []
+                        except _TxAborted:
+                            raise
                         except Exception as retry_e:
                             err_str = str(retry_e)
                             if "ORA-51815" not in err_str:
@@ -2351,6 +2847,8 @@ class OracleMemoryProvider(MemoryProvider):
                     try:
                         self._exec_insert(sql, conservative_binds_list, tx_conn)
                         return []
+                    except _TxAborted:
+                        raise
                     except Exception as retry_e:
                         err_str = str(retry_e)
                         is_51815 = "ORA-51815" in err_str
@@ -2374,52 +2872,10 @@ class OracleMemoryProvider(MemoryProvider):
                     "In-database ONNX insert_many hit transient/shape error (%s); inserting rows with null embedding to prevent turn loss",
                     err_str,
                 )
-                null_sql = f"""
-                    INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                        (memory_id, session_id, agent_id, role, content, embedding,
-                         created_at, target, metadata, content_txt,
-                         embedding_model, embedding_updated_at,
-                         turn_index, chunk_index, turn_id, conv_ref)
-                    VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                         NULL, SYSTIMESTAMP, :9, :10, :11, :12)
-                """
-                null_binds_list = []
-                for row in rows:
-                    memory_id = row.get("memory_id")
-                    session_id = row.get("session_id") or self._session_id or "none"
-                    role = row.get("role")
-                    content = row.get("content")
-                    target = row.get("target")
-                    metadata = row.get("metadata")
-                    meta = json.dumps(metadata or {})
-                    txt = self._safe_varchar_bytes(content, 4000)
-                    binds = (
-                        memory_id,
-                        session_id,
-                        self._agent_id,
-                        role,
-                        content,
-                        target,
-                        meta,
-                        txt,
-                        row.get("turn_index"),
-                        row.get("chunk_index"),
-                        row.get("turn_id"),
-                        row.get("conv_ref"),
-                    )
-                    null_binds_list.append(binds)
                 try:
-                    self._exec_insert(null_sql, null_binds_list, tx_conn)
-                    backfill = [
-                        (str(row["memory_id"]), str(row["content"]))
-                        for row in rows
-                        if row.get("memory_id") and row.get("content")
-                    ]
-                    if tx_conn is not None:
-                        return backfill  # caller queues after its commit
-                    for mid, cnt in backfill:
-                        self._queue_embed_backfill(mid, cnt)
-                    return []
+                    return self._insert_many_null(rows, tx_conn)
+                except _TxAborted:
+                    raise
                 except Exception as null_e:
                     logger.error(
                         "Null-embedding insert_many fallback failed (%s)", null_e
@@ -2429,7 +2885,12 @@ class OracleMemoryProvider(MemoryProvider):
                     ) from null_e
 
         if any(r.get("embedding") is None for r in rows):
-            raise RuntimeError(
+            if self._onnx_model:
+                # ONNX cooldown: write the rows now with NULL embeddings and let
+                # the backfill embed them once the cooldown ends.
+                logger.info("ONNX in cooldown; writing %d row(s) with NULL embeddings and queueing backfill", len(rows))
+                return self._insert_many_null(rows, tx_conn)
+            raise _PolicyError(
                 "In-database ONNX embedding model is unavailable; external fallback is disabled"
             )
 
@@ -2478,12 +2939,63 @@ class OracleMemoryProvider(MemoryProvider):
         self._exec_insert(sql, binds_list, tx_conn)
         return []
 
+    def _insert_many_null(self, rows: list[dict[str, Any]], tx_conn: Any = None) -> list[tuple[str, str]]:
+        """INSERT *rows* with NULL embeddings. Without *tx_conn* the backfill is
+        queued here (after the commit in _exec_insert) and [] is returned; with
+        *tx_conn* the (memory_id, content) pairs are returned for the caller to
+        queue after its own commit."""
+        null_sql = f"""
+            INSERT /*+ NO_PARALLEL */ INTO {self._table}
+                (memory_id, session_id, agent_id, role, content, embedding,
+                 created_at, target, metadata, content_txt,
+                 embedding_model, embedding_updated_at,
+                 turn_index, chunk_index, turn_id, conv_ref)
+            VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
+                 NULL, SYSTIMESTAMP, :9, :10, :11, :12)
+        """  # nosec B608
+        null_binds_list = []
+        for row in rows:
+            content = row.get("content")
+            null_binds_list.append((
+                row.get("memory_id"),
+                row.get("session_id") or self._session_id or "none",
+                self._agent_id,
+                row.get("role"),
+                content,
+                row.get("target"),
+                json.dumps(row.get("metadata") or {}),
+                self._safe_varchar_bytes(content, 4000),
+                row.get("turn_index"),
+                row.get("chunk_index"),
+                row.get("turn_id"),
+                row.get("conv_ref"),
+            ))
+        self._exec_insert(null_sql, null_binds_list, tx_conn)
+        backfill = [
+            (str(row["memory_id"]), str(row["content"]))
+            for row in rows
+            if row.get("memory_id") and row.get("content")
+        ]
+        if tx_conn is not None:
+            return backfill  # caller queues after its commit
+        for mid, cnt in backfill:
+            self._queue_embed_backfill(mid, cnt)
+        return []
+
     def _exec_insert(self, sql: str, binds_list: list[Any], tx_conn: Any = None) -> None:
         """executemany on a fresh pooled connection (and commit), or inside the
         caller's open transaction on *tx_conn* (no commit; a failure is rolled
-        back to a savepoint so earlier statements in that transaction survive)."""
+        back to a savepoint so earlier statements in that transaction survive).
+
+        With *tx_conn*, a session-level error or a failed savepoint rollback
+        raises _TxAborted: the connection cannot run another attempt, so the
+        retry/clamp/NULL-fallback ladder in _insert_many must stop and let the
+        caller roll back the whole transaction."""
         if tx_conn is None:
-            with self._pool.acquire() as conn, conn.cursor() as cur:
+            pool = self._pool
+            if pool is None:
+                raise RuntimeError(self._init_error or "pool not initialized")
+            with pool.acquire() as conn, conn.cursor() as cur:
                 cur.executemany(sql, binds_list)
                 conn.commit()
             return
@@ -2491,11 +3003,13 @@ class OracleMemoryProvider(MemoryProvider):
             cur.execute("SAVEPOINT hermes_insert_many")
             try:
                 cur.executemany(sql, binds_list)
-            except Exception:
+            except Exception as e:
+                if _is_session_error(e):
+                    raise _TxAborted(f"transaction connection broken: {e}") from e
                 try:
                     cur.execute("ROLLBACK TO SAVEPOINT hermes_insert_many")
                 except Exception as rb_e:
-                    logger.debug("rollback to savepoint failed: %s", rb_e)
+                    raise _TxAborted(f"{e} (rollback to savepoint failed: {rb_e})") from e
                 raise
 
     _JUNK = (
@@ -2537,22 +3051,22 @@ class OracleMemoryProvider(MemoryProvider):
                 return True
         return False
 
-    def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
-        # oracledb thin mode returns CLOB columns as LOB objects; a
-        # DB_TYPE_LONG outputtypehandler would silently truncate content over
-        # 32,760 bytes, so do not install one. Instead _fetch_rows reads any
-        # LOB value to str below.
-        fetch_k = binds.get("k", _FETCH_ARRAYSIZE)
-        cur.arraysize = max(_FETCH_ARRAYSIZE, int(fetch_k or 0))
+    def _fetch_rows(self, cur, sql: str, binds: dict, max_rows: int | None = None) -> list:
+        """Run one search query and map its rows. *max_rows* is the most rows the
+        statement can return (2 x k for the fused UNION ALL query); the fetch
+        array covers it, plus one, so the whole result arrives with the execute
+        round trip instead of needing another fetch."""
+        if max_rows is None:
+            max_rows = int(binds.get("k") or 0)
+        cur.arraysize = max(_FETCH_ARRAYSIZE, int(max_rows) + 1)
         cur.prefetchrows = cur.arraysize
-        cur.execute(sql, binds)
+        _execute_lobs_as_str(cur, sql, binds)
         out = []
         for row in cur.fetchall():
             content = row[4]
             if content is not None and not isinstance(content, str):
-                # oracledb thin mode returns CLOB columns as LOB objects, not str;
-                # read them out fully (LOB.read() preserves the whole value, unlike a
-                # DB_TYPE_LONG outputtypehandler which truncates at ~32 KB).
+                # Older drivers without fetch_lobs=False return a LOB locator;
+                # read it out fully (one extra round trip per row).
                 content = content.read() if hasattr(content, "read") else str(content)
             dist = float(row[7]) if row[7] is not None else None
             txt = float(row[6] or 0)
@@ -2575,7 +3089,21 @@ class OracleMemoryProvider(MemoryProvider):
                     "created_at": row[8] if len(row) > 8 else None,
                 }
             )
+            tags = _metadata_tags(row[9]) if len(row) > 9 else []
+            if tags:
+                out[-1]["tags"] = tags
         return out
+
+    def _fetch_rows_attempt(self, cur: Any, sql: str, binds: dict, attempt: int, max_rows: int | None = None) -> list:
+        """_fetch_rows for one attempt of an ORA-51815 retry loop: the first
+        attempt uses *cur*, every re-execution of the same SQL a fresh cursor on
+        the same connection, so a statement left in a bad state by the failed
+        attempt is never re-used."""
+        conn = getattr(cur, "connection", None) if attempt else None
+        if conn is None:
+            return self._fetch_rows(cur, sql, binds, max_rows=max_rows)
+        with conn.cursor() as fresh:
+            return self._fetch_rows(fresh, sql, binds, max_rows=max_rows)
 
     def _build_text_search_sql(
         self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None,
@@ -2595,7 +3123,8 @@ class OracleMemoryProvider(MemoryProvider):
 
         sql = f"""
             SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                   SCORE(1) AS txt_score, NULL AS distance, created_at
+                   SCORE(1) AS txt_score, NULL AS distance, created_at,
+                   JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
             {self._JUNK}{tgt_sql}{extra_filters}
@@ -2623,7 +3152,7 @@ class OracleMemoryProvider(MemoryProvider):
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
                        VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
-                       created_at
+                       created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -2636,7 +3165,7 @@ class OracleMemoryProvider(MemoryProvider):
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
                        VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
-                       created_at
+                       created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -2669,12 +3198,12 @@ class OracleMemoryProvider(MemoryProvider):
         if use_onnx and self._onnx_model:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
                            VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
-                           created_at
+                           created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -2683,10 +3212,11 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance, created_at
+                           SCORE(1) AS txt_score, NULL AS distance, created_at,
+                           JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -2702,12 +3232,12 @@ class OracleMemoryProvider(MemoryProvider):
         else:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
                            VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
-                           created_at
+                           created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -2716,10 +3246,11 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance, created_at
+                           SCORE(1) AS txt_score, NULL AS distance, created_at,
+                           JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -2752,16 +3283,16 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
+                    # Same weight as a text-only hit of the fused query, so a
+                    # hybrid score means the same thing on every path.
+                    r["score"] = round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
                     merged[r["memory_id"]] = r
                 for item in merged.values():
                     if self._is_prefix_match(item.get("content"), query):
                         item["score"] = round(min(1.0, item["score"] + 0.15), 4)
             except Exception as e:
                 err_str = str(e)
-                is_timeout_err = isinstance(e, TimeoutError) or any(
-                    code in err_str
-                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                )
+                is_timeout_err = _is_timeout_error(e)
                 if is_timeout_err:
                     logger.warning(
                         "Oracle hybrid text search in cooldown timed out after %ss (%s); failing fast",
@@ -2772,12 +3303,7 @@ class OracleMemoryProvider(MemoryProvider):
                         f"oracle_search hybrid text query timed out after {timeout_s:.0f}s: {e}"
                     ) from e
                 raise
-            ranked = sorted(
-                merged.values(), key=lambda x: x["score"], reverse=True
-            )
-            if not rerank or len(ranked) <= 1:
-                return ranked[:top_k]
-            return self._rerank(query, ranked, top_k, cur=cur)
+            return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
         use_onnx = bool(self._onnx_model)
         if not use_onnx and vec is None:
@@ -2791,7 +3317,7 @@ class OracleMemoryProvider(MemoryProvider):
         degraded_to_text = False
         for attempt in range(_51815_RETRIES):
             try:
-                for r in self._fetch_rows(cur, fused_sql, fused_binds):
+                for r in self._fetch_rows_attempt(cur, fused_sql, fused_binds, attempt, max_rows=2 * fetch_k):
                     prev = merged.get(r["memory_id"])
                     if prev:
                         prev["score"] = round(
@@ -2801,7 +3327,7 @@ class OracleMemoryProvider(MemoryProvider):
                     else:
                         item = dict(r)
                         if item.get("dist") is None and "dist" in item:
-                            item["score"] = round(item["score"] * 0.3, 4)
+                            item["score"] = round(item["score"] * _HYBRID_TEXT_WEIGHT, 4)
                         item.pop("dist", None)
                         merged[r["memory_id"]] = item
                 break
@@ -2820,10 +3346,7 @@ class OracleMemoryProvider(MemoryProvider):
 
                 is_text_err = any(code in err_str for code in ("DRG-", "ORA-29902", "ORA-30600"))
                 is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                is_timeout_err = isinstance(e, TimeoutError) or any(
-                    code in err_str
-                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                )
+                is_timeout_err = _is_timeout_error(e)
                 if use_onnx and not is_text_err and not is_shape_err and not is_timeout_err:
                     self._onnx_mark_failed(err_str)
 
@@ -2848,7 +3371,7 @@ class OracleMemoryProvider(MemoryProvider):
                             vec_sql, vec_binds = self._build_vector_search_sql(
                                 query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                             )
-                            for r in self._fetch_rows(cur, vec_sql, vec_binds):
+                            for r in self._fetch_rows_attempt(cur, vec_sql, vec_binds, vec_attempt):
                                 r.pop("dist", None)
                                 merged[r["memory_id"]] = r
                             vec_fallback_done = True
@@ -2866,10 +3389,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 break
 
                             vec_err_str = str(vec_err)
-                            is_vec_timeout = isinstance(vec_err, TimeoutError) or any(
-                                code in vec_err_str
-                                for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                            )
+                            is_vec_timeout = _is_timeout_error(vec_err)
                             logger.warning(
                                 "In-database ONNX vector fallback failed (%s); external fallback is disabled",
                                 vec_err,
@@ -2905,16 +3425,16 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
+                    # Same weight as a text-only hit of the fused query, so a
+                    # hybrid score means the same thing on every path.
+                    r["score"] = round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
                     merged[r["memory_id"]] = r
                 for item in merged.values():
                     if self._is_prefix_match(item.get("content"), query):
                         item["score"] = round(min(1.0, item["score"] + 0.15), 4)
             except Exception as e:
                 err_str = str(e)
-                is_timeout_err = isinstance(e, TimeoutError) or any(
-                    code in err_str
-                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                )
+                is_timeout_err = _is_timeout_error(e)
                 if is_timeout_err:
                     logger.warning(
                         "Oracle hybrid degraded text search timed out after %ss (%s); failing fast",
@@ -2925,24 +3445,17 @@ class OracleMemoryProvider(MemoryProvider):
                         f"oracle_search hybrid degraded text query timed out after {timeout_s:.0f}s: {e}"
                     ) from e
                 logger.warning("Oracle hybrid degraded text search encountered error: %s", e)
-            ranked = sorted(
-                merged.values(), key=lambda x: x["score"], reverse=True
-            )
-            if not rerank or len(ranked) <= 1:
-                return ranked[:top_k]
-            return self._rerank(query, ranked, top_k, cur=cur)
+            return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
         for item in merged.values():
             item.pop("dist", None)
             if self._is_prefix_match(item.get("content"), query):
                 item["score"] = round(min(1.0, item["score"] + 0.15), 4)
 
-        ranked = sorted(
-            merged.values(), key=lambda x: x["score"], reverse=True
-        )
-        if not rerank or len(ranked) <= 1:
-            return ranked[:top_k]
-        return self._rerank(query, ranked, top_k, cur=cur)
+        # Not cut to top_k here: weighting and per-source diversification run
+        # in _search_once over the whole candidate list, and the optional rerank
+        # after them (*rerank* is applied there).
+        return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
     def _apply_weights(self, rows: list[dict[str, Any]], cur: Any = None) -> list[dict[str, Any]]:
         """Apply retrieval weighting to candidate rows based on recency, role, telemetry, and length."""
@@ -3076,7 +3589,11 @@ class OracleMemoryProvider(MemoryProvider):
                 # that session produced ORA-01002 and then "'NoneType' object is
                 # not iterable" on later searches. A reconnect is far cheaper.
                 bad = _is_session_error(exc) or _is_timeout_error(exc)
-                bad = bad or (isinstance(exc, Exception) and not _ORA_CODE_RE.search(str(exc)))
+                bad = bad or (
+                    isinstance(exc, Exception)
+                    and not isinstance(exc, _PolicyError)
+                    and not _ORA_CODE_RE.search(str(exc))
+                )
                 if bad:
                     try:
                         pool.drop(conn)
@@ -3146,10 +3663,7 @@ class OracleMemoryProvider(MemoryProvider):
                         rows = sorted(rows, key=lambda x: x["score"], reverse=True)
                     except Exception as e:
                         err_str = str(e)
-                        is_timeout_err = isinstance(e, TimeoutError) or any(
-                            code in err_str
-                            for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                        )
+                        is_timeout_err = _is_timeout_error(e)
                         if is_timeout_err:
                             logger.warning(
                                 "Oracle text search timed out after %ss (%s); failing fast",
@@ -3177,7 +3691,7 @@ class OracleMemoryProvider(MemoryProvider):
                         )
                         for attempt in range(_51815_RETRIES):
                             try:
-                                rows = self._fetch_rows(cur, sql, binds)
+                                rows = self._fetch_rows_attempt(cur, sql, binds, attempt)
                                 break
                             except Exception as vec_fetch_e:
                                 if _is_51815(vec_fetch_e) and attempt < _51815_RETRIES - 1:
@@ -3192,10 +3706,7 @@ class OracleMemoryProvider(MemoryProvider):
                     except Exception as e:
                         err_str = str(e)
                         is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                        is_timeout_err = isinstance(e, TimeoutError) or any(
-                            code in err_str
-                            for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                        )
+                        is_timeout_err = _is_timeout_error(e)
                         logger.warning(
                             "In-database ONNX vector search failed (%s); external fallback is disabled",
                             e,
@@ -3214,6 +3725,8 @@ class OracleMemoryProvider(MemoryProvider):
                         cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match, timeout_s=query_timeout_s
                     )
                 rows = self._apply_weights(rows, cur)
+                if mode == "hybrid" and rerank and len(rows) > 1:
+                    rows = self._rerank(query, rows, top_k, cur=cur)
         return rows[:top_k]
 
     def _rerank(self, query: str, rows: list, top_k: int, cur=None) -> list:
@@ -3250,7 +3763,9 @@ class OracleMemoryProvider(MemoryProvider):
                     id_rank[mid] = i
             if not id_rank:
                 return rows
-            return sorted(rows, key=lambda r: id_rank.get(r["memory_id"], 999))[:top_k]
+            # Reorder only; the caller cuts to top_k (rows the reranker did not
+            # see keep their order after the reranked head).
+            return sorted(rows, key=lambda r: id_rank.get(r["memory_id"], len(id_rank)))
         except Exception as e:
             logger.debug("DBMS_VECTOR.RERANK skipped: %s", e)
             return rows
@@ -3375,19 +3890,57 @@ class OracleMemoryProvider(MemoryProvider):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if not self._pool or action != "add" or not isinstance(content, str) or not content:
+        """Mirror built-in memory writes. add inserts an md_ row; replace inserts
+        the new entry first, then deletes the mirror of the previous one; remove
+        deletes it. The previous entry is identified only by
+        metadata["previous_content"] (old_text alone is not authoritative), and
+        only this host's mirrors of the same target are touched."""
+        if not self._pool or action not in ("add", "replace", "remove"):
             return
+        meta = dict(metadata or {})
+        previous = meta.pop("previous_content", None)
+        meta.pop("old_text", None)
+        tgt = target if target in ("memory", "user") else "memory"
         try:
-            self._insert(
-                memory_id=f"md_{uuid.uuid4().hex[:16]}",
-                session_id=self._session_id,
-                role="fact",
-                content=content,
-                target=target or "memory",
-                metadata={"kind": "builtin", **(metadata or {})},
-            )
+            if action in ("add", "replace") and isinstance(content, str) and content:
+                self._insert(
+                    memory_id=f"md_{uuid.uuid4().hex[:16]}",
+                    session_id=self._session_id,
+                    role="fact",
+                    content=content,
+                    target=tgt,
+                    metadata={**meta, "kind": "builtin", "host": get_host_id()},
+                )
+            if action == "add":
+                return
+            if not isinstance(previous, str) or not previous:
+                logger.debug("oracle on_memory_write %s without previous_content; old mirror kept", action)
+                return
+            if action == "replace" and previous == content:
+                return
+            self._delete_memory_mirror(tgt, previous)
         except Exception as e:
-            logger.debug("oracle on_memory_write failed: %s", e)
+            logger.debug("oracle on_memory_write %s failed: %s", action, e)
+
+    def _delete_memory_mirror(self, target: str, content: str) -> int:
+        """Delete this host's md_ mirror rows of one built-in memory entry. Rows
+        mirrored before 1.1.1.4 carry no host and match by agent id alone. The
+        host is read from the row itself (JSON_QUERY wrapper), not from the
+        asynchronously synced JSON search index, so a mirror written a moment
+        ago is found."""
+        sql = f"""
+            DELETE /*+ NO_PARALLEL */ FROM {self._table}
+            WHERE memory_id LIKE 'md\\_%' ESCAPE '\\'
+              AND role = 'fact' AND agent_id = :aid AND NVL(target, 'memory') = :tgt
+              AND NVL(JSON_VALUE(JSON_QUERY(metadata, '$' RETURNING JSON), '$.host'), :host) = :host
+              AND DBMS_LOB.COMPARE(content, TO_CLOB(:c)) = 0
+        """  # nosec B608
+        with self._acquire_checked() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"aid": self._agent_id, "tgt": target, "host": get_host_id(), "c": content})
+                n = cur.rowcount or 0
+            conn.commit()
+        return n
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if not self._pool or not isinstance(messages, list) or not messages:
@@ -3519,172 +4072,254 @@ class OracleMemoryProvider(MemoryProvider):
                 logger.debug("oracle on_skill_lifecycle usage log failed: %s", exc)
             return
 
-        # Content actions: created, edited, patched, installed, restored
-        if action in ("created", "edited", "patched", "installed", "restored"):
+        # Content actions ingest the skill; "archived" retires this host's copy.
+        # The caller (the skill tool) only schedules: file lookup, parsing, the
+        # hash check and the write all run on the per-skill writer thread (#6).
+        if action in ("created", "edited", "patched", "installed", "restored", "archived"):
+            if not isinstance(skill_name, str) or not _SKILL_NAME_RE.match(skill_name):
+                logger.debug("on_skill_lifecycle: ignoring invalid skill name %r", skill_name)
+                return
             try:
-                skill_file: Path | None = None
-                for root_candidate in (
-                    Path.home() / ".hermes" / "skills",
-                    Path.home() / ".agents" / "skills",
-                    Path.home() / "skills",
-                ):
-                    if root_candidate.exists():
-                        candidate = root_candidate / skill_name / "SKILL.md"
-                        if candidate.is_file():
-                            skill_file = candidate
-                            break
-                        for sub in _skill_md_matches(root_candidate, skill_name):
-                            if sub.is_file():
-                                skill_file = sub
-                                break
-                    if skill_file:
-                        break
+                # Resolved here: the Hermes home can be a context-local
+                # (per-profile) override that a new thread does not inherit.
+                roots = list(_sync_skills_module().resolve_skill_roots())
+            except Exception as e:
+                logger.debug("on_skill_lifecycle: cannot resolve skill roots: %s", e)
+                return
+            self._schedule_skill_lifecycle(skill_name, "archive" if action == "archived" else "ingest", roots)
+            return
 
-                if not skill_file or not skill_file.is_file():
-                    logger.debug("on_skill_lifecycle: local SKILL.md not found for '%s'; skipping live ingest", skill_name)
-                    return
+    def _lifecycle_key(self, skill_name: str) -> tuple[str, str, str]:
+        return (self._pool_fingerprint, self._table, skill_name)
 
-                _sync = _sync_skills_module()
-                parse_skill_file, format_skill_payload = _sync.parse_skill_file, _sync.format_skill_payload
+    def _schedule_skill_lifecycle(self, skill_name: str, op: str, roots: list[Path]) -> None:
+        """Run *op* for *skill_name* on a writer thread, one writer per skill
+        and database table in this process (whichever provider instance the
+        event reached). An event for a skill whose writer is still busy is
+        coalesced, not dropped: the writer runs once more with the latest event."""
+        key = self._lifecycle_key(skill_name)
+        with _LIFECYCLE_LOCK:
+            if key in _LIFECYCLE_IN_FLIGHT:
+                _LIFECYCLE_PENDING[key] = (self, op, roots)
+                return
+            _LIFECYCLE_IN_FLIGHT.add(key)
+        thread = threading.Thread(
+            target=self._run_skill_lifecycle,
+            args=(key, skill_name, op, roots),
+            daemon=True,
+            name=f"oracle-lifecycle-{skill_name}",
+        )
+        started = False
+        try:
+            started = self._start_sync_thread(thread)
+        except Exception as e:
+            logger.debug("on_skill_lifecycle: cannot start writer for '%s': %s", skill_name, e)
+        if not started:
+            logger.info("on_skill_lifecycle: provider shutting down; not processing '%s'", skill_name)
+            with _LIFECYCLE_LOCK:
+                _LIFECYCLE_IN_FLIGHT.discard(key)
+                _LIFECYCLE_PENDING.pop(key, None)
 
-                skill_info = parse_skill_file(skill_file)
-                if not skill_info:
-                    return
+    def _run_skill_lifecycle(self, key: tuple[str, str, str], skill_name: str, op: str, roots: list[Path]) -> None:
+        """Writer loop for one skill. *key* is the one computed when the work
+        was scheduled (the pool fingerprint can change before this thread
+        runs). Coalesced events for this provider run here; an event that
+        reached another provider is handed to that provider's own scheduler,
+        so its shutdown tracks (joins) the thread that runs it."""
+        while True:
+            try:
+                if op == "archive":
+                    self._skill_archive_once(skill_name, roots)
+                else:
+                    self._skill_ingest_once(skill_name, roots)
+            except Exception as e:
+                logger.warning("on_skill_lifecycle: %s of '%s' failed: %s", op, skill_name, e)
+            with _LIFECYCLE_LOCK:
+                nxt = _LIFECYCLE_PENDING.pop(key, None)
+                again = nxt is not None and nxt[0] is self and not self._write_stop.is_set()
+                if not again:
+                    _LIFECYCLE_IN_FLIGHT.discard(key)
+            if again and nxt is not None:
+                _prov, op, roots = nxt
+                continue
+            if nxt is not None and nxt[0] is not self:
+                nxt[0]._schedule_skill_lifecycle(skill_name, nxt[1], nxt[2])
+            elif nxt is not None:
+                logger.info("on_skill_lifecycle: provider shutting down; not processing '%s'", skill_name)
+            return
 
-                # In-flight deduplication
-                with self._lifecycle_lock:
-                    if skill_name in self._in_flight_lifecycle_skills:
+    @staticmethod
+    def _find_skill_file(roots: list[Path], skill_name: str) -> Path | None:
+        if not _SKILL_NAME_RE.match(skill_name or ""):
+            return None
+        for root in roots:
+            if not root.is_dir():
+                continue
+            candidate = root / skill_name / "SKILL.md"
+            if candidate.is_file():
+                return candidate
+            for sub in _skill_md_matches(root, skill_name):
+                if sub.is_file():
+                    return sub
+        # Deeper layouts, as the bulk sync's discovery walks them (hidden
+        # trees such as .archive/ skipped; depth-bounded against link loops).
+        for root in roots:
+            if not root.is_dir():
+                continue
+            base_depth = len(root.parts)
+            for cur_root, dirnames, _files in os.walk(root, followlinks=True):
+                depth = len(Path(cur_root).parts) - base_depth
+                dirnames[:] = [] if depth >= 6 else [d for d in dirnames if not d.startswith(".")]
+                if skill_name in dirnames:
+                    sub = Path(cur_root) / skill_name / "SKILL.md"
+                    if sub.is_file():
+                        return sub
+        return None
+
+    def _skill_ingest_once(self, skill_name: str, roots: list[Path]) -> None:
+        """Replace this host's copy of one skill (full mode) in one transaction;
+        skip the write when the stored hash already matches the file.
+
+        The identity is the parsed skill name (the frontmatter name, else the
+        directory name), exactly as the bulk sync stores it; the event name only
+        locates the file."""
+        skill_file = self._find_skill_file(roots, skill_name)
+        if skill_file is None:
+            logger.debug("on_skill_lifecycle: local SKILL.md not found for '%s'; skipping live ingest", skill_name)
+            return
+        _sync = _sync_skills_module()
+        skill_info = _sync.parse_skill_file(skill_file)
+        if not skill_info:
+            return
+        name = str(getattr(skill_info, "name", "") or "")
+        if not _SKILL_NAME_RE.match(name):
+            logger.warning("on_skill_lifecycle: skill '%s' has an invalid name %r; not stored", skill_name, name)
+            return
+        if name != skill_name:
+            logger.debug("on_skill_lifecycle: '%s' is stored as '%s' (its frontmatter name)", skill_name, name)
+        host_id = get_host_id()
+        payload_rows = _sync.format_skill_payload(skill_info, mode="full", host=host_id)
+        if not payload_rows:
+            return
+        current_hash = getattr(skill_info, "hash", None) or getattr(skill_info, "content_hash", "")
+        own_binds = _sync.own_skill_rows_binds(host_id, name)
+        if self._pool is None:
+            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", name)
+            return
+        # Hash check, DELETE of this host's rows and INSERT share one
+        # transaction: a failed insert rolls back and the previous rows stay.
+        # The checked acquire reads the pool once and drops a broken session.
+        with self._acquire_checked() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT json_value(metadata, '$.hash'), json_value(metadata, '$.path'), "  # nosec B608
+                        f"json_value(metadata, '$.total_chunks') FROM {self._table} "
+                        "WHERE memory_id = :1 AND role = 'skill'",
+                        (f"skill:{host_id}:{name}:c0",),
+                    )
+                    row = cur.fetchone()
+                    stored_path = row[1] if row is not None and len(row) > 1 else None
+                    # A meta-only copy (no total_chunks) is not current for this full write.
+                    stored_full = row is not None and (len(row) < 3 or row[2] is not None)
+                    if stored_full and _sync.copy_is_current(row[0], stored_path, current_hash, skill_info.path, roots):
+                        logger.debug("on_skill_lifecycle: skill '%s' unchanged (%s); skipping", name, current_hash)
                         return
-                    self._in_flight_lifecycle_skills.add(skill_name)
+                    if _sync.live_elsewhere(stored_path, skill_file, roots):
+                        logger.warning(
+                            "on_skill_lifecycle: skill '%s' of host '%s' is stored from %s, which still exists "
+                            "outside this profile's skill dirs; not replacing it (set HERMES_HOST_ID per "
+                            "profile to keep separate copies)", name, host_id, stored_path,
+                        )
+                        return
+                    cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)
+                backfill = self._insert_many(payload_rows, tx_conn=conn)
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception as rb_e:
+                    logger.debug("on_skill_lifecycle rollback failed: %s", rb_e)
+                raise
+        for mid, cnt in backfill or []:
+            self._queue_embed_backfill(mid, cnt)
+        logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", name, len(payload_rows))
 
-                # Check idempotency: skip if stored c0 hash matches local file
-                host_id = get_host_id()
-                c0_id = f"skill:{host_id}:{skill_name}:c0"
-                if self._pool:
-                    try:
-                        with self._pool.acquire() as conn:
-                            with conn.cursor() as cur:
-                                chk_sql = f"""
-                                    SELECT json_value(metadata, '$.hash')
-                                    FROM {self._table}
-                                    WHERE role = 'skill' AND (memory_id = :1 OR memory_id = :2)
-                                """
-                                cur.execute(chk_sql, (c0_id, f"skill:{skill_name}:c0"))
-                                row = cur.fetchone()
-                                current_hash = getattr(skill_info, "hash", None) or getattr(skill_info, "content_hash", "")
-                                if row and row[0] == current_hash:
-                                    logger.debug("on_skill_lifecycle: skill '%s' hash unchanged (%s); skipping", skill_name, current_hash)
-                                    with self._lifecycle_lock:
-                                        self._in_flight_lifecycle_skills.discard(skill_name)
-                                    return
-                    except Exception as chk_e:
-                        logger.debug("on_skill_lifecycle hash check error: %s", chk_e)
-
-                def do_lifecycle_upsert():
-                    try:
-                        payload_rows = format_skill_payload(skill_info, mode="full", host=host_id)
-                        if not payload_rows:
-                            return
-                        if self._pool is None:
-                            logger.info("on_skill_lifecycle: provider closed; skipping upsert of '%s'", skill_name)
-                            return
-
-                        conv_ref = f"skill:{host_id}:{skill_name}"
-                        # DELETE + INSERT commit together. If the insert fails
-                        # (ONNX cooldown, timeout, forced pool close at shutdown)
-                        # the transaction rolls back and the previous rows stay,
-                        # instead of the skill vanishing from every host. The
-                        # checked acquire reads the pool once and drops a session
-                        # broken by a timeout instead of returning it.
-                        with self._acquire_checked() as conn:
-                            try:
-                                with conn.cursor() as cur:
-                                    del_sql = f"DELETE FROM {self._table} WHERE role = 'skill' AND (conv_ref = :1 OR memory_id = :2)"
-                                    cur.execute(del_sql, (conv_ref, c0_id))
-                                backfill = self._insert_many(payload_rows, tx_conn=conn)
-                                conn.commit()
-                            except BaseException:
-                                try:
-                                    conn.rollback()
-                                except Exception as rb_e:
-                                    logger.debug("on_skill_lifecycle rollback failed: %s", rb_e)
-                                raise
-                        for mid, cnt in backfill or []:
-                            self._queue_embed_backfill(mid, cnt)
-                        logger.info("on_skill_lifecycle: ingested skill '%s' (%d chunks)", skill_name, len(payload_rows))
-                    except Exception as up_e:
-                        logger.warning("on_skill_lifecycle: background upsert failed for '%s': %s", skill_name, up_e)
-                    finally:
-                        with self._lifecycle_lock:
-                            self._in_flight_lifecycle_skills.discard(skill_name)
-
-                thread = threading.Thread(target=do_lifecycle_upsert, daemon=True, name=f"oracle-lifecycle-{skill_name}")
-                if not self._start_sync_thread(thread):
-                    logger.info("on_skill_lifecycle: provider shutting down; not ingesting '%s'", skill_name)
-                    with self._lifecycle_lock:
-                        self._in_flight_lifecycle_skills.discard(skill_name)
-            except Exception as e:
-                logger.debug("on_skill_lifecycle ingest error: %s", e)
-                with self._lifecycle_lock:
-                    self._in_flight_lifecycle_skills.discard(skill_name)
+    def _skill_archive_once(self, skill_name: str, roots: list[Path]) -> None:
+        """Delete this host's copy of an archived skill, unless a SKILL.md for
+        it is still live under the roots. The copy is found by its id
+        (skill:<host>:<name>:c0) or by its stored path (.../<name>/SKILL.md,
+        for a skill whose frontmatter name differs from its directory). A copy
+        whose stored SKILL.md still exists is kept, wherever it lies (a live
+        skill of this profile under another name, or another profile's copy),
+        unless it is the target of the symlink this archive moved into
+        .archive/. Other hosts' copies and the host-less shared corpus are
+        never touched."""
+        if not _SKILL_NAME_RE.match(skill_name or ""):
             return
-
-        # Removal action: archived (retire from shared corpus only if local file is gone)
-        if action == "archived":
+        if self._find_skill_file(roots, skill_name) is not None:
+            return
+        _sync = _sync_skills_module()
+        host_id = get_host_id()
+        own_binds = _sync.own_skill_rows_binds(host_id, skill_name)
+        if self._pool is None:
+            return
+        deleted = 0
+        removed: list[str] = []
+        kept: list[str] = []
+        with self._acquire_checked() as conn:
             try:
-                found = False
-                for root_candidate in (
-                    Path.home() / ".hermes" / "skills",
-                    Path.home() / ".agents" / "skills",
-                    Path.home() / "skills",
-                ):
-                    if root_candidate.exists():
-                        target_file = root_candidate / skill_name / "SKILL.md"
-                        if target_file.exists():
-                            found = True
-                            break
-                        for sub in _skill_md_matches(root_candidate, skill_name):
-                            if sub.exists():
-                                found = True
-                                break
-                    if found:
-                        break
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT memory_id, json_value(metadata, '$.skill_name'), json_value(metadata, '$.path') "  # nosec B608
+                        f"FROM {self._table} WHERE role = 'skill' AND memory_id LIKE :own ESCAPE '\\' "
+                        "AND memory_id LIKE '%:c0' "
+                        "AND (memory_id = :c0 OR json_value(metadata, '$.path') LIKE :tail ESCAPE '\\')",
+                        {
+                            "own": _sync.like_escape(f"skill:{host_id}:") + "%",
+                            "c0": f"skill:{host_id}:{skill_name}:c0",
+                            "tail": "%" + _sync.like_escape(f"{os.sep}{skill_name}{os.sep}SKILL.md"),
+                        },
+                    )
+                    candidates = list(cur.fetchall() or [])
+                    for cand in candidates:
+                        mid = str(cand[0] or "")
+                        sname = str(cand[1] or "") if len(cand) > 1 else ""
+                        spath = cand[2] if len(cand) > 2 else None
+                        if not sname:
+                            m = re.match(r"^skill:[^:]+:([^:]+):c0$", mid)
+                            sname = m.group(1) if m else ""
+                        if not _SKILL_NAME_RE.match(sname):
+                            continue
+                        if _stored_file_exists(spath) and not _sync.archived_link_target(spath, roots, skill_name):
+                            kept.append(f"{sname} ({spath})")
+                            continue
+                        cur.execute(
+                            f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}",  # nosec B608
+                            _sync.own_skill_rows_binds(host_id, sname),
+                        )
+                        deleted += cur.rowcount or 0
+                        removed.append(sname)
+                    if not candidates:
+                        # No meta row (partial legacy write): clear any chunk rows under the id.
+                        cur.execute(f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}", own_binds)  # nosec B608
+                        deleted += cur.rowcount or 0
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+        logger.info(
+            "on_skill_lifecycle: archived skill '%s': removed %d rows of host '%s' (%s)%s",
+            skill_name, deleted, host_id, ", ".join(removed) or "no copy",
+            f"; kept, SKILL.md still exists: {', '.join(kept)}" if kept else "",
+        )
 
-                if not found:
-                    def do_archive_delete():
-                        pool = self._pool  # read once (see do_lifecycle_upsert)
-                        if pool is None:
-                            return
-                        host_id = get_host_id()
-                        compute_host_root = _sync_skills_module().compute_host_root
-                        host_root = compute_host_root()
-                        with pool.acquire() as conn:
-                            with conn.cursor() as cur:
-                                del_sql = f"""
-                                    DELETE FROM {self._table}
-                                    WHERE role = 'skill'
-                                      AND json_value(metadata, '$.skill_name') = :s
-                                      AND (
-                                          json_value(metadata, '$.host') = :h
-                                          OR (
-                                              json_value(metadata, '$.host') IS NULL
-                                              AND json_value(metadata, '$.path') LIKE :root || '%'
-                                          )
-                                      )
-                                """
-                                cur.execute(del_sql, {"s": skill_name, "h": host_id, "root": host_root})
-                            conn.commit()
-                        logger.info("on_skill_lifecycle: archived and pruned skill '%s' for host '%s'", skill_name, host_id)
-
-                    thread = threading.Thread(target=do_archive_delete, daemon=True, name="oracle-lifecycle-archive")
-                    if not self._start_sync_thread(thread):
-                        logger.info("on_skill_lifecycle: provider shutting down; not pruning '%s'", skill_name)
-            except Exception as e:
-                logger.debug("on_skill_lifecycle archive error: %s", e)
-            return
-
-    def _load_skill_fetch(self, skill_name: str, path: str = "", variant: int | None = None) -> str:
-        """Load and reconstruct a skill document from its constituent chunks in the shared corpus."""
+    def _load_skill_fetch(self, skill_name: str, path: str = "", variant: int | None = None, host: str = "") -> str:
+        """Load and reconstruct a skill document from its constituent chunks in the shared corpus.
+        Copies are keyed by (host, path); the DB fetch is bounded per copy."""
         skill_name = (skill_name or "").strip()
         if not skill_name or not re.match(r"^[A-Za-z0-9._-]+$", skill_name):
             return tool_error(f"Invalid skill name '{skill_name}'. Skill name must match ^[A-Za-z0-9._-]+$")
@@ -3693,23 +4328,29 @@ class OracleMemoryProvider(MemoryProvider):
             return tool_error(f"Oracle memory not initialized: {self._init_error or self.unavailable_reason()}")
 
         try:
-            import oracledb
-
-            def fetch_lobs_as_strings(cursor, metadata):
-                if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                    return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
-
+            # At most _SKILL_FETCH_MAX_CHUNKS + 2 rows per copy (c0, the cap and
+            # one more to detect truncation). CLOBs arrive as str in the same
+            # round trip (_execute_lobs_as_str).
             sql = f"""
-                SELECT to_number(regexp_substr(memory_id, '[0-9]+$', 1, 1)) idx,
-                       content,
-                       json_value(metadata, '$.reference_file') ref,
-                       json_value(metadata, '$.total_chunks') total,
-                       metadata,
-                       memory_id
-                FROM {self._table}
-                WHERE role = 'skill' AND json_value(metadata, '$.skill_name') = :s
+                SELECT idx, content, ref, total, metadata, memory_id
+                FROM (
+                    SELECT to_number(regexp_substr(memory_id, '[0-9]+$', 1, 1)) idx,
+                           content,
+                           json_value(metadata, '$.reference_file') ref,
+                           json_value(metadata, '$.total_chunks') total,
+                           metadata,
+                           memory_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY json_value(metadata, '$.host'), json_value(metadata, '$.path')
+                               ORDER BY to_number(regexp_substr(memory_id, '[0-9]+$', 1, 1)) NULLS FIRST, memory_id
+                           ) rn
+                    FROM {self._table}
+                    WHERE role = 'skill' AND json_value(metadata, '$.skill_name') = :s
+                )
+                WHERE rn <= :cap
                 ORDER BY idx NULLS FIRST
             """
+            fetch_cap = max(1, _SKILL_FETCH_MAX_CHUNKS) + 2
 
             def _fetch_skill_rows(conn):
                 try:
@@ -3717,8 +4358,9 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
                 with conn.cursor() as cur:
-                    cur.outputtypehandler = fetch_lobs_as_strings
-                    cur.execute(sql, {"s": skill_name})
+                    cur.arraysize = min(fetch_cap * 2, 1000)
+                    cur.prefetchrows = cur.arraysize + 1
+                    _execute_lobs_as_str(cur, sql, {"s": skill_name, "cap": fetch_cap})
                     return cur.fetchall()
 
             try:
@@ -3737,23 +4379,26 @@ class OracleMemoryProvider(MemoryProvider):
             if not rows:
                 return tool_error(f"skill '{skill_name}' not in corpus — use action=list to search")
 
-            variants_map: dict[str, dict[str, Any]] = {}
+            variants_map: dict[tuple[str, str], dict[str, Any]] = {}
             parsed_rows = []
             for r in rows:
                 idx, content, ref, total, md_raw, mid = r[0], r[1], r[2], r[3], r[4], r[5]
                 if not re.search(r":c\d+$", str(mid or "")):
                     idx = None
-                md: dict[str, Any] = {}
-                if md_raw:
-                    md = json.loads(md_raw) if isinstance(md_raw, str) else dict(md_raw)
+                md = _metadata_dict(md_raw)
                 p = md.get("path") or ""
-                if p and p not in variants_map:
-                    variants_map[p] = {
+                h = md.get("host") or ""
+                if p and (h, p) not in variants_map:
+                    variants_map[(h, p)] = {
                         "path": p,
                         "hash": md.get("hash") or "",
                         "mtime": md.get("mtime") or "",
-                        "host": md.get("host") or "",
+                        "host": h,
                     }
+                if isinstance(content, (bytes, bytearray)):
+                    content = content.decode("utf-8", "replace")
+                elif content is not None and not isinstance(content, str):
+                    content = _lob_text(content)
                 parsed_rows.append({
                     "idx": idx,
                     "content": content or "",
@@ -3763,31 +4408,46 @@ class OracleMemoryProvider(MemoryProvider):
                     "memory_id": mid,
                 })
 
-            unique_variants = list(variants_map.values())
+            # Variants in a stable order: (host, path); legacy (host-less) first.
+            unique_variants = [variants_map[k] for k in sorted(variants_map)]
             if len(unique_variants) > 1:
-                selected_path = None
-                if path:
-                    matching = [v["path"] for v in unique_variants if v["path"] == path]
+                selected: dict[str, Any] | None = None
+                if path or host:
+                    matching = [
+                        v for v in unique_variants
+                        if (not path or v["path"] == path) and (not host or v["host"] == host)
+                    ]
                     if not matching:
-                        avail = ", ".join(v["path"] for v in unique_variants)
-                        return tool_error(f"Specified path '{path}' does not match any variant for skill '{skill_name}'. Available paths: {avail}")
-                    selected_path = path
+                        avail = ", ".join(f"{v['host'] or '(shared)'}:{v['path']}" for v in unique_variants)
+                        return tool_error(
+                            f"No variant of skill '{skill_name}' matches path='{path}' host='{host}'. Available: {avail}"
+                        )
+                    if len(matching) > 1:
+                        return tool_error(
+                            f"path '{path}' matches {len(matching)} copies of skill '{skill_name}' on different hosts; "
+                            "pass 'host' or 'variant' as well"
+                        )
+                    selected = matching[0]
                 elif variant is not None:
                     if not (0 <= variant < len(unique_variants)):
                         return tool_error(f"Variant index {variant} out of range (0-{len(unique_variants)-1}) for skill '{skill_name}'")
-                    selected_path = unique_variants[variant]["path"]
+                    selected = unique_variants[variant]
                 else:
                     return json.dumps({
                         "status": "multiple_variants",
                         "skill": skill_name,
                         "variants": [
-                            {"variant": i, "path": v["path"], "hash": v["hash"], "mtime": v["mtime"]}
+                            {"variant": i, "host": v["host"], "path": v["path"], "hash": v["hash"], "mtime": v["mtime"]}
                             for i, v in enumerate(unique_variants)
                         ],
-                        "message": f"Multiple variants exist for skill '{skill_name}'. Please specify 'path' or 'variant' to select one.",
-                    })
-                if selected_path:
-                    parsed_rows = [r for r in parsed_rows if r["metadata"].get("path") == selected_path]
+                        "message": f"Multiple variants exist for skill '{skill_name}'. Please specify 'variant' (or 'path' and 'host') to select one.",
+                    }, default=_json_default)
+                if selected is not None:
+                    parsed_rows = [
+                        r for r in parsed_rows
+                        if r["metadata"].get("path") == selected["path"]
+                        and (r["metadata"].get("host") or "") == selected["host"]
+                    ]
 
             meta_row = None
             body_chunks: list[tuple[int, str]] = []
@@ -3876,11 +4536,37 @@ class OracleMemoryProvider(MemoryProvider):
         page_size = 500
 
         try:
-            import oracledb
-
-            def fetch_lobs_as_strings(cursor, metadata):
-                if metadata.type_code is oracledb.DB_TYPE_CLOB:
-                    return cursor.var(oracledb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+            # One row per skill name (paging is over distinct names, so a page
+            # is never short and never repeats a name), with the description
+            # from one meta row and the number of stored copies.
+            filt = (filter_str or "").strip()
+            where_filter = ""
+            binds: dict[str, Any] = {"o": offset, "limit": page_size + 1}
+            if filt:
+                where_filter = (
+                    "AND (UPPER(json_value(metadata, '$.skill_name')) LIKE UPPER(:f) ESCAPE '\\' "
+                    "OR UPPER(content) LIKE UPPER(:f) ESCAPE '\\')"
+                )
+                # The filter is a literal substring: % and _ are escaped.
+                binds["f"] = "%" + _sync_skills_module().like_escape(filt) + "%"
+            sql = f"""
+                SELECT name, category, content, copies
+                FROM (
+                    SELECT json_value(metadata, '$.skill_name') AS name,
+                           json_value(metadata, '$.category') AS category,
+                           content,
+                           COUNT(*) OVER (PARTITION BY json_value(metadata, '$.skill_name')) AS copies,
+                           ROW_NUMBER() OVER (PARTITION BY json_value(metadata, '$.skill_name') ORDER BY memory_id) AS rn
+                    FROM {self._table}
+                    WHERE role = 'skill'
+                      AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
+                      AND json_value(metadata, '$.skill_name') IS NOT NULL
+                      {where_filter}
+                )
+                WHERE rn = 1
+                ORDER BY name
+                OFFSET :o ROWS FETCH FIRST :limit ROWS ONLY
+            """
 
             def _run_list(conn):
                 try:
@@ -3888,108 +4574,31 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
                 with conn.cursor() as cur:
-                    cur.outputtypehandler = fetch_lobs_as_strings
-
-                    if filter_str and filter_str.strip():
-                        filt = f"%{filter_str.strip()}%"
-                        sql = f"""
-                            SELECT json_value(metadata, '$.skill_name') as name,
-                                   json_value(metadata, '$.category') as category,
-                                   content
-                            FROM {self._table}
-                            WHERE role = 'skill'
-                              AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
-                              AND (UPPER(json_value(metadata, '$.skill_name')) LIKE UPPER(:f)
-                                   OR UPPER(content) LIKE UPPER(:f))
-                            ORDER BY name
-                            OFFSET :o ROWS FETCH FIRST :limit ROWS ONLY
-                        """
-                        cur.execute(sql, {"f": filt, "o": offset, "limit": page_size + 1})
-                        rows = cur.fetchall()
-                        more = len(rows) > page_size
-                        page_rows = rows[:page_size]
-
-                        skills_out = []
-                        seen_names = set()
-                        for row in page_rows:
-                            sname, scat, scontent = row[0], row[1] or "general", row[2] or ""
-                            if sname in seen_names:
-                                continue
-                            seen_names.add(sname)
-                            desc = _extract_skill_description(scontent, sname)
-                            skills_out.append({
-                                "name": sname,
-                                "category": scat,
-                                "description": desc,
-                            })
-
-                        return json.dumps({
-                            "count_in_page": len(skills_out),
-                            "offset": offset,
-                            "more": more,
-                            "skills": skills_out,
-                        })
-
-                    # No filter: fast distinct name and category fetch
-                    sql = f"""
-                        SELECT DISTINCT
-                               json_value(metadata, '$.skill_name') as name,
-                               json_value(metadata, '$.category') as category
-                        FROM {self._table}
-                        WHERE role = 'skill' AND json_value(metadata, '$.skill_name') IS NOT NULL
-                        ORDER BY name
-                        OFFSET :o ROWS FETCH FIRST :limit ROWS ONLY
-                    """
-                    cur.execute(sql, {"o": offset, "limit": page_size + 1})
+                    cur.arraysize = page_size + 1
+                    cur.prefetchrows = page_size + 2
+                    _execute_lobs_as_str(cur, sql, binds)
                     rows = cur.fetchall()
-                    more = len(rows) > page_size
-                    page_rows = rows[:page_size]
-
-                    if not page_rows:
-                        return json.dumps({
-                            "count_in_page": 0,
-                            "offset": offset,
-                            "more": False,
-                            "skills": [],
-                        })
-
-                    # Follow-up: retrieve descriptions for this page's skills
-                    page_names = [r[0] for r in page_rows if r[0]]
-                    desc_map: dict[str, str] = {}
-                    if page_names:
-                        for chunk_start in range(0, len(page_names), 500):
-                            name_chunk = page_names[chunk_start : chunk_start + 500]
-                            binds = {f"n{i}": name for i, name in enumerate(name_chunk)}
-                            in_clause = ", ".join(f":n{i}" for i in range(len(name_chunk)))
-                            desc_sql = f"""
-                                SELECT json_value(metadata, '$.skill_name'), content
-                                FROM {self._table}
-                                WHERE role = 'skill'
-                                  AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
-                                  AND json_value(metadata, '$.skill_name') IN ({in_clause})
-                            """
-                            cur.execute(desc_sql, binds)
-                            for drow in cur.fetchall():
-                                sname, scontent = drow[0], drow[1]
-                                if sname and sname not in desc_map:
-                                    desc_map[sname] = _extract_skill_description(scontent, sname)
-
-                    skills_out = []
-                    for r in page_rows:
-                        name = r[0]
-                        cat = r[1] or "general"
-                        skills_out.append({
-                            "name": name,
-                            "category": cat,
-                            "description": desc_map.get(name, ""),
-                        })
-
-                    return json.dumps({
-                        "count_in_page": len(skills_out),
-                        "offset": offset,
-                        "more": more,
-                        "skills": skills_out,
-                    }, default=_json_default)
+                more = len(rows) > page_size
+                skills_out = []
+                for row in rows[:page_size]:
+                    sname, scat, scontent = row[0], row[1] or "general", row[2] or ""
+                    if not isinstance(scontent, str):
+                        scontent = _lob_text(scontent)
+                    item: dict[str, Any] = {
+                        "name": sname,
+                        "category": scat,
+                        "description": _extract_skill_description(scontent, sname),
+                    }
+                    copies = row[3] if len(row) > 3 else None
+                    if isinstance(copies, (int, float)) and copies > 1:
+                        item["copies"] = int(copies)
+                    skills_out.append(item)
+                return json.dumps({
+                    "count_in_page": len(skills_out),
+                    "offset": offset,
+                    "more": more,
+                    "skills": skills_out,
+                }, default=_json_default)
 
             try:
                 with self._pool.acquire() as conn:
@@ -4043,13 +4652,9 @@ class OracleMemoryProvider(MemoryProvider):
                         return json.dumps(
                             {"result": "No relevant memories found.", "count": 0}
                         )
-                    return json.dumps({"results": rows, "count": len(rows)}, default=_json_default)
+                    return json.dumps(_search_tool_payload(rows), default=_json_default)
                 except Exception as e:
-                    err_str = str(e)
-                    is_timeout = isinstance(e, TimeoutError) or any(
-                        code in err_str
-                        for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout", "TimeoutError")
-                    )
+                    is_timeout = _is_timeout_error(e) or "TimeoutError" in str(e)
                     if is_timeout:
                         logger.warning(
                             "oracle_search query timed out after %ss (%s); clean fallback to empty results",
@@ -4108,6 +4713,16 @@ class OracleMemoryProvider(MemoryProvider):
 
                 if not facts_to_add:
                     return tool_error("Missing required parameter: content or facts")
+                if len(facts_to_add) > _ADD_MAX_FACTS:
+                    return tool_error(
+                        f"too many facts in one call ({len(facts_to_add)}; max {_ADD_MAX_FACTS}): split the batch"
+                    )
+                too_long = [i for i, f in enumerate(facts_to_add) if len(f) > _MAX_FACT_CHARS]
+                if too_long:
+                    return tool_error(
+                        f"fact {too_long[0]} is {len(facts_to_add[too_long[0]])} characters (max {_MAX_FACT_CHARS}); "
+                        "store long text with oracle_chunk"
+                    )
 
                 try:
                     add_tags = _normalize_tags(args.get("tags"))
@@ -4119,6 +4734,11 @@ class OracleMemoryProvider(MemoryProvider):
                 if add_tags:
                     add_meta["tags"] = add_tags
 
+                if req_mid is not None and req_mid.lower().startswith(_SKILL_ID_PREFIX):
+                    return tool_error(
+                        f"memory_id prefix '{_SKILL_ID_PREFIX}' is reserved for the skill corpus "
+                        "(written by oracle_sync_skills)"
+                    )
                 if req_mid is not None:
                     if len(facts_to_add) != 1:
                         return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
@@ -4147,18 +4767,20 @@ class OracleMemoryProvider(MemoryProvider):
                         out["tags"] = add_tags
                     return json.dumps(out)
                 else:
-                    mids = []
-                    for f in facts_to_add:
-                        mid = f"fact_{uuid.uuid4().hex[:16]}"
-                        self._insert(
-                            memory_id=mid,
-                            session_id=self._session_id,
-                            role="fact",
-                            content=f,
-                            target=target,
-                            metadata=add_meta,
-                        )
-                        mids.append(mid)
+                    # One array insert, committed once: either every fact is
+                    # stored (and its id returned) or none is.
+                    mids = [f"fact_{uuid.uuid4().hex[:16]}" for _ in facts_to_add]
+                    self._insert_many([
+                        {
+                            "memory_id": mid,
+                            "session_id": self._session_id,
+                            "role": "fact",
+                            "content": f,
+                            "target": target,
+                            "metadata": add_meta,
+                        }
+                        for mid, f in zip(mids, facts_to_add)
+                    ])
                     return json.dumps({
                         "result": f"Batch facts stored ({len(mids)}).",
                         "memory_ids": mids,
@@ -4170,12 +4792,18 @@ class OracleMemoryProvider(MemoryProvider):
                 has_tags = args.get("tags") is not None
                 if not mid or (not content and not has_tags):
                     return tool_error("memory_id and content (or tags) required")
+                if len(content) > _MAX_FACT_CHARS:
+                    return tool_error(f"content is {len(content)} characters (max {_MAX_FACT_CHARS})")
+                if mid.lower().startswith(_SKILL_ID_PREFIX):
+                    return tool_error(_SKILL_ROW_READONLY)
                 try:
                     upd_tags = _normalize_tags(args.get("tags")) if has_tags else None
                 except ValueError as ve:
                     return tool_error(str(ve))
                 n = self._update_row(mid, content or None, tags=upd_tags)
                 if not n:
+                    if self._is_skill_row(mid):
+                        return tool_error(_SKILL_ROW_READONLY)
                     return tool_error(f"Memory not found: {mid}")
                 upd_out: dict[str, Any] = {"result": "updated", "memory_id": mid}
                 if upd_tags is not None:
@@ -4230,6 +4858,8 @@ class OracleMemoryProvider(MemoryProvider):
                         f"session_id '{sid}' is shared by unrelated rows (skill corpus / rows without a "
                         "session) and cannot be purged; delete individual rows by memory_id"
                     )
+                if mid and mid.lower().startswith(_SKILL_ID_PREFIX):
+                    return tool_error(_SKILL_ROW_READONLY)
                 with self._acquire_checked() as conn:
                     with conn.cursor() as cur:
                         if sid:
@@ -4249,21 +4879,32 @@ class OracleMemoryProvider(MemoryProvider):
                                 }
                             )
                         else:
-                            query = f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                            # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
+                            query = (
+                                f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                                " AND NVL(role, 'fact') <> 'skill'"
+                            )
                             cur.execute(
                                 query,
                                 (mid,),
                             )
                             n = cur.rowcount
                             conn.commit()
-                            if not n:
-                                return tool_error(f"Memory not found: {mid}")
-                            return json.dumps({"result": "deleted", "memory_id": mid})
+                # Only the memory_id branch gets here (the thread purge returned above).
+                if not n:
+                    if self._is_skill_row(mid):
+                        return tool_error(_SKILL_ROW_READONLY)
+                    return tool_error(f"Memory not found: {mid}")
+                return json.dumps({"result": "deleted", "memory_id": mid})
             if tool_name == "oracle_chunk":
                 content = (args.get("content") or "").strip()
                 file_path = (args.get("file_path") or args.get("path") or "").strip()
                 if not content and not file_path:
                     return tool_error("Missing required parameter: content or file_path")
+                try:
+                    max_words, overlap = _chunk_params(args.get("max_words"), args.get("overlap"))
+                except ValueError as ve:
+                    return tool_error(str(ve))
                 if file_path:
                     try:
                         p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
@@ -4338,9 +4979,7 @@ class OracleMemoryProvider(MemoryProvider):
                             structured_turns = []
 
                         if structured_turns and not content:
-                            mw = int(args.get("max_words") or 80)
-                            ov = int(args.get("overlap") or 10)
-                            ids = self._chunk_and_store("", mw, ov, turns=structured_turns)
+                            ids = self._chunk_and_store("", max_words, overlap, turns=structured_turns)
                             return json.dumps(
                                 {"result": "chunked", "count": len(ids), "memory_ids": ids}
                             )
@@ -4356,8 +4995,6 @@ class OracleMemoryProvider(MemoryProvider):
 
                 if not content:
                     return tool_error("Content is empty")
-                max_words = int(args.get("max_words") or 80)
-                overlap = int(args.get("overlap") or 10)
                 ids = self._chunk_and_store(content, max_words, overlap)
                 return json.dumps(
                     {"result": "chunked", "count": len(ids), "memory_ids": ids}
@@ -4393,7 +5030,19 @@ class OracleMemoryProvider(MemoryProvider):
                             return tool_error(f"not a directory: {d}")
                         dirs.append(dp)
                 batch_size = max(1, min(int(args.get("batch_size") or 50), 500))
-                res = self.sync_skills(mode=mode, force=force, dirs=dirs, batch_size=batch_size)
+                prune = _as_bool(args.get("prune", False))
+                dry_run = _as_bool(args.get("dry_run", False))
+                raw_limit = args.get("prune_limit")
+                try:
+                    prune_limit = 100 if raw_limit in (None, "") else int(raw_limit)
+                except (TypeError, ValueError):
+                    return tool_error("prune_limit must be an integer")
+                if not 1 <= prune_limit <= 500:
+                    return tool_error("prune_limit must be between 1 and 500")
+                res = self.sync_skills(
+                    mode=mode, force=force, dirs=dirs, batch_size=batch_size,
+                    prune=prune, prune_limit=prune_limit, dry_run=dry_run,
+                )
                 return json.dumps(res)
             if tool_name == "oracle_load_skill":
                 action = (args.get("action") or "fetch").lower().strip()
@@ -4404,13 +5053,14 @@ class OracleMemoryProvider(MemoryProvider):
                 elif action == "fetch":
                     skill = args.get("skill") or ""
                     path = args.get("path") or ""
+                    host = str(args.get("host") or "").strip()
                     variant = args.get("variant")
                     if variant is not None:
                         try:
                             variant = int(variant)
                         except (ValueError, TypeError):
                             variant = None
-                    return self._load_skill_fetch(skill, path=path, variant=variant)
+                    return self._load_skill_fetch(skill, path=path, variant=variant, host=host)
                 else:
                     return tool_error(f"Invalid action '{action}' for oracle_load_skill. Expected 'fetch' or 'list'.")
             return tool_error(f"Unknown tool: {tool_name}")
@@ -4473,9 +5123,14 @@ class OracleMemoryProvider(MemoryProvider):
                         logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
         if not chunks:
             words = text.split()
-            step = max(1, max_words - overlap)
+            size = max(1, max_words)
+            step = max(1, size - max(0, overlap))
             for i in range(0, len(words), step):
-                chunks.append(" ".join(words[i : i + max_words]))
+                piece = " ".join(words[i : i + size])
+                if piece:
+                    chunks.append(piece)
+                if i + size >= len(words):
+                    break  # the rest is already inside this chunk
         return chunks
 
     def _chunk_and_store(
@@ -4539,14 +5194,22 @@ class OracleMemoryProvider(MemoryProvider):
         force: bool = False,
         dirs: list[str | Path] | None = None,
         batch_size: int = 50,
+        prune: bool = False,
+        prune_limit: int = 100,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Index local skills from ~/.agents/skills and ~/.hermes/skills into Oracle 26ai vector memory."""
+        """Index this host's skills (the profile's skills dir and ~/.agents/skills,
+        or *dirs*) under this host's identity; *prune* removes this host's
+        skills that are gone from those roots."""
         if not self._pool:
             raise RuntimeError(
                 self._init_error or self.unavailable_reason() or "Oracle memory pool not initialized"
             )
-        sync_skills_library = _sync_skills_module().sync_skills_library
-        return sync_skills_library(provider=self, mode=mode, force=force, dirs=dirs, dry_run=False, batch_size=batch_size)
+        sync = _sync_skills_module()
+        return sync.sync_skills_library(
+            provider=self, mode=mode, force=force, dirs=dirs, dry_run=dry_run, batch_size=batch_size,
+            prune=prune, prune_limit=prune_limit, host_tag=get_host_id(),
+        )
 
     def shutdown(self) -> None:
         # Stop accepting new background writes, then drain in-flight and
@@ -4555,12 +5218,15 @@ class OracleMemoryProvider(MemoryProvider):
         with _LIVE_PROVIDERS_LOCK:
             _LIVE_PROVIDERS.discard(self)
         self._write_stop.set()
-        busy = False
-        for t in (self._write_worker, self._embed_worker):
-            if t and t.is_alive():
-                t.join(timeout=30.0)
-                busy = busy or t.is_alive()
-        # Skill-lifecycle writers (DELETE + re-INSERT of a skill, one transaction).
+        busy: list[threading.Thread] = []
+        # 1. The turn writer feeds the backfill queue, so it goes first.
+        wt = self._write_worker
+        if wt and wt.is_alive():
+            wt.join(timeout=30.0)
+            if wt.is_alive():
+                busy.append(wt)
+        # 2. Skill-lifecycle writers (DELETE + re-INSERT of a skill, one
+        # transaction; they queue backfills after their commit).
         # _write_stop is already set, so _start_sync_thread() refuses new ones and
         # this snapshot (same lock) contains every writer that did start.
         with self._sync_threads_lock:
@@ -4568,32 +5234,62 @@ class OracleMemoryProvider(MemoryProvider):
         deadline = time.monotonic() + 30.0
         for t in sync_threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
-            busy = busy or t.is_alive()
-        # Prefetch only reads; do not hold shutdown (or leak the pool) for it.
-        pf = self._prefetch_thread
-        if pf and pf.is_alive():
-            pf.join(timeout=3.0)
+            if t.is_alive():
+                busy.append(t)
+        # 3. Drain the embedding backfill: with _write_stop set every pending
+        # batch gets one attempt and no backoff (rows it cannot embed keep NULL
+        # embeddings and are re-queued by the next startup scan).
+        et = self._ensure_embed_worker()
+        if et and et.is_alive():
+            et.join(timeout=30.0)
+            if et.is_alive():
+                busy.append(et)
+        # Prefetch and the startup backfill scan only read; do not hold
+        # shutdown (or leak the pool) for them.
+        for rt in (self._prefetch_thread, self._backfill_scan_thread):
+            if rt and rt.is_alive():
+                rt.join(timeout=3.0)
         if busy:
-            # A writer still holds a pooled connection; closing the pool under
-            # it raised "list.remove(x): x not in list" and failed every queued
-            # row with "pool not initialized". Leave the pool to process exit.
-            logger.warning("oracle shutdown: worker still busy after 30s; pool left open")
+            # A writer still holds a pooled connection (an ingest call may run
+            # for the whole write budget). Closing the pool under it raised
+            # "list.remove(x): x not in list" and failed every queued row with
+            # "pool not initialized", so keep the pool for it and finish the
+            # teardown in the background once it is done. A re-initialize()
+            # with the same configuration in the meantime re-arms the pool.
+            logger.warning(
+                "oracle shutdown: %d worker(s) still busy after their join budget; pool closes when they finish",
+                len(busy),
+            )
+            pool = self._pool
+            threading.Thread(
+                target=self._finish_shutdown_when_idle,
+                args=(busy, pool),
+                daemon=True,
+                name="oracle-shutdown-finish",
+            ).start()
             return
-        pool, self._pool = self._pool, None
-        if pool is not None:
-            try:
-                pool.close()
-            except Exception as e:
-                if not _is_pool_busy_error(e):
-                    logger.debug("oracle pool close: %s", e)
-                    return
-                # A connection is still checked out (a prefetch read or a tool
-                # call on another thread). Never kill it mid-call, and never leak
-                # the pool: close it once the connection comes back.
-                logger.info("oracle pool close deferred until busy connections return: %s", e)
-                threading.Thread(
-                    target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
-                ).start()
+        with self._pool_lock:
+            pool, self._pool = self._pool, None
+        _retire_pool(pool, "shutdown")
+
+    def _finish_shutdown_when_idle(self, threads: list[threading.Thread], pool: Any) -> None:
+        """Deferred end of a busy shutdown(): wait for the busy workers (bounded
+        by the longest call budget), then close the pool unless initialize()
+        re-armed this provider with it in the meantime."""
+        budget = max(_SEARCH_TIMEOUT_SECS, _ingest_timeout_secs()) + _pool_wait_timeout_ms() / 1000.0 + 30.0
+        deadline = time.monotonic() + budget
+        for t in threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in threads):
+            # Still holding a connection past every call budget: never close
+            # the pool under it; process exit releases it.
+            logger.warning("oracle shutdown: worker still busy after %.0fs; pool left open", budget)
+            return
+        with self._pool_lock:
+            if not self._write_stop.is_set() or pool is None or self._pool is not pool:
+                return  # re-armed by initialize(), or already replaced/closed
+            self._pool = None
+        _retire_pool(pool, "shutdown")
 
     def _start_sync_thread(self, thread: threading.Thread) -> bool:
         """Start a skill-lifecycle writer and record it so shutdown() waits for it.

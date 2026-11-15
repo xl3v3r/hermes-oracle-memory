@@ -60,12 +60,16 @@ _MAX_CONTENT = 4000  # the plugin embeds (content or "")[:4000]
 _PGA_ERR = "ORA-04036"
 
 
-def load_env() -> None:
-    env_file = Path.home() / ".hermes" / ".env"
-    if not env_file.exists():
+def load_env(env_file: str | None = None) -> None:
+    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
+    when the user passes --env-file. Otherwise the script reads the process
+    environment alone; values already set there win."""
+    if not env_file:
         return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
         line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
@@ -306,7 +310,7 @@ def run_worker(
 
 
 def run(args: argparse.Namespace) -> int:
-    load_env()
+    load_env(getattr(args, "env_file", None))
     table = args.table.strip().upper()
     if not re.match(r"^[A-Z0-9_$]+$", table):
         raise ValueError(f"Invalid Oracle table name: {args.table!r}")
@@ -416,6 +420,7 @@ def main() -> None:
                    help="ORA-04036 backoffs before a worker gives up on its range")
     p.add_argument("--checkpoint", default=None, help="path to a resume checkpoint JSON")
     p.add_argument("--resume", action="store_true", help="resume each worker from its checkpoint")
+    p.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
     args = p.parse_args()
     sys.exit(run(args))
 

@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.1.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.4-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
@@ -115,7 +115,8 @@ Per ingested skill `S`:
 
 - **Metadata** (JSON): `category, chunk_index, hash (sha256 of source file), kind=skill_ingest, mtime, path, skill_name, total_chunks, version, host, target=memory`
 - **Reconstruction fidelity**: Chunks are 80 whole words joined by single spaces with 10-word overlap. Reassembled text is word-accurate and lossless at word level (line/markdown formatting flattened).
-- **Backward compatibility**: Legacy single-row skills (pre-c0 era, no `:cN` suffix) are treated as meta rows and return with status `"meta_only"`.
+- **Host identity**: `{host}` is `HERMES_HOST_ID`, or the short host name in lower case. A host only replaces or deletes rows under its own `skill:{host}:` prefix. Profiles on one host share the id and so share one copy per skill name. A copy whose SKILL.md is live outside the scanned skill dirs is not replaced: the bulk sync reports it as `skipped_foreign`. Profiles are not fully isolated (#14), so set `HERMES_HOST_ID` per profile to keep them apart.
+- **Backward compatibility**: Legacy single-row skills (pre-c0 era, no `:cN` suffix) are treated as meta rows and return with status `"meta_only"`. Legacy rows without a host (`skill:{S}:cN`) form the shared corpus; no host prunes them.
 
 ### Using `oracle_load_skill`
 
@@ -131,7 +132,7 @@ Search the catalog by substring or paginate:
 }
 ```
 
-Returns `{count_in_page, offset, more, skills: [{name, category, description}]}`.
+Returns `{count_in_page, offset, more, skills: [{name, category, description, copies?}]}` — one entry per skill name; `copies` appears when several hosts store the skill.
 
 #### Materializing a Skill (`action="fetch"`)
 
@@ -145,34 +146,43 @@ Fetch and reconstruct the full skill document:
 ```
 
 Returns `{status: "ok", skill, category, source_host_path, total_chunks, chunk_count, word_count, markdown, references: {rel_path: text}, content_hash, mtime}`.
-If cross-host variants exist with different paths, returns `status: "multiple_variants"` with a variants list to disambiguate.
+If several copies exist (different hosts or paths), returns `status: "multiple_variants"` with a `variants` list (`variant`, `host`, `path`, `hash`, `mtime`); pass `variant`, or `host` and/or `path`, to pick one.
 
-### Zombie-Safe Host-Scoped Pruning
+### Host-Scoped Pruning
 
-In a shared multi-server table, deletions must be host-scoped:
-- **Foreign-host rows are never touched** by another server.
-- **Locally deleted skills** are pruned from the shared database using:
+In a shared multi-server table, deletions are host-scoped:
+- **Other hosts' rows and the host-less shared corpus are never touched.**
+- Pruning is opt-in. It removes this host's skills whose `SKILL.md` is gone from the scanned roots (the active profile's skills dir and `~/.agents/skills`, or `--dirs`):
   ```bash
-  python3 scripts/sync_skills.py --prune-host /path/to/local/skills/ --prune-limit 500
+  python3 scripts/sync_skills.py --prune --dry-run      # preview
+  python3 scripts/sync_skills.py --prune --prune-limit 500
+  python3 scripts/sync_skills.py --prune-host /path/to/local/skills/   # only skills under this dir
   ```
-- **Dry-run verification**:
-  ```bash
-  python3 scripts/sync_skills.py --dry-run
-  ```
+  The `oracle_sync_skills` tool takes the same options (`prune`, `prune_limit`, `dry_run`).
+- Each changed skill is replaced in one transaction (delete of this host's rows + insert), so a failed write keeps the previous copy.
 
 ### Live Lifecycle Syncing
 
 The `on_skill_lifecycle` hook synchronizes changes in real-time as skills are managed by the agent:
-- Actions `created`, `edited`, `patched`, `installed`, `restored` immediately format and upsert skill chunks in the background. Idempotency pre-checks content hashes before writing.
-- Actions `archived` safely delete corpus rows only if the `SKILL.md` file has been removed from the local disk.
+- The hook only schedules work. One background writer per skill looks up the file under the active profile's skill roots, checks the content hash and writes; events that arrive while it runs are coalesced into one re-run with the latest event.
+- Actions `created`, `edited`, `patched`, `installed`, `restored` replace this host's copy of the skill (skipped when the hash is unchanged).
+- Action `archived` deletes this host's copy only if no `SKILL.md` for the skill is left on disk.
 
-### Legacy Host-Tag Migration
+### Legacy Host-Identity Migration
 
-To migrate older untagged rows (`skill:{name}:cN`) to host-tagged identifiers (`skill:{host}:{name}:cN`), run the one-shot migration utility:
+Rows written before 1.1.1.4 have no host (`skill:{name}:cN`). The migration gives a legacy skill its owner's identity only when one host has a live `SKILL.md` at the stored path; everything else stays in the shared corpus. Upgrade every host first, then run it from one host:
 
 ```bash
-python3 scripts/sync_skills.py --migrate-host-tags
+# on each host: list its live skills (no database access)
+python3 scripts/sync_skills.py --list-local > host-a.json
+# from one host: dry run (default), review the counts, then apply
+python3 scripts/sync_skills.py --migrate-host-identity --listing host-a.json --listing host-b.json
+python3 scripts/sync_skills.py --migrate-host-identity --listing host-a.json --listing host-b.json --apply
+# undo (dry run first, then --apply)
+python3 scripts/sync_skills.py --reverse-host-identity
 ```
+
+The migration runs in one transaction, checks the updated row count before committing, and keeps the old id in `metadata.legacy_id` for the reverse step.
 
 ## Vector Index Maintenance & ORA-51815
 
@@ -192,9 +202,21 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
   ```
   and automatically refreshes optimizer statistics via `DBMS_STATS.GATHER_TABLE_STATS`.
 
+## What's new in v1.1.1.4
+
+Robustness release with per-host skill identity — full details in `RELEASE_NOTES_1.1.1.4.md`:
+
+- **Per-host skill copies**: skill rows are `skill:{host}:{name}:cN`; a host only replaces or deletes its own copy, pruning is opt-in, and a dry-run-first migration (with a reverse step) relabels existing rows.
+- **Lifecycle hook off the caller's thread**: one writer per skill, coalesced events, profile-aware skill roots.
+- **No lost writes during an ONNX cooldown**: facts are stored at once and embedded later by a backfill with backoff.
+- **Pool and transaction safety**: old pools are retired, shutdown never closes a pool under a busy worker, inserts never retry inside a broken transaction, `ORA-00060` no longer starts the cooldown.
+- **Faster, consistent recall**: CLOBs in one round trip, sized fetches, ranking before the `top_k` cut, strict timeout classification.
+- **Tool limits**: batch and output caps, read-only skill rows for the generic tools, case-insensitive tags, memory mirror handles replace/remove.
+- **Hygiene**: helper scripts read an env file only with `--env-file`; SPDX license `BUSL-1.1`.
+
 ## What's new in v1.1.1.3
 
-Reliability + capability release — full details in `RELEASE_NOTES_1.1.1.3.md`:
+Reliability + capability release (details preserved in `CHANGELOG.md`):
 
 - **No more false "embedding model is unavailable"**: broken pooled sessions (`ORA-01002`), client timeouts, duplicate ids and other data errors, and Python exceptions no longer start the 60 s ONNX cooldown; poisoned connections are dropped and search retries once.
 - **Skill-lifecycle hook survives provider shutdown** instead of failing every event with `pool not initialized`.

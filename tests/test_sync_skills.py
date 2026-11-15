@@ -234,13 +234,35 @@ class TestSyncSkillsLibrary(unittest.TestCase):
             s_dir.mkdir()
             (s_dir / "SKILL.md").write_text("---\nname: demo\ndescription: Demo.\n---\n", encoding="utf-8")
 
+            # This host's own copy is stale -> updated (replaced in place).
             cur.fetchall.return_value = [
-                ("skill:demo", json.dumps({"hash": "stale_hash", "skill_name": "demo"}))
+                ("skill:hosta:demo:c0", json.dumps({"hash": "stale_hash", "skill_name": "demo", "host": "hosta"}))
             ]
 
-            res = sync_skills_library(provider=provider, mode="meta", force=False, dirs=[tmpdir])
+            res = sync_skills_library(provider=provider, mode="meta", force=False, dirs=[tmpdir], host_tag="hosta")
             self.assertEqual(res["status"], "success")
             self.assertEqual(res["scanned"], 1)
+            self.assertEqual(res["updated"], 1)
+            self.assertEqual(res["indexed"], 0)
+            self.assertEqual(provider._insert_many.call_count, 1)
+
+    def test_own_stale_copy_replaced_even_if_another_copy_matches(self):
+        provider = MagicMock()
+        provider._table = "HERMES_AGENT_MEMORY"
+        conn = MagicMock()
+        cur = MagicMock()
+        provider._pool.acquire.return_value.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+        with tempfile.TemporaryDirectory() as tmpdir:
+            s_dir = Path(tmpdir) / "demo"
+            s_dir.mkdir()
+            (s_dir / "SKILL.md").write_text("---\nname: demo\ndescription: Demo.\n---\n", encoding="utf-8")
+            skill = parse_skill_file(s_dir / "SKILL.md")
+            cur.fetchall.return_value = [
+                ("skill:hosta:demo:c0", json.dumps({"hash": "stale", "skill_name": "demo"})),
+                ("skill:hostb:demo:c0", json.dumps({"hash": skill.content_hash, "skill_name": "demo"})),
+            ]
+            res = sync_skills_library(provider=provider, mode="meta", dirs=[tmpdir], host_tag="hosta")
             self.assertEqual(res["updated"], 1)
             self.assertEqual(provider._insert_many.call_count, 1)
 
@@ -300,9 +322,12 @@ class TestProviderIntegration(unittest.TestCase):
         for idx, row in enumerate(rows):
             self.assertEqual(row["chunk_index"], idx)
             self.assertEqual(row["memory_id"], f"skill:ref-skill:c{idx}")
-            self.assertEqual(row["conv_ref"], "ref-skill")
+            self.assertEqual(row["conv_ref"], "ref-skill")  # no host: legacy layout
             self.assertEqual(row["role"], "skill")
             self.assertEqual(row["session_id"], "skills")
+        hosted = format_skill_payload(skill, mode="full", host="hosta")
+        self.assertEqual({r["conv_ref"] for r in hosted}, {"skill:hosta:ref-skill"})
+        self.assertEqual([r["memory_id"] for r in hosted], [f"skill:hosta:ref-skill:c{i}" for i in range(len(hosted))])
 
         # Row 0 is meta
         self.assertEqual(rows[0]["chunk_index"], 0)
@@ -333,41 +358,79 @@ class TestProviderIntegration(unittest.TestCase):
         # Assert reference chunk content
         self.assertTrue(any("mississippi-procedure.md" in r["content"] for r in rows[24:]))
 
-    def test_batch_delete_chunking_and_target_isolation(self):
+    def test_per_skill_replace_is_own_rows_only_and_transactional(self):
+        """Each changed skill: DELETE of this host's rows + INSERT, one commit.
+        Other hosts' copies and legacy rows are never in a DELETE."""
         provider = MagicMock()
         provider._table = "HERMES_AGENT_MEMORY"
+        provider._insert_many.return_value = []
         mock_cur = MagicMock()
-        # Mock existing_map to contain skill:in-db:c0, but NOT skill:new-skill:c0 or casemark archive
         mock_cur.fetchall.return_value = [
             ("skill:in-db:c0", "in-db", '{"hash": "old_hash"}'),
+            ("skill:hostb:in-db:c0", "skill:hostb:in-db", '{"hash": "old_hash", "host": "hostb"}'),
             ("skill:casemark-unrelated:c0", "casemark-unrelated", '{"hash": "cm_hash"}'),
         ]
         mock_conn = MagicMock()
+        events = []
+        mock_cur.execute.side_effect = lambda sql, *a, **k: events.append("delete" if "DELETE" in sql else "sql")
+        provider._insert_many.side_effect = lambda rows, tx_conn=None: (events.append("insert"), [])[1]
+        mock_conn.commit.side_effect = lambda: events.append("commit")
         mock_conn.cursor.return_value.__enter__.return_value = mock_cur
         mock_conn.cursor.return_value.__exit__.return_value = False
         provider._pool.acquire.return_value.__enter__.return_value = mock_conn
         provider._pool.acquire.return_value.__exit__.return_value = False
 
         with tempfile.TemporaryDirectory() as td:
-            # 2 skills to sync: in-db (exists) and not-in-db (does not exist)
-            s1 = Path(td) / "in-db"
-            s1.mkdir()
-            (s1 / "SKILL.md").write_text("---\nname: in-db\ndescription: Exists in DB\n---\nBody", encoding="utf-8")
-            s2 = Path(td) / "not-in-db"
-            s2.mkdir()
-            (s2 / "SKILL.md").write_text("---\nname: not-in-db\ndescription: Not in DB\n---\nBody", encoding="utf-8")
+            for name in ("in-db", "not-in-db"):
+                d = Path(td) / name
+                d.mkdir()
+                (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: x\n---\nBody", encoding="utf-8")
 
-            res = sync_skills_library(provider=provider, mode="meta", force=True, dirs=[td], batch_size=50)
+            res = sync_skills_library(provider=provider, mode="meta", force=True, dirs=[td], batch_size=50,
+                                      host_tag="hosta")
             self.assertEqual(res["status"], "success")
 
-            # executemany was called for delete
-            mock_cur.executemany.assert_called_once()
-            call_args = mock_cur.executemany.call_args[0]
-            del_sql, chunk = call_args[0], call_args[1]
-            self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY", del_sql)
-            # Only in-db was in the delete chunk, not-in-db and casemark-unrelated were NOT deleted
-            self.assertEqual(len(chunk), 1)
-            self.assertEqual(chunk[0][0], "in-db")
+        mock_cur.executemany.assert_not_called()
+        deletes = [c[0] for c in mock_cur.execute.call_args_list if "DELETE" in c[0][0]]
+        self.assertEqual(sorted(d[1]["pfx"] for d in deletes),
+                         ["skill:hosta:in-db:c%", "skill:hosta:not-in-db:c%"])
+        for sql, _ in deletes:
+            self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY", sql)
+            self.assertIn("memory_id LIKE :pfx ESCAPE", sql)
+        self.assertEqual([e for e in events if e != "sql"], ["delete", "insert", "commit"] * 2)
+        for c in provider._insert_many.call_args_list:
+            self.assertIs(c.kwargs["tx_conn"], mock_conn)
+            for row in c[0][0]:
+                self.assertTrue(row["memory_id"].startswith("skill:hosta:"))
+                self.assertTrue(row["conv_ref"].startswith("skill:hosta:"))
+
+    def test_failed_skill_rolls_back_and_others_continue(self):
+        provider = MagicMock()
+        provider._table = "HERMES_AGENT_MEMORY"
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = []
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        provider._pool.acquire.return_value.__enter__.return_value = mock_conn
+
+        def ins(rows, tx_conn=None):
+            if rows[0]["metadata"]["skill_name"] == "bad":
+                raise RuntimeError("ORA-00001: unique constraint violated")
+            return []
+
+        provider._insert_many.side_effect = ins
+        with tempfile.TemporaryDirectory() as td:
+            for name in ("bad", "good"):
+                d = Path(td) / name
+                d.mkdir()
+                (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: x\n---\nBody", encoding="utf-8")
+            res = sync_skills_library(provider=provider, mode="meta", dirs=[td], host_tag="hosta")
+        self.assertEqual(res["status"], "partial")
+        self.assertEqual(res["upserted"], 1)
+        self.assertEqual(len(res["errors"]), 1)
+        self.assertIn("bad", res["errors"][0])
+        mock_conn.rollback.assert_called_once()
+        mock_conn.commit.assert_called_once()
 
     def test_provider_handle_tool_call_uninitialized(self):
         provider = oracle_plugin.OracleMemoryProvider()

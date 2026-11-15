@@ -1,7 +1,7 @@
 ---
 name: oracle-skill-corpus
 description: Discover and materialize shared cross-server skills from Oracle 26ai ADB memory at runtime without requiring local disk installation.
-version: 1.1.1.3
+version: 1.1.1.4
 author: Hermes Community
 metadata:
   hermes:
@@ -77,19 +77,19 @@ The tool reconstructs:
 
 #### Multi-Variant Handling
 
-When multiple servers have contributed variants of the same skill with different paths, `fetch` returns a `variants` manifest:
+When several hosts (or paths) hold a copy of the same skill, `fetch` returns a `variants` manifest:
 
 ```json
 {
   "status": "multiple_variants",
   "variants": [
-    {"variant": 0, "path": "/srv/agent-a/.hermes/skills/example/sample/SKILL.md", "hash": "abc..."},
-    {"variant": 1, "path": "/Users/agent-b/.hermes/skills/example/sample/SKILL.md", "hash": "def..."}
+    {"variant": 0, "host": "agent-a", "path": "/srv/agent-a/.hermes/skills/example/sample/SKILL.md", "hash": "abc..."},
+    {"variant": 1, "host": "agent-b", "path": "/Users/agent-b/.hermes/skills/example/sample/SKILL.md", "hash": "def..."}
   ]
 }
 ```
 
-Specify either the `variant` index or `path` to select a specific variant:
+Specify the `variant` index, or `host` and/or `path`, to select a specific variant (the same path on two hosts needs `host`):
 
 ```json
 {
@@ -104,4 +104,5 @@ Specify either the `variant` index or `path` to select a specific variant:
 - Skills are indexed into the shared `HERMES_AGENT_MEMORY` table under `role="skill"`.
 - Chunks preserve exact word sequences with 10-word boundary overlaps.
 - Live updates: creating, editing, patching, or installing a skill locally immediately synchronizes it to Oracle via the `on_skill_lifecycle` hook.
-- Zombie-safe pruning: deleting or moving a skill locally prunes only this host's rows, leaving foreign host skills untouched.
+- Rows are `skill:<host>:<name>:c<N>`; a host only replaces or deletes its own copy. Host-less legacy rows are the shared corpus and are never pruned.
+- Pruning is opt-in (`oracle_sync_skills` with `prune=true`, preview with `dry_run=true`) and removes only this host's skills that are gone from disk.

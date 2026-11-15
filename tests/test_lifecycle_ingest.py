@@ -22,13 +22,16 @@ class TestLifecycleIngest(unittest.TestCase):
         self.provider._pool = MagicMock()
         self.mock_conn = MagicMock()
         self.mock_cur = MagicMock()
-        self.provider._pool.acquire.return_value.__enter__.return_value = self.mock_conn
+        # Writers use _acquire_checked() (pool.acquire() without "with"); other
+        # paths use "with pool.acquire() as conn": both get mock_conn.
+        self.provider._pool.acquire.return_value = self.mock_conn
+        self.mock_conn.__enter__.return_value = self.mock_conn
         self.mock_conn.cursor.return_value.__enter__.return_value = self.mock_cur
 
     def test_create_and_patch_adds_rows_matching_format_skill_payload(self):
         """Verify on_skill_lifecycle('created'/'patched') resolves local file and inserts payload rows."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            skills_dir = Path(tmpdir) / "skills"
+            skills_dir = Path(tmpdir) / ".hermes" / "skills"
             skill_folder = skills_dir / "my-test-skill"
             skill_folder.mkdir(parents=True)
             skill_file = skill_folder / "SKILL.md"
@@ -67,7 +70,7 @@ class TestLifecycleIngest(unittest.TestCase):
     def test_unchanged_hash_is_noop_zero_db_calls(self):
         """Verify when local file hash equals the database c0 hash, zero DB writes occur."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            skills_dir = Path(tmpdir) / "skills"
+            skills_dir = Path(tmpdir) / ".hermes" / "skills"
             skill_folder = skills_dir / "noop-skill"
             skill_folder.mkdir(parents=True)
             skill_file = skill_folder / "SKILL.md"
@@ -97,7 +100,7 @@ class TestLifecycleIngest(unittest.TestCase):
     def test_archive_deletes_only_when_local_file_is_gone(self):
         """Verify archive deletes from DB iff file is absent; skips delete if file is still present."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            skills_dir = Path(tmpdir) / "skills"
+            skills_dir = Path(tmpdir) / ".hermes" / "skills"
             skill_folder = skills_dir / "arch-skill"
             skill_folder.mkdir(parents=True)
             skill_file = skill_folder / "SKILL.md"
@@ -127,15 +130,15 @@ class TestLifecycleIngest(unittest.TestCase):
                 ]
                 self.assertEqual(len(delete_calls_b), 1)
                 del_sql, binds = delete_calls_b[0][0][0], delete_calls_b[0][0][1]
-                self.assertEqual(binds["s"], "arch-skill")
+                host = oracle_plugin.get_host_id()
+                self.assertEqual(binds["pfx"], f"skill:{host}:arch-skill:c%".replace("_", "\\_"))
 
     def test_foreign_host_rows_never_touched(self):
-        """Verify delete query strictly scopes to host_id and local host root prefix."""
+        """The archive delete is scoped to this host's own id prefix: other
+        hosts' copies and the host-less shared corpus are never matched."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            skills_dir = Path(tmpdir) / "skills"
-            # No local file exists for foreign skill
             with patch("pathlib.Path.home", return_value=Path(tmpdir)), \
-                 patch.dict(os.environ, {"HERMES_HOST_ID": "atlas_host"}):
+                 patch.dict(os.environ, {"HERMES_HOST_ID": "peer_host"}):
 
                 self.provider.on_skill_lifecycle("archived", "foreign-skill")
                 time.sleep(0.1)
@@ -148,11 +151,11 @@ class TestLifecycleIngest(unittest.TestCase):
                 sql = delete_calls[0][0][0]
                 binds = delete_calls[0][0][1]
 
-                # SQL must gate deletion to current host
-                self.assertIn("json_value(metadata, '$.host') = :h", sql)
-                self.assertEqual(binds["h"], "atlas_host")
-
-
+                self.assertIn("memory_id LIKE :pfx ESCAPE", sql)
+                self.assertNotIn("conv_ref", sql)
+                self.assertNotIn("$.path", sql)
+                # '_' escaped: peer_host must not match e.g. peerXhost
+                self.assertEqual(binds, {"pfx": "skill:peer\\_host:foreign-skill:c%"})
 
 
 class TestLifecycleUpsertAtomic(unittest.TestCase):
@@ -181,7 +184,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
 
     def _fire(self, insert_side_effect):
         with tempfile.TemporaryDirectory() as tmpdir:
-            d = Path(tmpdir) / "skills" / "atomic-skill"
+            d = Path(tmpdir) / ".hermes" / "skills" / "atomic-skill"
             d.mkdir(parents=True)
             (d / "SKILL.md").write_text("---\nname: atomic-skill\ndescription: d\n---\n\n# Atomic\nBody.\n")
             with patch("pathlib.Path.home", return_value=Path(tmpdir)), \
@@ -193,7 +196,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
         ins = self._fire(lambda rows, tx_conn=None: (self.events.append("insert"), [])[1])
         self.assertEqual(ins.call_args.kwargs["tx_conn"], self.conn)
         self.assertEqual([e for e in self.events if e != "sql"], ["delete", "insert", "commit"])
-        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self.assertNotIn(self.provider._lifecycle_key("atomic-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
 
     def test_failed_insert_rolls_back_the_delete(self):
         def boom(rows, tx_conn=None):
@@ -202,7 +205,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
         self.assertIn("rollback", self.events)
         self.assertNotIn("commit", self.events)
         self.provider._pool.drop.assert_called_once_with(self.conn)  # non-ORA error: session dropped
-        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self.assertNotIn(self.provider._lifecycle_key("atomic-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
 
     def test_pool_cleared_mid_upsert_still_commits_on_captured_connection(self):
         def clear_pool(rows, tx_conn=None):
@@ -227,7 +230,7 @@ class TestLifecycleUpsertAtomic(unittest.TestCase):
         start.assert_not_called()
         ins.assert_not_called()
         self.assertNotIn("delete", self.events)
-        self.assertNotIn("atomic-skill", self.provider._in_flight_lifecycle_skills)
+        self.assertNotIn(self.provider._lifecycle_key("atomic-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
         self._sync.start()
 
 

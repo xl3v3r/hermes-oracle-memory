@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.1.4] - 2026-11-14
+
+### Added
+- `oracle_sync_skills`: `prune`, `prune_limit` and `dry_run`; `oracle_load_skill fetch`: `host`; `list` reports `copies`.
+- `scripts/sync_skills.py`: `--prune`, `--list-local`, `--migrate-host-identity --listing <file>` (dry run unless `--apply`) and `--reverse-host-identity`.
+- Embedding backfill with exponential backoff (2–300 s, 8 attempts) and a startup scan that re-queues rows with a NULL embedding (#7).
+- Tests: `test_lifecycle_robustness.py`, `test_recall_path.py`, `test_tool_surface.py`, `test_skill_identity.py`, `test_skill_ownership.py`, `test_script_hygiene.py`.
+
+### Fixed
+- **Cross-host skill deletes (#5)**: skill rows are `skill:<host>:<name>:c<N>`; sync, lifecycle and prune delete only this host's id prefix (LIKE wildcards escaped), never other hosts' copies or the host-less shared corpus. Each changed skill is replaced in its own transaction; a failed skill is rolled back and reported (`status: "partial"`) while the rest continue. `get_host_id()` gives the same id with or without `HOSTNAME` in the environment.
+- **Lifecycle hook (#6)**: work moved off the caller's thread (one writer per skill and table in the process), events during a write are coalesced instead of dropped, the skill roots follow the active profile's Hermes home, the event name is validated, and the stored identity is the parsed skill name (as in the bulk sync). The writer key is fixed at scheduling time, and coalesced events run on the provider they reached. Skills are found up to six levels below a root. A copy whose stored SKILL.md is live outside the scanned skill dirs is not replaced, and `archived` keeps any copy whose stored SKILL.md still exists (unless it is the archived symlink's target). Profiles sharing a host id are not fully isolated (#14).
+- **Writes lost during an ONNX cooldown (#7)**: the row is written with a NULL embedding and backfilled; `shutdown()` drains the backfill within its budget. The backfill keeps only a row's latest text and writes a vector only while the row has none and still holds that text; rows the guard skips are re-read and re-queued with their stored text (bounded). Short text is bound as a string, longer text as a temporary CLOB released at the commit.
+- **Pool lifecycle (#8)**: the old pool is retired on re-init and failed init; `shutdown()` does not close the pool while a worker is still busy.
+- **Transactional insert (#9)**: savepoint per attempt inside a caller's transaction, no retry inside a broken transaction; `ORA-00060` is a data error.
+- **Recall path (#10)**: fresh cursor per `ORA-51815` retry, CLOBs as strings in one round trip (`fetch_lobs=False`; the `DB_TYPE_LONG` output handlers are gone), sized `arraysize`/`prefetchrows`, ranking before the `top_k` cut, one hybrid text weight, timeouts classified by error code.
+- **Tool surface (#11)**: `oracle_add` ≤ 100 facts × 32,000 chars, all-or-nothing; `oracle_get` limit enforced; search results capped at 4,000 chars with tags; `max_words` 10–1000; `skill:` rows read-only for generic tools (`oracle_delete` included); case-insensitive tags; memory mirror handles `replace`/`remove`.
+- `oracle_load_skill`: `fetch` bounds rows per copy in SQL and keys copies by (host, path); `list` pages over distinct names (no repeated names, no short pages) and its filter is a literal substring; Oracle NUMBER metadata serialises.
+- Bulk sync: `mode="full"` passed as a keyword was overridden by the positional default and ran a meta sync; another host's identical copy no longer counts as current; a meta-only copy is not current for a full sync; a copy is current only when it records the skill's present path; a same-host copy whose SKILL.md is live in another profile is never replaced (`skipped_foreign`).
+- Stored SKILL.md paths are in-root (unresolved), so skill dirs symlinked into a root are archived and pruned correctly; `--list-local` listings carry both the in-root and the resolved path, and the migration matches legacy rows on either.
+
+### Changed
+- **Helper scripts (#12)** read `OCI_*` from the environment and load a KEY=VALUE file only with `--env-file`; nothing is read at import time.
+- `pyproject.toml`: `license = "BUSL-1.1"` (SPDX) with `license-files`; build requires `setuptools>=77`. CLA allowlist names its bots instead of `*[bot]`.
+- `scripts/sync_skills.py --migrate-host-tags` (path-prefix relabel) replaced by `--migrate-host-identity`.
+- **Version bumps**: `1.1.1.3` → `1.1.1.4` across `VERSION`, `plugin.yaml`, `pyproject.toml`, `__version__`, README/INSTALL badges, both `skills/*/SKILL.md` pins, `AGENTS.md` and `NEEDS.md` (stale since 1.1.0.1; now covered by the version test).
+
+### Notes
+- No schema change. Single-current-notes convention maintained: this is `RELEASE_NOTES_1.1.1.4.md`; the v1.1.1.3 notes file was removed.
+- Test suite: 450 passed / 3 skipped.
+
 ## [1.1.1.3] - 2026-11-14
 
 ### Added

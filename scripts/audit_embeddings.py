@@ -31,12 +31,16 @@ _DEFAULT_SAMPLE = 50
 _DEFAULT_TOL = 0.01
 
 
-def load_env() -> None:
-    env_file = Path.home() / ".hermes" / ".env"
-    if not env_file.exists():
+def load_env(env_file: str | None = None) -> None:
+    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
+    when the user passes --env-file. Otherwise the script reads the process
+    environment alone; values already set there win."""
+    if not env_file:
         return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
         line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
@@ -67,7 +71,7 @@ def connect() -> Any:
 
 
 def run(args: argparse.Namespace) -> int:
-    load_env()
+    load_env(getattr(args, "env_file", None))
     table = args.table.strip().upper()
     if not table.replace("_", "").isalnum():
         raise ValueError(f"Invalid table name: {args.table!r}")
@@ -167,6 +171,7 @@ def main() -> None:
                    help="cosine distance above which a row counts as stale")
     p.add_argument("--quiet", action="store_true",
                    help="print only problems (cron-friendly silence when healthy)")
+    p.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
     args = p.parse_args()
     if args.quiet:
         logging.getLogger().setLevel(logging.ERROR)
