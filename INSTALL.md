@@ -1,11 +1,11 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.1.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.4-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
 
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1.3) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1.4) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 
@@ -113,6 +113,8 @@ To achieve **zero external embedding API costs**, configure in-database ONNX inf
    ```bash
    python3 scripts/setup_onnx_model.py
    ```
+   The helper scripts read `OCI_DB_*` / `OCI_WALLET_*` from the environment. To use the settings from your Hermes env file (Step 4), pass it explicitly: `python3 scripts/setup_onnx_model.py --env-file <path to the env file>`.
+
    This exports the model with dynamic token slicing (bounded to 512 tokens to avoid `ORA-54401`), stages it via `DATA_PUMP_DIR`, and registers it with `DBMS_VECTOR.LOAD_ONNX_MODEL`.
 
 2. Specify the ONNX model name in your environment:
@@ -211,6 +213,8 @@ If upgrading from an earlier version (e.g. 1536-dimensional vectors or null embe
 ```bash
 python3 scripts/backfill_embeddings.py --workers 4 --batch-size 32
 ```
+
+(Export the `OCI_*` settings first, or add `--env-file <path to the env file>`; no script reads the Hermes env file on its own.)
 
 The backfill utility:
 - Multithreads batch processing across database sessions.

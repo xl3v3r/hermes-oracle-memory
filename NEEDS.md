@@ -1,9 +1,9 @@
 # hermes-oracle-memory — what it needs now
 
-**Version in play:** 1.1.0.1 (`VERSION`, `pyproject.toml`, `plugin.yaml`, `__init__.py` agree)
-**Installed at:** `~/.hermes/plugins/oracle` (pinned checkout, tag `v1.1.0.1`)
+**Version in play:** 1.1.1.4 (`VERSION`, `pyproject.toml`, `plugin.yaml`, `__init__.py` agree)
+**Installed at:** `~/.hermes/plugins/oracle` (pinned checkout, tag `v1.1.1.4`)
 **Environment:** Oracle 26ai ADB, 2 CPUs, in-DB ONNX `BGE_BASE_EN_V1_5`, `HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1`, table `hermes_agent_memory`
-**Updated:** 2026-11-07, v1.1.0.1 fleet-sync hardening release
+**Updated:** 2026-11-14, v1.1.1.4 robustness and skill-corpus identity release
 
 ---
 
@@ -20,6 +20,14 @@
 | — | `_JUNK` filter hid every `[skill_ingest]` row | 1.0.9.4.2 |
 | — | `oracle_sync_skills` tool call crashed on `@dataclass` load | 1.0.9.4.2 |
 | — | **Skill rows written but unreachable by every search mode** | **1.0.9.6** |
+| #5 | Skill rows of all hosts shared one id; one host's sync or archive deleted another host's copy | 1.1.1.4 (`skill:<host>:<name>:c<N>`, own-row deletes, opt-in prune, migration with reverse step) |
+| #6 | Lifecycle hook did file and DB work on the caller's thread, dropped events during a write, ignored the profile | 1.1.1.4 (one writer per skill, coalesced re-run, profile-aware roots) |
+| #7 | Writes during an ONNX cooldown were lost; backfill retried without backoff | 1.1.1.4 (NULL-embedding write + backfill with backoff, startup re-queue) |
+| #8 | Old pool leaked on re-init; shutdown could close the pool under a busy worker | 1.1.1.4 |
+| #9 | Transactional insert retried inside a broken transaction; `ORA-00060` tripped the cooldown | 1.1.1.4 |
+| #10 | Recall path: reused cursor on retry, LOB round trips, fetch sizing, ranking after the cut | 1.1.1.4 |
+| #11 | Tool surface: unbounded batches and output, schema gaps, memory mirror ignored replace/remove | 1.1.1.4 |
+| #12 | Scripts read the env file unconditionally; non-SPDX license; wildcard CLA bot allowlist | 1.1.1.4 |
 
 ## 1. Skill retrieval starvation — RESOLVED in 1.0.9.6
 
