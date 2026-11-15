@@ -327,6 +327,14 @@ class TestMigrateHostIdentity(unittest.TestCase):
         conn.commit.assert_called_once()
 
 
+class TestMigrationCliDefaultsToDryRun(unittest.TestCase):
+    def test_migrate_and_reverse_need_apply(self):
+        src = (REPO / "scripts" / "sync_skills.py").read_text(encoding="utf-8")
+        self.assertIn("dry = args.dry_run or not args.apply", src)
+        self.assertIn("reverse_host_identity(conn, table_name, dry_run=dry)", src)
+        self.assertIn("migrate_host_identity(conn, table_name, listings, dry_run=dry)", src)
+
+
 class TestSkillFetchVariants(unittest.TestCase):
     def test_same_path_on_two_hosts_are_two_variants(self):
         p, conn, cur = _provider()

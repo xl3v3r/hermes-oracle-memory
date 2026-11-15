@@ -1329,6 +1329,8 @@ def main() -> None:
     parser.add_argument("--listing", action="append", default=[],
                         help="--list-local output file of a host (repeatable; default: this host)")
     parser.add_argument("--reverse-host-identity", action="store_true", help="Undo --migrate-host-identity")
+    parser.add_argument("--apply", action="store_true",
+                        help="Write the --migrate-host-identity / --reverse-host-identity changes (default: dry run)")
     parser.add_argument("--env-file", default=None,
                         help="Load KEY=VALUE settings (OCI_DB_*) from this file; by default only the environment is read")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -1368,12 +1370,14 @@ def main() -> None:
             table_name = args.table or provider._table
             with provider._pool.acquire() as conn:
                 conn.call_timeout = _ingest_timeout_ms()
+                # Migrations are dry runs unless --apply is given.
+                dry = args.dry_run or not args.apply
                 if args.reverse_host_identity:
-                    rep = reverse_host_identity(conn, table_name, dry_run=args.dry_run)
+                    rep = reverse_host_identity(conn, table_name, dry_run=dry)
                 else:
                     listings = [json.loads(Path(f).read_text(encoding="utf-8")) for f in args.listing] \
                         or [list_local_skills(dirs=args.dirs)]
-                    rep = migrate_host_identity(conn, table_name, listings, dry_run=args.dry_run)
+                    rep = migrate_host_identity(conn, table_name, listings, dry_run=dry)
             print(json.dumps(rep, indent=2))
             return
 
