@@ -18,7 +18,7 @@ import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 logger = logging.getLogger("hermes.oracle_sync_skills")
 
@@ -539,6 +539,22 @@ def default_skill_roots() -> list[Path]:
     return out
 
 
+# Trees that never hold live skills: Hermes moves archived skills to .archive/.
+IGNORED_SUBDIRS = frozenset({".archive", ".git", ".venv", ".pytest_cache", ".locks", ".curator_backups"})
+
+
+def is_live_skill_file(path: Any) -> bool:
+    """True when *path* is an existing file that does not resolve into an
+    ignored tree (a link leading into .archive/ is not a live skill)."""
+    if not path:
+        return False
+    try:
+        p = Path(str(path))
+        return p.is_file() and not any(part in IGNORED_SUBDIRS for part in p.resolve().parts)
+    except OSError:
+        return False
+
+
 def resolve_skill_roots(dirs: Sequence[str | Path] | None = None) -> list[Path]:
     """Existing, resolved, de-duplicated scan roots (*dirs* or the defaults)."""
     raw: Sequence[str | Path] = dirs if dirs else default_skill_roots()
@@ -547,6 +563,17 @@ def resolve_skill_roots(dirs: Sequence[str | Path] | None = None) -> list[Path]:
         p = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
         if p.is_dir() and p not in out:
             out.append(p)
+    return out
+
+
+def profile_skill_roots(dirs: Sequence[str | Path] | None = None) -> list[Path]:
+    """The profile's own skill roots: its default roots plus any explicit
+    *dirs*. A copy stored from a file under one of them belongs to this
+    profile, even when a run scans only a subset."""
+    out = resolve_skill_roots(dirs)
+    for r in resolve_skill_roots(None):
+        if r not in out:
+            out.append(r)
     return out
 
 
@@ -583,14 +610,9 @@ def live_elsewhere(stored_path: Any, own_file: str | Path | None, roots: Sequenc
     """True when *stored_path* is a SKILL.md that still exists, is not
     *own_file* and lies outside *roots*: another profile on this host (same
     host id) owns that copy, so this one must not replace or delete it."""
-    if not stored_path:
+    if not is_live_skill_file(stored_path):
         return False
     p = Path(str(stored_path))
-    try:
-        if not p.is_file():
-            return False
-    except OSError:
-        return False
     if own_file is not None and same_file(p, own_file):
         return False
     return not path_in_roots(p, roots)
@@ -647,19 +669,35 @@ def archived_link_target(stored_path: Any, roots: Sequence[str | Path], dir_name
     return False
 
 
+def walk_skill_tree(base: str | Path) -> Iterator[tuple[str, list[str], list[str]]]:
+    """os.walk(followlinks=True) over a skill root that skips hidden subtrees
+    (.archive/ ...) and enters each real directory once, so link loops end
+    and there is no depth limit. Callers may prune the yielded dirnames."""
+    seen: set[str] = set()
+    for cur, dirnames, filenames in os.walk(base, followlinks=True):
+        try:
+            real = os.path.realpath(cur)
+        except OSError:
+            dirnames[:] = []
+            continue
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        yield cur, dirnames, filenames
+
+
 def discover_skills(dirs: list[str | Path] | None = None) -> list[SkillInfo]:
     """Scan directories for SKILL.md files and return parsed SkillInfo objects."""
     search_dirs = resolve_skill_roots(dirs)
 
     skills_by_name: dict[str, SkillInfo] = {}
     seen_canonical_paths: set[Path] = set()
-    ignored_subdirs = {".archive", ".git", ".venv", ".pytest_cache", ".locks", ".curator_backups"}
+    ignored_subdirs = IGNORED_SUBDIRS
 
     for base_dir in search_dirs:
-        for root, dirnames, filenames in os.walk(base_dir, followlinks=True):
-            # Prune hidden subdirectories
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-
+        for root, _dirnames, filenames in walk_skill_tree(base_dir):
             for fname in filenames:
                 if fname.lower() == "skill.md":
                     fpath = Path(root) / fname
@@ -934,6 +972,7 @@ def sync_skills_library(
     prune_limit: int = 500,
     host_tag: str | None = None,
     prune: bool = False,
+    replace_foreign: bool = False,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Synchronize discovered skills into Oracle memory database.
@@ -944,7 +983,15 @@ def sync_skills_library(
     is opt-in (*prune*, or *prune_host* = a path prefix): it deletes this
     host's skills whose SKILL.md is no longer under the scanned roots (or under
     *prune_host*), and never touches other hosts' copies or the host-less
-    legacy corpus."""
+    legacy corpus.
+
+    This host's copy whose stored SKILL.md still exists outside the profile's
+    skill roots (its default roots plus *dirs*) is foreign: another profile
+    stored it, or it comes from a root no longer configured. So is a copy
+    stored from a live SKILL.md under the default roots when this run's file
+    lies outside them (a --dirs run must not take over a default skill). It
+    is kept and reported in skipped_foreign / foreign_skills, unless
+    *replace_foreign*."""
     target_provider_or_conn = provider if provider is not None else provider_or_conn
 
     # skills_or_mode: a skill list, or a positional mode string. The keyword
@@ -1017,9 +1064,10 @@ def sync_skills_library(
         "dry_run": dry_run,
         "host": effective_host,
     }
-    # The roots this run scans: a stored copy of this host whose SKILL.md
-    # still exists outside them belongs to another profile (same host id).
-    owner_roots = resolve_skill_roots(dirs)
+    # The profile's own roots (defaults plus *dirs*, so a run over a subset
+    # still owns the copies it stored from the other roots).
+    owner_roots = profile_skill_roots(dirs)
+    default_roots = resolve_skill_roots(None)
 
     if dry_run and not target_provider_or_conn:
         return {
@@ -1137,18 +1185,39 @@ def sync_skills_library(
                     own = [c for c in copies if str(c.get("mid", "")).startswith(own_prefix)]
                     skill_hash = skill.hash or skill.content_hash
                     # This host's copy is stored from a SKILL.md that still
-                    # exists outside the scanned roots: another profile owns
-                    # it. Never replace it (not even with force); set
-                    # HERMES_HOST_ID per profile to keep separate copies.
+                    # exists outside the profile's roots: another profile owns
+                    # it, or it comes from a root no longer configured. Kept
+                    # (not even force replaces it) unless replace_foreign.
                     foreign = [c for c in own if live_elsewhere(c.get("path"), skill.path, owner_roots)]
-                    if foreign:
+                    reason = "outside_profile"
+                    if not foreign and dirs and not path_in_roots(skill.path, default_roots):
+                        reason = "default_dir"
+                        # A --dirs run outside the default roots never replaces
+                        # a copy stored from a live SKILL.md under them: later
+                        # default runs and the lifecycle hook would treat this
+                        # run's copy as foreign.
+                        foreign = [
+                            c for c in own
+                            if is_live_skill_file(c.get("path")) and not same_file(c.get("path"), skill.path)
+                            and path_in_roots(c.get("path"), default_roots)
+                        ]
+                    if foreign and not replace_foreign:
                         stats["skipped_foreign"] += 1
-                        stats["foreign_skills"].append({"name": skill.name, "path": foreign[0].get("path")})
+                        stats["foreign_skills"].append(
+                            {"name": skill.name, "path": foreign[0].get("path"), "reason": reason}
+                        )
                         logger.warning(
-                            "skill '%s': this host's copy is stored from %s, which exists outside the scanned "
-                            "roots (another profile); not replacing it", skill.name, foreign[0].get("path"),
+                            "skill '%s': this host's copy is stored from %s, which still exists (another "
+                            "profile, a dir no longer configured, or a default skill dir while this run "
+                            "found the skill in a --dirs dir outside the default dirs); not replacing it",
+                            skill.name, foreign[0].get("path"),
                         )
                         continue
+                    if foreign:
+                        logger.warning(
+                            "skill '%s': replacing this host's copy stored from %s (replace_foreign)",
+                            skill.name, foreign[0].get("path"),
+                        )
 
                     def _full_ok(c: dict[str, Any]) -> bool:
                         return mode != "full" or c.get("full") is not False
@@ -1282,6 +1351,18 @@ def sync_skills_library(
 
     if stats["errors"] and stats["status"] == "success":
         stats["status"] = "partial"
+    if stats["skipped_foreign"]:
+        stats["hint"] = (
+            "Some of this host's copies are stored from other SKILL.md files that still exist (another "
+            "profile, a dir no longer configured, or a default skill dir while this run found the skill in a "
+            "--dirs dir outside the default dirs); see foreign_skills. Re-run with replace_foreign "
+            "(--replace-foreign on the command line) to replace them with the copies this run found."
+        )
+        if any(f.get("reason") == "default_dir" for f in stats["foreign_skills"]):
+            stats["hint"] += (
+                " For a skill kept because it is in a default skill dir (reason default_dir), sync without "
+                "--dirs instead: replacing it would make this run's copy foreign to every later default sync."
+            )
     return stats
 
 
@@ -1470,6 +1551,8 @@ def main() -> None:
     parser.add_argument("--prune", action="store_true", help="Delete this host's skills that are no longer under the scanned roots")
     parser.add_argument("--prune-host", default=None, help="Prune this host's skills whose SKILL.md path starts with this prefix")
     parser.add_argument("--prune-limit", type=int, default=500, help="Maximum number of stale skills to prune in one run (default: 500)")
+    parser.add_argument("--replace-foreign", action="store_true",
+                        help="Replace this host's copies stored from SKILL.md files outside this profile's skill roots")
     parser.add_argument("--list-local", action="store_true", help="Print this host's id and live skills as JSON (no database)")
     parser.add_argument("--migrate-host-identity", action="store_true",
                         help="Relabel legacy (host-less) skill rows whose SKILL.md is live on a host; see --listing")
@@ -1538,6 +1621,7 @@ def main() -> None:
             prune=args.prune,
             prune_host=args.prune_host,
             prune_limit=args.prune_limit,
+            replace_foreign=args.replace_foreign,
             host_tag=get_host_id(),
         )
         print("Sync complete:")

@@ -33,7 +33,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.1.4"
+__version__ = "1.1.1.5"
 
 VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -357,14 +357,6 @@ def _sync_skills_module() -> Any:
 # Skill names as stored in ids (skill:<host>:<name>:c<N>) and accepted from hooks/tools.
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
-
-def _stored_file_exists(stored_path: Any) -> bool:
-    if not stored_path:
-        return False
-    try:
-        return Path(str(stored_path)).is_file()
-    except OSError:
-        return False
 
 # Lifecycle writer bookkeeping is per process, keyed by (pool fingerprint,
 # table, skill): events reach whichever provider serves the session, and two
@@ -1011,6 +1003,13 @@ TOOL_SCHEMAS = [
                 "dry_run": {
                     "type": "boolean",
                     "description": "Report what would be indexed/pruned without writing. Default false.",
+                },
+                "replace_foreign": {
+                    "type": "boolean",
+                    "description": (
+                        "Also replace this host's copies stored from SKILL.md files outside this profile's "
+                        "skill dirs (reported as skipped_foreign). Default false."
+                    ),
                 },
             },
         },
@@ -2032,7 +2031,9 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _backfill_write(self, conn: Any, todo: list[tuple[Any, Any, str, str]]) -> list[str]:
         """Write the vectors in *todo* ((vec, model, memory_id, text) tuples) and
-        return the ids whose UPDATE matched no row. The vector is written only
+        return the ids whose UPDATE matched no row (every id of a group whose
+        per-row counts the driver cannot report, so the caller re-checks them
+        instead of dropping a mismatch silently). The vector is written only
         for the text it was computed from, and only while the row still has
         none: a row updated meanwhile (here or on another host) keeps its newer
         content's embedding."""
@@ -2068,6 +2069,8 @@ class OracleMemoryProvider(MemoryProvider):
             del binds
             if len(counts) == len(group):
                 unmatched.extend(t[2] for t, c in zip(group, counts) if not c)
+            else:
+                unmatched.extend(t[2] for t in group)
         return unmatched
 
     def _backfill_reread(self, conn: Any, mids: list[str]) -> dict[str, str]:
@@ -2145,10 +2148,13 @@ class OracleMemoryProvider(MemoryProvider):
                     with pool.acquire() as conn:
                         unmatched = self._backfill_write(conn, todo)
                         conn.commit()
-                        # Rows whose text did not match: done if they got an
+                        # Rows not confirmed written: done if they got an
                         # embedding meanwhile or are gone; otherwise re-queued
-                        # once more with the text the database holds now.
-                        reread = self._backfill_reread(conn, unmatched) if unmatched else {}
+                        # once more with the text the database holds now. Not
+                        # during shutdown: the drain must not spend its join
+                        # budget on retries (the next startup re-queues them).
+                        recheck = bool(unmatched) and not self._write_stop.is_set()
+                        reread = self._backfill_reread(conn, unmatched) if recheck else {}
                     for mid, text in reread.items():
                         with self._embed_lock:
                             if any(m == mid for m, _ in self._embed_pending):
@@ -2164,10 +2170,15 @@ class OracleMemoryProvider(MemoryProvider):
                             self._embed_attempts[mid] = n
                             self._embed_pending.append((mid, text))
                             requeued.add(mid)
-                    if unmatched:
+                    if unmatched and not recheck:
                         logger.info(
-                            "embed backfill: %d row(s) changed or embedded meanwhile; %d re-queued with their "
-                            "stored text", len(unmatched), len(reread),
+                            "embed backfill: %d row(s) not confirmed written; not re-checked during shutdown "
+                            "(any still without an embedding is re-queued at the next startup)", len(unmatched),
+                        )
+                    elif unmatched:
+                        logger.info(
+                            "embed backfill: %d row(s) not confirmed written (changed or embedded meanwhile, or "
+                            "no per-row counts); %d re-queued with their stored text", len(unmatched), len(reread),
                         )
                 done = {mid for _, _, mid, _ in todo}
             except Exception as e:
@@ -4150,29 +4161,29 @@ class OracleMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _find_skill_file(roots: list[Path], skill_name: str) -> Path | None:
+        """The live <skill_name>/SKILL.md under the roots, at any depth, as the
+        bulk sync's discovery walks them (hidden trees skipped, each real
+        directory entered once). A file that resolves into an ignored tree
+        such as .archive/ (a link to an archived skill) is not live."""
         if not _SKILL_NAME_RE.match(skill_name or ""):
             return None
+        live = _sync_skills_module().is_live_skill_file
         for root in roots:
             if not root.is_dir():
                 continue
             candidate = root / skill_name / "SKILL.md"
-            if candidate.is_file():
+            if live(candidate):
                 return candidate
             for sub in _skill_md_matches(root, skill_name):
-                if sub.is_file():
+                if live(sub):
                     return sub
-        # Deeper layouts, as the bulk sync's discovery walks them (hidden
-        # trees such as .archive/ skipped; depth-bounded against link loops).
         for root in roots:
             if not root.is_dir():
                 continue
-            base_depth = len(root.parts)
-            for cur_root, dirnames, _files in os.walk(root, followlinks=True):
-                depth = len(Path(cur_root).parts) - base_depth
-                dirnames[:] = [] if depth >= 6 else [d for d in dirnames if not d.startswith(".")]
+            for cur_root, dirnames, _files in _sync_skills_module().walk_skill_tree(root):
                 if skill_name in dirnames:
                     sub = Path(cur_root) / skill_name / "SKILL.md"
-                    if sub.is_file():
+                    if live(sub):
                         return sub
         return None
 
@@ -4250,7 +4261,8 @@ class OracleMemoryProvider(MemoryProvider):
         it is still live under the roots. The copy is found by its id
         (skill:<host>:<name>:c0) or by its stored path (.../<name>/SKILL.md,
         for a skill whose frontmatter name differs from its directory). A copy
-        whose stored SKILL.md still exists is kept, wherever it lies (a live
+        whose stored SKILL.md still exists (and does not resolve into an
+        ignored tree such as .archive/) is kept, wherever it lies (a live
         skill of this profile under another name, or another profile's copy),
         unless it is the target of the symlink this archive moved into
         .archive/. Other hosts' copies and the host-less shared corpus are
@@ -4291,7 +4303,7 @@ class OracleMemoryProvider(MemoryProvider):
                             sname = m.group(1) if m else ""
                         if not _SKILL_NAME_RE.match(sname):
                             continue
-                        if _stored_file_exists(spath) and not _sync.archived_link_target(spath, roots, skill_name):
+                        if _sync.is_live_skill_file(spath) and not _sync.archived_link_target(spath, roots, skill_name):
                             kept.append(f"{sname} ({spath})")
                             continue
                         cur.execute(
@@ -5042,6 +5054,7 @@ class OracleMemoryProvider(MemoryProvider):
                 res = self.sync_skills(
                     mode=mode, force=force, dirs=dirs, batch_size=batch_size,
                     prune=prune, prune_limit=prune_limit, dry_run=dry_run,
+                    replace_foreign=_as_bool(args.get("replace_foreign", False)),
                 )
                 return json.dumps(res)
             if tool_name == "oracle_load_skill":
@@ -5197,10 +5210,12 @@ class OracleMemoryProvider(MemoryProvider):
         prune: bool = False,
         prune_limit: int = 100,
         dry_run: bool = False,
+        replace_foreign: bool = False,
     ) -> dict[str, Any]:
         """Index this host's skills (the profile's skills dir and ~/.agents/skills,
         or *dirs*) under this host's identity; *prune* removes this host's
-        skills that are gone from those roots."""
+        skills that are gone from those roots; *replace_foreign* replaces this
+        host's copies stored from SKILL.md files outside the profile's roots."""
         if not self._pool:
             raise RuntimeError(
                 self._init_error or self.unavailable_reason() or "Oracle memory pool not initialized"
@@ -5208,7 +5223,7 @@ class OracleMemoryProvider(MemoryProvider):
         sync = _sync_skills_module()
         return sync.sync_skills_library(
             provider=self, mode=mode, force=force, dirs=dirs, dry_run=dry_run, batch_size=batch_size,
-            prune=prune, prune_limit=prune_limit, host_tag=get_host_id(),
+            prune=prune, prune_limit=prune_limit, replace_foreign=replace_foreign, host_tag=get_host_id(),
         )
 
     def shutdown(self) -> None:

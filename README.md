@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.1.4-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.1.5-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
@@ -115,7 +115,7 @@ Per ingested skill `S`:
 
 - **Metadata** (JSON): `category, chunk_index, hash (sha256 of source file), kind=skill_ingest, mtime, path, skill_name, total_chunks, version, host, target=memory`
 - **Reconstruction fidelity**: Chunks are 80 whole words joined by single spaces with 10-word overlap. Reassembled text is word-accurate and lossless at word level (line/markdown formatting flattened).
-- **Host identity**: `{host}` is `HERMES_HOST_ID`, or the short host name in lower case. A host only replaces or deletes rows under its own `skill:{host}:` prefix. Profiles on one host share the id and so share one copy per skill name. A copy whose SKILL.md is live outside the scanned skill dirs is not replaced: the bulk sync reports it as `skipped_foreign`. Profiles are not fully isolated (#14), so set `HERMES_HOST_ID` per profile to keep them apart.
+- **Host identity**: `{host}` is `HERMES_HOST_ID`, or the short host name in lower case. A host only replaces or deletes rows under its own `skill:{host}:` prefix. Profiles on one host share the id and so share one copy per skill name. A copy whose SKILL.md is live outside the profile's skill dirs (its skills dir and `~/.agents/skills`, plus any `--dirs`) is not replaced: the bulk sync reports it as `skipped_foreign` with a hint, and `replace_foreign` (`--replace-foreign`) replaces it. Profiles are not fully isolated (#14), so set `HERMES_HOST_ID` per profile to keep them apart.
 - **Backward compatibility**: Legacy single-row skills (pre-c0 era, no `:cN` suffix) are treated as meta rows and return with status `"meta_only"`. Legacy rows without a host (`skill:{S}:cN`) form the shared corpus; no host prunes them.
 
 ### Using `oracle_load_skill`
@@ -158,7 +158,7 @@ In a shared multi-server table, deletions are host-scoped:
   python3 scripts/sync_skills.py --prune --prune-limit 500
   python3 scripts/sync_skills.py --prune-host /path/to/local/skills/   # only skills under this dir
   ```
-  The `oracle_sync_skills` tool takes the same options (`prune`, `prune_limit`, `dry_run`).
+  The `oracle_sync_skills` tool takes the same options (`prune`, `prune_limit`, `dry_run`, `replace_foreign`).
 - Each changed skill is replaced in one transaction (delete of this host's rows + insert), so a failed write keeps the previous copy.
 
 ### Live Lifecycle Syncing
@@ -167,6 +167,7 @@ The `on_skill_lifecycle` hook synchronizes changes in real-time as skills are ma
 - The hook only schedules work. One background writer per skill looks up the file under the active profile's skill roots, checks the content hash and writes; events that arrive while it runs are coalesced into one re-run with the latest event.
 - Actions `created`, `edited`, `patched`, `installed`, `restored` replace this host's copy of the skill (skipped when the hash is unchanged).
 - Action `archived` deletes this host's copy only if no `SKILL.md` for the skill is left on disk.
+- The file lookup walks the skill roots at any depth, as the bulk sync does: hidden trees are skipped, each real directory is entered once (link loops end), and a `SKILL.md` that resolves into an ignored tree such as `.archive/` is not live.
 
 ### Legacy Host-Identity Migration
 
@@ -202,9 +203,18 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
   ```
   and automatically refreshes optimizer statistics via `DBMS_STATS.GATHER_TABLE_STATS`.
 
+## What's new in v1.1.1.5
+
+Follow-up release for #14 — full details in `RELEASE_NOTES_1.1.1.5.md`:
+
+- **Foreign skill copies**: ownership is judged against the profile's own skill dirs, so a sync over a `--dirs` subset updates the copies it stored from the other dirs (a `--dirs` run outside the defaults never takes over a live default skill); `replace_foreign` / `--replace-foreign` replaces a copy left from another profile or a removed root, and the sync result carries a hint when it skipped one.
+- **Lifecycle lookup**: a link into `.archive/` is no longer a live skill; the lookup walks any depth and ends on link loops, like the bulk sync.
+- **Backfill**: no re-check or re-queue once shutdown has begun; a write whose per-row counts the driver cannot report is re-checked instead of dropped.
+- **Test suite**: a runtime guard refuses any link outside the temp dir; the source scan also catches aliased and shell links.
+
 ## What's new in v1.1.1.4
 
-Robustness release with per-host skill identity — full details in `RELEASE_NOTES_1.1.1.4.md`:
+Robustness release with per-host skill identity — full details in the `[1.1.1.4]` section of `CHANGELOG.md`:
 
 - **Per-host skill copies**: skill rows are `skill:{host}:{name}:cN`; a host only replaces or deletes its own copy, pruning is opt-in, and a dry-run-first migration (with a reverse step) relabels existing rows.
 - **Lifecycle hook off the caller's thread**: one writer per skill, coalesced events, profile-aware skill roots.

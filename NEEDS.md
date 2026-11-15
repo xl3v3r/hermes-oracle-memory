@@ -1,9 +1,9 @@
 # hermes-oracle-memory — what it needs now
 
-**Version in play:** 1.1.1.4 (`VERSION`, `pyproject.toml`, `plugin.yaml`, `__init__.py` agree)
-**Installed at:** `~/.hermes/plugins/oracle` (pinned checkout, tag `v1.1.1.4`)
+**Version in play:** 1.1.1.5 (`VERSION`, `pyproject.toml`, `plugin.yaml`, `__init__.py` agree)
+**Installed at:** `~/.hermes/plugins/oracle` (pinned checkout, tag `v1.1.1.5`)
 **Environment:** Oracle 26ai ADB, 2 CPUs, in-DB ONNX `BGE_BASE_EN_V1_5`, `HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1`, table `hermes_agent_memory`
-**Updated:** 2026-11-14, v1.1.1.4 robustness and skill-corpus identity release
+**Updated:** 2026-11-15, v1.1.1.5 skill-sync and backfill follow-ups (#14)
 
 ---
 
@@ -28,6 +28,7 @@
 | #10 | Recall path: reused cursor on retry, LOB round trips, fetch sizing, ranking after the cut | 1.1.1.4 |
 | #11 | Tool surface: unbounded batches and output, schema gaps, memory mirror ignored replace/remove | 1.1.1.4 |
 | #12 | Scripts read the env file unconditionally; non-SPDX license; wildcard CLA bot allowlist | 1.1.1.4 |
+| #14 | No override for `skipped_foreign`; lifecycle lookup treated links into `.archive/` as live; backfill edge cases (shutdown re-queue, no row counts); source-only test link guard | 1.1.1.5 (profile-root ownership + `--replace-foreign`, liveness by resolved path, loop-safe walk, runtime link guard). Open: profiles sharing a host id |
 
 ## 1. Skill retrieval starvation — RESOLVED in 1.0.9.6
 
