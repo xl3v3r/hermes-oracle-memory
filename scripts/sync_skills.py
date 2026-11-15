@@ -374,7 +374,10 @@ def extract_body_triggers(body: str) -> list[str]:
 
 
 def parse_skill_file(skill_path: Path | str) -> SkillInfo | None:
-    path = Path(skill_path).resolve()
+    # Absolute but not resolved: a skill dir symlinked into a root keeps its
+    # in-root path, which is what archive, prune and ownership checks look at
+    # (Hermes archives the link, not its target).
+    path = Path(os.path.abspath(os.path.expanduser(str(skill_path))))
     if not path.is_file():
         return None
 
@@ -547,6 +550,103 @@ def resolve_skill_roots(dirs: Sequence[str | Path] | None = None) -> list[Path]:
     return out
 
 
+def _under_any(p: Path, roots: Sequence[Path]) -> bool:
+    for root in roots:
+        try:
+            p.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def path_in_roots(path: str | Path, roots: Sequence[str | Path]) -> bool:
+    """True when *path* lies under one of *roots*, lexically or once resolved."""
+    p = Path(os.path.abspath(str(path)))
+    lexical = [Path(os.path.abspath(str(r))) for r in roots]
+    if _under_any(p, lexical):
+        return True
+    try:
+        return _under_any(p.resolve(), [r.resolve() for r in lexical])
+    except OSError:
+        return False
+
+
+def same_file(a: str | Path, b: str | Path) -> bool:
+    try:
+        return Path(str(a)).resolve() == Path(str(b)).resolve()
+    except OSError:
+        return False
+
+
+def live_elsewhere(stored_path: Any, own_file: str | Path | None, roots: Sequence[str | Path]) -> bool:
+    """True when *stored_path* is a SKILL.md that still exists, is not
+    *own_file* and lies outside *roots*: another profile on this host (same
+    host id) owns that copy, so this one must not replace or delete it."""
+    if not stored_path:
+        return False
+    p = Path(str(stored_path))
+    try:
+        if not p.is_file():
+            return False
+    except OSError:
+        return False
+    if own_file is not None and same_file(p, own_file):
+        return False
+    return not path_in_roots(p, roots)
+
+
+def copy_is_current(
+    stored_hash: Any, stored_path: Any, skill_hash: str, skill_path: str | Path, roots: Sequence[str | Path]
+) -> bool:
+    """True when this host's stored copy has the file's hash and records the
+    file's path. A copy whose path is gone or names another file is rewritten
+    (it records where the skill lives now). The same file under another path is
+    kept, except a target path outside the roots (rows written before 1.1.1.4
+    for a skill dir symlinked in from outside), which is rewritten once to the
+    in-root path so archive and prune can see it. Keeping other aliases means
+    two profiles reaching one file by different paths never rewrite each other."""
+    if not skill_hash or str(stored_hash or "") != skill_hash:
+        return False
+    if not stored_path:
+        return True  # legacy row without a path: the hash decides
+    sp = Path(str(stored_path))
+    if str(sp) == str(skill_path):
+        return True
+    if not same_file(sp, skill_path):
+        return False
+    try:
+        canonical = sp == sp.resolve()
+    except OSError:
+        canonical = False
+    return not (canonical and not path_in_roots(sp, roots))
+
+
+def archived_link_target(stored_path: Any, roots: Sequence[str | Path], dir_name: str) -> bool:
+    """True when a root's .archive/ holds the archived symlink for *dir_name*
+    (Hermes moves the link itself, flat, with an optional -<timestamp> suffix on
+    collision) and it points at *stored_path*'s skill dir: the stored target
+    still exists, but this profile's skill was archived."""
+    if not stored_path or not dir_name:
+        return False
+    try:
+        target = Path(str(stored_path)).parent.resolve()
+    except OSError:
+        return False
+    stamped = re.compile(re.escape(dir_name) + r"(?:-\d{14})?$")
+    for root in roots:
+        arch = Path(str(root)) / ".archive"
+        try:
+            if not arch.is_dir():
+                continue
+            for cand in arch.iterdir():
+                if stamped.match(cand.name) and cand.is_symlink() and cand.resolve() == target:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def discover_skills(dirs: list[str | Path] | None = None) -> list[SkillInfo]:
     """Scan directories for SKILL.md files and return parsed SkillInfo objects."""
     search_dirs = resolve_skill_roots(dirs)
@@ -583,7 +683,7 @@ def discover_skills(dirs: list[str | Path] | None = None) -> list[SkillInfo]:
                     except ValueError:
                         pass
 
-                    skill_info = parse_skill_file(canonical)
+                    skill_info = parse_skill_file(fpath)
                     if skill_info and skill_info.name:
                         if skill_info.name not in skills_by_name:
                             skills_by_name[skill_info.name] = skill_info
@@ -909,12 +1009,17 @@ def sync_skills_library(
         "upserted": 0,
         "pruned": 0,
         "pruned_skills": [],
+        "skipped_foreign": 0,
+        "foreign_skills": [],
         "total_rows_inserted": 0,
         "errors": [],
         "mode": mode,
         "dry_run": dry_run,
         "host": effective_host,
     }
+    # The roots this run scans: a stored copy of this host whose SKILL.md
+    # still exists outside them belongs to another profile (same host id).
+    owner_roots = resolve_skill_roots(dirs)
 
     if dry_run and not target_provider_or_conn:
         return {
@@ -1031,17 +1136,40 @@ def sync_skills_library(
                     copies = existing_by_name.get(skill.name, [])
                     own = [c for c in copies if str(c.get("mid", "")).startswith(own_prefix)]
                     skill_hash = skill.hash or skill.content_hash
-                    # Up to date: this host's copy has the file's hash (and, for
-                    # a full sync, holds the whole document). With no copy of
-                    # its own, an identical host-less shared-corpus copy is
-                    # enough (it is never pruned); another host's copy is not,
-                    # since that host may archive or prune it. A stale copy of
-                    # its own is always replaced.
-                    current = own if own else [c for c in copies if not c.get("host")]
-                    if not force and skill_hash and any(
-                        c.get("hash") == skill_hash and (mode != "full" or c.get("full") is not False)
-                        for c in current
-                    ):
+                    # This host's copy is stored from a SKILL.md that still
+                    # exists outside the scanned roots: another profile owns
+                    # it. Never replace it (not even with force); set
+                    # HERMES_HOST_ID per profile to keep separate copies.
+                    foreign = [c for c in own if live_elsewhere(c.get("path"), skill.path, owner_roots)]
+                    if foreign:
+                        stats["skipped_foreign"] += 1
+                        stats["foreign_skills"].append({"name": skill.name, "path": foreign[0].get("path")})
+                        logger.warning(
+                            "skill '%s': this host's copy is stored from %s, which exists outside the scanned "
+                            "roots (another profile); not replacing it", skill.name, foreign[0].get("path"),
+                        )
+                        continue
+
+                    def _full_ok(c: dict[str, Any]) -> bool:
+                        return mode != "full" or c.get("full") is not False
+
+                    # Up to date: this host's copy has the file's hash and path
+                    # (and, for a full sync, holds the whole document). With no
+                    # copy of its own, an identical host-less shared-corpus
+                    # copy is enough (it is never pruned); another host's copy
+                    # is not, since that host may archive or prune it. A stale
+                    # copy of its own is always replaced.
+                    if own:
+                        is_current = any(
+                            copy_is_current(c.get("hash"), c.get("path"), skill_hash, skill.path, owner_roots)
+                            and _full_ok(c)
+                            for c in own
+                        )
+                    else:
+                        is_current = bool(skill_hash) and any(
+                            c.get("hash") == skill_hash and _full_ok(c) for c in copies if not c.get("host")
+                        )
+                    if not force and is_current:
                         stats["skipped"] += 1
                         continue
                     if own:
@@ -1168,7 +1296,10 @@ def list_local_skills(dirs: list[str | Path] | None = None) -> dict[str, Any]:
     migrate_host_identity(). No database access."""
     return {
         "host": get_host_id(),
-        "skills": [{"name": s.name, "path": str(s.path)} for s in discover_skills(dirs=dirs)],
+        "skills": [
+            {"name": s.name, "path": str(s.path), "real_path": str(Path(s.path).resolve())}
+            for s in discover_skills(dirs=dirs)
+        ],
     }
 
 
@@ -1182,7 +1313,7 @@ def migrate_host_identity(
 
     *listings* are list_local_skills() outputs, one per host. A legacy skill is
     relabelled only when one listing has a live SKILL.md with the same name AT
-    THE SAME PATH; its rows become skill:<host>:<name>:c<N> (a bare skill:<name>
+    THE SAME PATH (in-root or resolved); its rows become skill:<host>:<name>:c<N> (a bare skill:<name>
     becomes :c0) with conv_ref skill:<host>:<name> and metadata.host, and keep
     metadata.legacy_id / legacy_conv_ref for reverse_host_identity(). Everything
     else stays legacy: the shared corpus (archive rows, skills whose files are
@@ -1195,7 +1326,10 @@ def migrate_host_identity(
         if not _HOST_RE.match(host):
             raise ValueError(f"invalid host in listing: {host!r}")
         for s in listing.get("skills") or []:
-            owners.setdefault((str(s.get("name") or ""), str(s.get("path") or "")), set()).add(host)
+            # Legacy rows recorded the resolved path; listings carry both.
+            for key in ("path", "real_path"):
+                if s.get(key):
+                    owners.setdefault((str(s.get("name") or ""), str(s[key])), set()).add(host)
 
     report: dict[str, Any] = {
         "dry_run": dry_run,

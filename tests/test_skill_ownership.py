@@ -33,6 +33,16 @@ def _provider(rowcount=1):
     return p, conn, cur
 
 
+def _link_in_tmp(link: Path, target: Path) -> None:
+    """The only way these tests create a symlink: link and target must both lie
+    in the temp dir (never the installed plugin; see
+    test_suite_never_writes_outside_checkout)."""
+    tmp = Path(tempfile.gettempdir()).resolve()
+    for p in (link.parent, target):
+        Path(p).resolve().relative_to(tmp)  # raises outside the temp dir
+    os.symlink(target, link)
+
+
 def _sqls(cur):
     return [str(c[0][0]) for c in cur.execute.call_args_list]
 
@@ -152,6 +162,133 @@ class TestLifecycleIdentity(unittest.TestCase):
         self.assertEqual(deletes, [{"pfx": ss.like_escape("skill:hosta:front-name:c") + "%"}])
 
 
+class TestArchiveAndPathsRound2(unittest.TestCase):
+    _run = TestLifecycleIdentity._run
+
+    def test_archive_keeps_live_in_root_copy_under_archived_name(self):
+        # dir 'baz' (live) has frontmatter name 'foo'; dir 'foo' was archived
+        p, conn, cur = _provider()
+        with tempfile.TemporaryDirectory() as td:
+            live = _write_skill(Path(td) / ".hermes" / "skills", "baz", "foo")
+            cur.fetchall.return_value = [("skill:hosta:foo:c0", "foo", str(live))]
+            self._run(p, "archived", "foo", Path(td))
+        self.assertFalse(any(s.lstrip().upper().startswith("DELETE") for s in _sqls(cur)))
+
+    def test_archive_keeps_live_deeply_nested_copy(self):
+        p, conn, cur = _provider()
+        with tempfile.TemporaryDirectory() as td:
+            live = _write_skill(Path(td) / ".hermes" / "skills" / "cat" / "sub", "deep", "deep2")
+            cur.fetchall.return_value = [("skill:hosta:deep2:c0", "deep2", str(live))]
+            self._run(p, "archived", "other", Path(td))
+        self.assertFalse(any(s.lstrip().upper().startswith("DELETE") for s in _sqls(cur)))
+
+    def test_deeply_nested_skill_found_for_ingest(self):
+        p, conn, cur = _provider()
+        cur.fetchone.return_value = None
+        with tempfile.TemporaryDirectory() as td:
+            _write_skill(Path(td) / ".hermes" / "skills" / "a" / "b", "nested", "nested")
+            (Path(td) / ".hermes" / "skills" / ".archive" / "x").mkdir(parents=True)
+            with patch.object(p, "_insert_many", return_value=[]) as ins:
+                self._run(p, "edited", "nested", Path(td))
+        ins.assert_called_once()
+
+    def test_archived_symlinked_skill_is_removed(self):
+        p, conn, cur = _provider()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".hermes" / "skills"
+            root.mkdir(parents=True)
+            target = _write_skill(Path(td) / "elsewhere", "linked", "linked")
+            _link_in_tmp(root / "linked", target.parent)
+            info = ss.parse_skill_file(root / "linked" / "SKILL.md")
+            assert info is not None
+            self.assertEqual(str(info.path), str(root / "linked" / "SKILL.md"))  # in-root path kept
+            # Hermes archives the link itself; the target stays.
+            (root / ".archive").mkdir()
+            (root / "linked").rename(root / ".archive" / "linked")
+            for stored in (str(root / "linked" / "SKILL.md"), str(target.resolve())):  # new row, pre-1.1.1.4 row
+                cur.reset_mock()
+                cur.fetchall.return_value = [("skill:hosta:linked:c0", "linked", stored)]
+                self._run(p, "archived", "linked", Path(td))
+                deletes = [s for s in _sqls(cur) if s.lstrip().upper().startswith("DELETE")]
+                self.assertEqual(len(deletes), 1, stored)
+
+    def test_ingest_rewrites_meta_only_or_moved_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = _write_skill(Path(td) / ".hermes" / "skills", "mv", "mv")
+            info = ss.parse_skill_file(f)
+            assert info is not None
+            h = info.hash or info.content_hash
+            for row, expect in (
+                ((h, str(f), 2), False),  # current: same hash, path, full
+                ((h, str(f), None), True),  # meta-only copy
+                ((h, str(Path(td) / "gone" / "mv" / "SKILL.md"), 2), True),  # recorded path is gone
+            ):
+                p, conn, cur = _provider()
+                cur.fetchone.return_value = row
+                with patch.object(p, "_insert_many", return_value=[]) as ins:
+                    self._run(p, "edited", "mv", Path(td))
+                self.assertEqual(ins.called, expect, row)
+
+
+class TestBulkSyncProfileGuard(unittest.TestCase):
+    def _sync(self, stored_path, force=False):
+        provider = MagicMock()
+        provider._table = "HERMES_AGENT_MEMORY"
+        conn, cur = MagicMock(), MagicMock()
+        provider._pool.acquire.return_value.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
+            _write_skill(Path(td), "demo", "demo", "Mine")
+            theirs = _write_skill(Path(other), "demo", "demo", "Theirs")
+            path = {"<THEIRS>": str(theirs)}.get(stored_path, stored_path)
+            cur.fetchall.return_value = [("skill:hosta:demo:c0", "demo", "old-hash", path, "hosta", 2)]
+            res = ss.sync_skills_library(provider=provider, mode="meta", dirs=[td], host_tag="hosta", force=force)
+        return res, provider
+
+    def test_copy_live_in_another_profile_is_not_replaced(self):
+        for force in (False, True):
+            res, prov = self._sync("<THEIRS>", force=force)
+            self.assertEqual(res["skipped_foreign"], 1)
+            self.assertEqual(res["foreign_skills"][0]["name"], "demo")
+            prov._insert_many.assert_not_called()
+            self.assertEqual(res["indexed"] + res["updated"], 0)
+
+    def test_copy_whose_file_is_gone_is_replaced(self):
+        res, prov = self._sync("/nonexistent/demo/SKILL.md")
+        self.assertEqual(res["skipped_foreign"], 0)
+        self.assertEqual(res["updated"], 1)
+
+
+class TestPathHelpers(unittest.TestCase):
+    def test_copy_is_current(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            out = Path(td) / "out"
+            real = _write_skill(out, "s", "s")
+            root.mkdir()
+            _link_in_tmp(root / "s", real.parent)
+            link = root / "s" / "SKILL.md"
+            self.assertTrue(ss.copy_is_current("h", str(link), "h", link, [root]))
+            self.assertFalse(ss.copy_is_current("x", str(link), "h", link, [root]))
+            self.assertTrue(ss.copy_is_current("h", None, "h", link, [root]))
+            # pre-1.1.1.4 row with the resolved target outside the roots: rewritten once
+            self.assertFalse(ss.copy_is_current("h", str(real.resolve()), "h", link, [root]))
+            # the target inside the roots (shared root reached through a link): current
+            self.assertTrue(ss.copy_is_current("h", str(real.resolve()), "h", link, [root, out]))
+            self.assertFalse(ss.copy_is_current("h", str(Path(td) / "gone" / "SKILL.md"), "h", link, [root]))
+
+    def test_listing_matches_legacy_resolved_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            real = _write_skill(Path(td) / "out", "s", "s")
+            root.mkdir()
+            _link_in_tmp(root / "s", real.parent)
+            listing = ss.list_local_skills([str(root)])
+        entry = listing["skills"][0]
+        self.assertEqual(entry["path"], str(root.resolve() / "s" / "SKILL.md"))
+        self.assertEqual(entry["real_path"], str(real.resolve()))
+
+
 class TestWritersCoalescedPerProcess(unittest.TestCase):
     def test_two_instances_share_one_writer_per_skill(self):
         a, _, _ = _provider()
@@ -176,8 +313,75 @@ class TestWritersCoalescedPerProcess(unittest.TestCase):
             gate.set()
             for t in list(a._sync_threads):
                 t.join(5)
+            for t in list(b._sync_threads):  # the coalesced event runs on b's own thread
+                t.join(5)
         self.assertEqual(calls, [("a", "same"), ("b", "same")])
         self.assertNotIn(a._lifecycle_key("same"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
+
+    def test_key_fixed_at_scheduling_time(self):
+        p, _, _ = _provider()
+        p._pool_fingerprint = "fp1"
+        held = []
+        with patch.object(p, "_start_sync_thread", side_effect=lambda t: (held.append(t), True)[1]), \
+                patch.object(p, "_skill_ingest_once"):
+            p.on_skill_lifecycle("edited", "fp-skill")
+            p._pool_fingerprint = "fp2"  # re-initialised before the writer ran
+            held[0].run()
+        self.assertNotIn(("fp1", p._table, "fp-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
+        self.assertNotIn(("fp2", p._table, "fp-skill"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
+
+    def test_event_for_live_provider_survives_other_shutdown(self):
+        a, _, _ = _provider()
+        b, _, _ = _provider()
+        gate, entered = threading.Event(), threading.Event()
+        calls = []
+
+        def ingest_a(name, roots):
+            entered.set()
+            gate.wait(5)
+
+        with tempfile.TemporaryDirectory() as td, \
+                patch("pathlib.Path.home", return_value=Path(td)), \
+                patch.dict(sys.modules, {"hermes_constants": None}), \
+                patch.object(a, "_skill_ingest_once", side_effect=ingest_a), \
+                patch.object(b, "_skill_ingest_once", side_effect=lambda n, r: calls.append(("b", n))):
+            a.on_skill_lifecycle("edited", "handoff")
+            self.assertTrue(entered.wait(5))
+            b.on_skill_lifecycle("edited", "handoff")
+            a._write_stop.set()  # a shuts down; b's event must still run, on b
+            gate.set()
+            for t in list(a._sync_threads):
+                t.join(5)
+            for t in list(b._sync_threads):
+                t.join(5)
+            self.assertEqual(len(b._sync_threads), 1)  # tracked by b, so b.shutdown() joins it
+        self.assertEqual(calls, [("b", "handoff")])
+        self.assertNotIn(b._lifecycle_key("handoff"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
+
+    def test_pending_event_of_stopping_provider_dropped(self):
+        a, _, _ = _provider()
+        gate, entered = threading.Event(), threading.Event()
+        calls = []
+
+        def ingest(name, roots):
+            calls.append(name)
+            entered.set()
+            gate.wait(5)
+
+        with tempfile.TemporaryDirectory() as td, \
+                patch("pathlib.Path.home", return_value=Path(td)), \
+                patch.dict(sys.modules, {"hermes_constants": None}), \
+                patch.object(a, "_skill_ingest_once", side_effect=ingest):
+            a.on_skill_lifecycle("edited", "drop")
+            self.assertTrue(entered.wait(5))
+            a.on_skill_lifecycle("edited", "drop")
+            a._write_stop.set()
+            gate.set()
+            for t in list(a._sync_threads):
+                t.join(5)
+        self.assertEqual(calls, ["drop"])
+        self.assertNotIn(a._lifecycle_key("drop"), oracle_plugin._LIFECYCLE_IN_FLIGHT)
+        self.assertNotIn(a._lifecycle_key("drop"), oracle_plugin._LIFECYCLE_PENDING)
 
 
 class TestBackfillNeverWritesOutdatedVectors(unittest.TestCase):
@@ -192,16 +396,64 @@ class TestBackfillNeverWritesOutdatedVectors(unittest.TestCase):
     def test_update_guarded_by_null_embedding_and_same_content(self):
         p, conn, cur = _provider()
         p._embed_pending.extend([("m1", "text one"), ("m2", "text two")])
-        conn.createlob.side_effect = lambda typ, text: ("CLOB", text)
+        cur.getarraydmlrowcounts.return_value = [1, 1]
         with patch.object(p, "_embed_many_tagged", return_value=[([0.1], "M"), ([0.2], "M")]):
             p._embed_worker_loop()  # inline: returns once the queue is empty
         cur.executemany.assert_called_once()
         conn.commit.assert_called_once()
         sql, binds = cur.executemany.call_args[0]
+        self.assertTrue(cur.executemany.call_args[1].get("arraydmlrowcounts"))
         self.assertIn("embedding IS NULL", sql)
         self.assertIn("DBMS_LOB.COMPARE(content, :4) = 0", sql)
-        # the text is bound as a temporary CLOB (a str over 32,767 bytes fails in SQL)
-        self.assertEqual([(b[2], b[3]) for b in binds], [("m1", ("CLOB", "text one")), ("m2", ("CLOB", "text two"))])
+        # short text is bound as a plain string; no temporary LOBs
+        self.assertEqual([(b[2], b[3]) for b in binds], [("m1", "text one"), ("m2", "text two")])
+        conn.createlob.assert_not_called()
+        self.assertEqual(list(p._embed_pending), [])
+
+    def test_long_text_bound_as_temporary_clob(self):
+        p, conn, cur = _provider()
+        big = "é" * 3000  # 6,000 UTF-8 bytes: over the plain-string limit
+        p._embed_pending.extend([("m1", "short"), ("m2", big)])
+        conn.createlob.side_effect = lambda typ, text: ("CLOB", text)
+        cur.getarraydmlrowcounts.side_effect = [[1], [1]]
+        with patch.object(p, "_embed_many_tagged", return_value=[([0.1], "M"), ([0.2], "M")]):
+            p._embed_worker_loop()
+        self.assertEqual(cur.executemany.call_count, 2)
+        small_binds = cur.executemany.call_args_list[0][0][1]
+        big_binds = cur.executemany.call_args_list[1][0][1]
+        self.assertEqual([b[3] for b in small_binds], ["short"])
+        self.assertEqual([b[3] for b in big_binds], [("CLOB", big)])
+
+    def test_unmatched_row_requeued_with_stored_text_then_given_up(self):
+        p, conn, cur = _provider()
+        p._embed_pending.append(("m1", "queued text"))
+        # Every UPDATE matches nothing; the row still has no embedding and the
+        # database holds other text (e.g. a charset substitution).
+        cur.getarraydmlrowcounts.return_value = [0]
+        cur.fetchall.return_value = [("m1", "stored text")]
+        texts = []
+
+        def embed(batch):
+            texts.extend(batch)
+            return [([0.1], "M") for _ in batch]
+
+        with patch.object(p, "_embed_many_tagged", side_effect=embed):
+            p._embed_worker_loop()
+        self.assertEqual(texts[0], "queued text")
+        self.assertEqual(set(texts[1:]), {"stored text"})
+        # bounded: gives up after _BACKFILL_MAX_ATTEMPTS re-reads
+        self.assertEqual(len(texts), oracle_plugin._BACKFILL_MAX_ATTEMPTS)
+        self.assertEqual(list(p._embed_pending), [])
+        self.assertNotIn("m1", p._embed_attempts)
+
+    def test_unmatched_row_already_embedded_is_done(self):
+        p, conn, cur = _provider()
+        p._embed_pending.append(("m1", "old"))
+        cur.getarraydmlrowcounts.return_value = [0]
+        cur.fetchall.return_value = []  # embedded meanwhile (or deleted)
+        with patch.object(p, "_embed_many_tagged", return_value=[([0.1], "M")]) as emb:
+            p._embed_worker_loop()
+        emb.assert_called_once()
         self.assertEqual(list(p._embed_pending), [])
 
 
@@ -217,7 +469,8 @@ class TestBulkSyncTrustsOnlyOwnOrSharedCopies(unittest.TestCase):
             skill = ss.parse_skill_file(f)
             assert skill is not None
             h = skill.hash or skill.content_hash
-            cur.fetchall.return_value = [tuple(h if v == "<H>" else v for v in r) for r in rows]
+            subst = {"<H>": h, "<P>": str(skill.path)}
+            cur.fetchall.return_value = [tuple(subst.get(v, v) if isinstance(v, str) else v for v in r) for r in rows]
             res = ss.sync_skills_library(provider=provider, mode=mode, dirs=[td], host_tag="hosta")
         return res, provider
 
@@ -237,7 +490,7 @@ class TestBulkSyncTrustsOnlyOwnOrSharedCopies(unittest.TestCase):
         self.assertEqual(res["updated"], 1)
         rows = prov._insert_many.call_args[0][0]
         self.assertIn("total_chunks", rows[0]["metadata"])
-        res, prov = self._sync([("skill:hosta:demo:c0", "demo", "<H>", "/x/demo/SKILL.md", "hosta", 3)], mode="full")
+        res, prov = self._sync([("skill:hosta:demo:c0", "demo", "<H>", "<P>", "hosta", 3)], mode="full")
         self.assertEqual(res["skipped"], 1)
 
 

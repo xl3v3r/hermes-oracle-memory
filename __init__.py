@@ -357,6 +357,15 @@ def _sync_skills_module() -> Any:
 # Skill names as stored in ids (skill:<host>:<name>:c<N>) and accepted from hooks/tools.
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+
+def _stored_file_exists(stored_path: Any) -> bool:
+    if not stored_path:
+        return False
+    try:
+        return Path(str(stored_path)).is_file()
+    except OSError:
+        return False
+
 # Lifecycle writer bookkeeping is per process, keyed by (pool fingerprint,
 # table, skill): events reach whichever provider serves the session, and two
 # instances must never run two writers for one skill at the same time (#6).
@@ -2015,6 +2024,71 @@ class OracleMemoryProvider(MemoryProvider):
             finally:
                 self._write_queue.task_done()
 
+    # Text up to this many UTF-8 bytes is bound as a plain string (it converts
+    # to CLOB in DBMS_LOB.COMPARE on any database); longer text goes in as a
+    # temporary CLOB, since a string bind over 32,767 bytes fails in SQL
+    # (ORA-01460) even with a CLOB input size.
+    _BACKFILL_STR_BIND_MAX_BYTES = 4000
+
+    def _backfill_write(self, conn: Any, todo: list[tuple[Any, Any, str, str]]) -> list[str]:
+        """Write the vectors in *todo* ((vec, model, memory_id, text) tuples) and
+        return the ids whose UPDATE matched no row. The vector is written only
+        for the text it was computed from, and only while the row still has
+        none: a row updated meanwhile (here or on another host) keeps its newer
+        content's embedding."""
+        import oracledb
+
+        sql = (
+            f"UPDATE /*+ NO_PARALLEL */ {self._table} SET embedding = :1, "
+            "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
+            "WHERE memory_id = :3 AND embedding IS NULL "
+            "AND DBMS_LOB.COMPARE(content, :4) = 0"
+        )  # nosec B608
+        limit = self._BACKFILL_STR_BIND_MAX_BYTES
+        small = [t for t in todo if len(t[3].encode("utf-8")) <= limit]
+        big = [t for t in todo if len(t[3].encode("utf-8")) > limit]
+        unmatched: list[str] = []
+        for group in (small, big):
+            if not group:
+                continue
+            if group is big:
+                binds: list[tuple[Any, ...]] = [
+                    (vec, model, mid, conn.createlob(oracledb.DB_TYPE_CLOB, text)) for vec, model, mid, text in group
+                ]
+            else:
+                binds = [tuple(t) for t in group]
+            with conn.cursor() as cur:
+                cur.executemany(sql, binds, arraydmlrowcounts=True)
+                try:
+                    counts = list(cur.getarraydmlrowcounts())
+                except Exception:
+                    counts = []
+            # Drop the temporary LOBs now: the driver frees them on the
+            # connection's next round trip (the commit).
+            del binds
+            if len(counts) == len(group):
+                unmatched.extend(t[2] for t, c in zip(group, counts) if not c)
+        return unmatched
+
+    def _backfill_reread(self, conn: Any, mids: list[str]) -> dict[str, str]:
+        """Current text of the rows among *mids* that still have no embedding."""
+        out: dict[str, str] = {}
+        for i in range(0, len(mids), 100):
+            part = mids[i : i + 100]
+            marks = ", ".join(f":{n + 1}" for n in range(len(part)))
+            with conn.cursor() as cur:
+                _execute_lobs_as_str(
+                    cur,
+                    f"SELECT memory_id, content FROM {self._table} "  # nosec B608
+                    f"WHERE memory_id IN ({marks}) AND embedding IS NULL",
+                    part,
+                )
+                for mid, content in cur.fetchall() or []:
+                    text = _lob_text(content) if not isinstance(content, str) else content
+                    if mid and text:
+                        out[str(mid)] = text
+        return out
+
     def _embed_worker_loop(self) -> None:
         """Embed queued NULL-embedding rows in batches.
 
@@ -2057,6 +2131,7 @@ class OracleMemoryProvider(MemoryProvider):
                 continue
             pool = self._pool
             done: set[str] = set()
+            requeued: set[str] = set()  # unmatched rows queued again with their stored text
             try:
                 if pool is None:
                     raise RuntimeError("pool not initialized")
@@ -2067,32 +2142,33 @@ class OracleMemoryProvider(MemoryProvider):
                     if vec is not None
                 ]
                 if todo:
-                    import oracledb
-
                     with pool.acquire() as conn:
-                        # The text goes in as a temporary CLOB: a str bind over
-                        # 32,767 bytes fails in SQL (ORA-01460), even with a
-                        # CLOB input size.
-                        binds = [
-                            (vec, model, mid, conn.createlob(oracledb.DB_TYPE_CLOB, text))
-                            for vec, model, mid, text in todo
-                        ]
-                        with conn.cursor() as cur:
-                            # Bulk update embeddings in one executemany,
-                            # stamping provenance alongside the vector. The
-                            # vector is written only for the text it was
-                            # computed from, and only while the row still has
-                            # none: a row updated meanwhile (here or on another
-                            # host) keeps its newer content's embedding, and the
-                            # newer content's own backfill entry fills it.
-                            sql = (
-                                f"UPDATE /*+ NO_PARALLEL */ {self._table} SET embedding = :1, "
-                                "embedding_model = :2, embedding_updated_at = SYSTIMESTAMP "
-                                "WHERE memory_id = :3 AND embedding IS NULL "
-                                "AND DBMS_LOB.COMPARE(content, :4) = 0"
-                            )  # nosec B608
-                            cur.executemany(sql, binds)
+                        unmatched = self._backfill_write(conn, todo)
                         conn.commit()
+                        # Rows whose text did not match: done if they got an
+                        # embedding meanwhile or are gone; otherwise re-queued
+                        # once more with the text the database holds now.
+                        reread = self._backfill_reread(conn, unmatched) if unmatched else {}
+                    for mid, text in reread.items():
+                        with self._embed_lock:
+                            if any(m == mid for m, _ in self._embed_pending):
+                                continue  # a newer write already queued it
+                            n = self._embed_attempts.get(mid, 0) + 1
+                            if n >= _BACKFILL_MAX_ATTEMPTS:
+                                self._embed_attempts.pop(mid, None)
+                                logger.warning(
+                                    "embed backfill: %s never matched its stored text; it keeps a NULL "
+                                    "embedding until the next startup", mid,
+                                )
+                                continue
+                            self._embed_attempts[mid] = n
+                            self._embed_pending.append((mid, text))
+                            requeued.add(mid)
+                    if unmatched:
+                        logger.info(
+                            "embed backfill: %d row(s) changed or embedded meanwhile; %d re-queued with their "
+                            "stored text", len(unmatched), len(reread),
+                        )
                 done = {mid for _, _, mid, _ in todo}
             except Exception as e:
                 logger.warning("embed backfill batch failed: %s", e)
@@ -2100,7 +2176,7 @@ class OracleMemoryProvider(MemoryProvider):
             dropped = 0
             keep: list[tuple[str, str]] = []
             with self._embed_lock:
-                for mid in done:
+                for mid in done - requeued:
                     self._embed_attempts.pop(mid, None)
                 stopping = self._write_stop.is_set()
                 for mid, content in remaining:
@@ -4029,7 +4105,7 @@ class OracleMemoryProvider(MemoryProvider):
             _LIFECYCLE_IN_FLIGHT.add(key)
         thread = threading.Thread(
             target=self._run_skill_lifecycle,
-            args=(skill_name, op, roots),
+            args=(key, skill_name, op, roots),
             daemon=True,
             name=f"oracle-lifecycle-{skill_name}",
         )
@@ -4044,25 +4120,33 @@ class OracleMemoryProvider(MemoryProvider):
                 _LIFECYCLE_IN_FLIGHT.discard(key)
                 _LIFECYCLE_PENDING.pop(key, None)
 
-    def _run_skill_lifecycle(self, skill_name: str, op: str, roots: list[Path]) -> None:
-        key = self._lifecycle_key(skill_name)
-        prov: OracleMemoryProvider = self
+    def _run_skill_lifecycle(self, key: tuple[str, str, str], skill_name: str, op: str, roots: list[Path]) -> None:
+        """Writer loop for one skill. *key* is the one computed when the work
+        was scheduled (the pool fingerprint can change before this thread
+        runs). Coalesced events for this provider run here; an event that
+        reached another provider is handed to that provider's own scheduler,
+        so its shutdown tracks (joins) the thread that runs it."""
         while True:
             try:
                 if op == "archive":
-                    prov._skill_archive_once(skill_name, roots)
+                    self._skill_archive_once(skill_name, roots)
                 else:
-                    prov._skill_ingest_once(skill_name, roots)
+                    self._skill_ingest_once(skill_name, roots)
             except Exception as e:
                 logger.warning("on_skill_lifecycle: %s of '%s' failed: %s", op, skill_name, e)
             with _LIFECYCLE_LOCK:
                 nxt = _LIFECYCLE_PENDING.pop(key, None)
-                # The coalesced event runs on the provider it reached, unless
-                # that provider (or this one) is shutting down.
-                if nxt is None or self._write_stop.is_set() or nxt[0]._write_stop.is_set():
+                again = nxt is not None and nxt[0] is self and not self._write_stop.is_set()
+                if not again:
                     _LIFECYCLE_IN_FLIGHT.discard(key)
-                    return
-            prov, op, roots = nxt
+            if again and nxt is not None:
+                _prov, op, roots = nxt
+                continue
+            if nxt is not None and nxt[0] is not self:
+                nxt[0]._schedule_skill_lifecycle(skill_name, nxt[1], nxt[2])
+            elif nxt is not None:
+                logger.info("on_skill_lifecycle: provider shutting down; not processing '%s'", skill_name)
+            return
 
     @staticmethod
     def _find_skill_file(roots: list[Path], skill_name: str) -> Path | None:
@@ -4077,31 +4161,20 @@ class OracleMemoryProvider(MemoryProvider):
             for sub in _skill_md_matches(root, skill_name):
                 if sub.is_file():
                     return sub
+        # Deeper layouts, as the bulk sync's discovery walks them (hidden
+        # trees such as .archive/ skipped; depth-bounded against link loops).
+        for root in roots:
+            if not root.is_dir():
+                continue
+            base_depth = len(root.parts)
+            for cur_root, dirnames, _files in os.walk(root, followlinks=True):
+                depth = len(Path(cur_root).parts) - base_depth
+                dirnames[:] = [] if depth >= 6 else [d for d in dirnames if not d.startswith(".")]
+                if skill_name in dirnames:
+                    sub = Path(cur_root) / skill_name / "SKILL.md"
+                    if sub.is_file():
+                        return sub
         return None
-
-    @staticmethod
-    def _live_elsewhere(stored_path: Any, own_file: Path | None, roots: list[Path]) -> bool:
-        """True when *stored_path* is a SKILL.md that still exists, is not
-        *own_file* and lies outside *roots*: another profile (or process) on
-        this host owns the stored copy, so this one must not replace or delete it."""
-        if not stored_path:
-            return False
-        try:
-            p = Path(str(stored_path))
-            if not p.is_file():
-                return False
-            rp = p.resolve()
-            if own_file is not None and rp == own_file.resolve():
-                return False
-            for root in roots:
-                try:
-                    rp.relative_to(root.resolve())
-                    return False
-                except ValueError:
-                    continue
-            return True
-        except OSError:
-            return False
 
     def _skill_ingest_once(self, skill_name: str, roots: list[Path]) -> None:
         """Replace this host's copy of one skill (full mode) in one transaction;
@@ -4140,16 +4213,19 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT json_value(metadata, '$.hash'), json_value(metadata, '$.path') "  # nosec B608
-                        f"FROM {self._table} WHERE memory_id = :1 AND role = 'skill'",
+                        "SELECT json_value(metadata, '$.hash'), json_value(metadata, '$.path'), "  # nosec B608
+                        f"json_value(metadata, '$.total_chunks') FROM {self._table} "
+                        "WHERE memory_id = :1 AND role = 'skill'",
                         (f"skill:{host_id}:{name}:c0",),
                     )
                     row = cur.fetchone()
-                    if current_hash and row and row[0] == current_hash:
-                        logger.debug("on_skill_lifecycle: skill '%s' hash unchanged (%s); skipping", name, current_hash)
-                        return
                     stored_path = row[1] if row is not None and len(row) > 1 else None
-                    if self._live_elsewhere(stored_path, skill_file, roots):
+                    # A meta-only copy (no total_chunks) is not current for this full write.
+                    stored_full = row is not None and (len(row) < 3 or row[2] is not None)
+                    if stored_full and _sync.copy_is_current(row[0], stored_path, current_hash, skill_info.path, roots):
+                        logger.debug("on_skill_lifecycle: skill '%s' unchanged (%s); skipping", name, current_hash)
+                        return
+                    if _sync.live_elsewhere(stored_path, skill_file, roots):
                         logger.warning(
                             "on_skill_lifecycle: skill '%s' of host '%s' is stored from %s, which still exists "
                             "outside this profile's skill dirs; not replacing it (set HERMES_HOST_ID per "
@@ -4173,9 +4249,12 @@ class OracleMemoryProvider(MemoryProvider):
         """Delete this host's copy of an archived skill, unless a SKILL.md for
         it is still live under the roots. The copy is found by its id
         (skill:<host>:<name>:c0) or by its stored path (.../<name>/SKILL.md,
-        for a skill whose frontmatter name differs from its directory); a copy
-        whose stored SKILL.md still exists elsewhere (another profile) is kept.
-        Other hosts' copies and the host-less shared corpus are never touched."""
+        for a skill whose frontmatter name differs from its directory). A copy
+        whose stored SKILL.md still exists is kept, wherever it lies (a live
+        skill of this profile under another name, or another profile's copy),
+        unless it is the target of the symlink this archive moved into
+        .archive/. Other hosts' copies and the host-less shared corpus are
+        never touched."""
         if not _SKILL_NAME_RE.match(skill_name or ""):
             return
         if self._find_skill_file(roots, skill_name) is not None:
@@ -4187,6 +4266,7 @@ class OracleMemoryProvider(MemoryProvider):
             return
         deleted = 0
         removed: list[str] = []
+        kept: list[str] = []
         with self._acquire_checked() as conn:
             try:
                 with conn.cursor() as cur:
@@ -4209,7 +4289,10 @@ class OracleMemoryProvider(MemoryProvider):
                         if not sname:
                             m = re.match(r"^skill:[^:]+:([^:]+):c0$", mid)
                             sname = m.group(1) if m else ""
-                        if not _SKILL_NAME_RE.match(sname) or self._live_elsewhere(spath, None, roots):
+                        if not _SKILL_NAME_RE.match(sname):
+                            continue
+                        if _stored_file_exists(spath) and not _sync.archived_link_target(spath, roots, skill_name):
+                            kept.append(f"{sname} ({spath})")
                             continue
                         cur.execute(
                             f"DELETE FROM {self._table} WHERE {_sync.OWN_SKILL_ROWS_SQL}",  # nosec B608
@@ -4229,8 +4312,9 @@ class OracleMemoryProvider(MemoryProvider):
                     pass
                 raise
         logger.info(
-            "on_skill_lifecycle: archived skill '%s': removed %d rows of host '%s' (%s)",
+            "on_skill_lifecycle: archived skill '%s': removed %d rows of host '%s' (%s)%s",
             skill_name, deleted, host_id, ", ".join(removed) or "no copy",
+            f"; kept, SKILL.md still exists: {', '.join(kept)}" if kept else "",
         )
 
     def _load_skill_fetch(self, skill_name: str, path: str = "", variant: int | None = None, host: str = "") -> str:

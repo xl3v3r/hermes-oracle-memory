@@ -2528,7 +2528,16 @@ class TestOraclePlugin(unittest.TestCase):
         bad = []
         for f in tests_dir.glob("test_*.py"):
             src = f.read_text(encoding="utf-8")
-            for pat in (r"shutil\.copy", r"\.symlink_to\(", r"shutil\.rmtree\(\s*(?:plugin_dir|dest)"):
+            # A test may symlink only through a _link_in_tmp() helper that
+            # confines link and target to the temp dir.
+            helper = re.search(r"\ndef _link_in_tmp\(.*?(?=\n(?:def |class ))", src, flags=re.S)
+            if helper:
+                if "gettempdir()" not in helper.group(0) or "relative_to(tmp)" not in helper.group(0):
+                    bad.append(f"{f.name}: _link_in_tmp is not confined to the temp dir")
+                src = src.replace(helper.group(0), "")
+            for pat in (
+                r"shutil\.copy", r"\.symlink_to\(", r"os\.symlink\(", r"shutil\.rmtree\(\s*(?:plugin_dir|dest)"
+            ):
                 if re.search(pat, src) and f.name != Path(__file__).name:
                     bad.append(f"{f.name}: {pat}")
         own = Path(__file__).read_text(encoding="utf-8")

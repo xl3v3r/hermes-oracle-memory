@@ -115,7 +115,7 @@ Per ingested skill `S`:
 
 - **Metadata** (JSON): `category, chunk_index, hash (sha256 of source file), kind=skill_ingest, mtime, path, skill_name, total_chunks, version, host, target=memory`
 - **Reconstruction fidelity**: Chunks are 80 whole words joined by single spaces with 10-word overlap. Reassembled text is word-accurate and lossless at word level (line/markdown formatting flattened).
-- **Host identity**: `{host}` is `HERMES_HOST_ID`, or the short host name in lower case. A host only replaces or deletes rows under its own `skill:{host}:` prefix. Profiles on one host share the id; a copy whose SKILL.md is live in another profile is never replaced or archived (set `HERMES_HOST_ID` per profile to keep separate copies).
+- **Host identity**: `{host}` is `HERMES_HOST_ID`, or the short host name in lower case. A host only replaces or deletes rows under its own `skill:{host}:` prefix. Profiles on one host share the id; a copy whose SKILL.md is live in another profile is never replaced (by the hook or the bulk sync, which reports it as `skipped_foreign`) or archived. Set `HERMES_HOST_ID` per profile to keep separate copies.
 - **Backward compatibility**: Legacy single-row skills (pre-c0 era, no `:cN` suffix) are treated as meta rows and return with status `"meta_only"`. Legacy rows without a host (`skill:{S}:cN`) form the shared corpus; no host prunes them.
 
 ### Using `oracle_load_skill`
