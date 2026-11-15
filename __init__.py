@@ -115,17 +115,28 @@ _SESSION_ERROR_MARKERS = (
     "ORA-02396", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12537",
     "ORA-12541", "ORA-25408",
     "DPI-1067", "DPI-1040", "DPY-4005", "DPY-4011", "DPY-4024", "DPY-1001", "DPY-1002",
-    "timed out", "timeout",
 )
 _ORA_CODE_RE = re.compile(r"\bORA-\d{5}\b")
 
 # Client/pool timeouts: the caller's budget is already spent, so never retry.
-# (DPI-1040 / DPY-4005 = pool wait exceeded; DPI-1067 / DPY-4024 = call timeout.)
-_TIMEOUT_MARKERS = ("timed out", "timeout", "DPI-1040", "DPI-1067", "DPY-4005", "DPY-4024")
+# (DPI-1040 / DPY-4005 = pool wait exceeded; DPI-1067 / DPY-4024 = call timeout;
+# ORA-01013 = the server cancelled the call, which is how a call timeout ends.)
+_TIMEOUT_MARKERS = ("DPI-1040", "DPI-1067", "DPY-4005", "DPY-4024", "ORA-01013")
+_TIMEOUT_PHRASE_RE = re.compile(r"\b(?:timed out|time ?out)\b", re.IGNORECASE)
 
 
 def _is_timeout_error(err: Any) -> bool:
-    return isinstance(err, TimeoutError) or any(m in str(err) for m in _TIMEOUT_MARKERS)
+    """A client/pool/call timeout. The bare words "timeout"/"timed out" count only
+    in messages without an ORA- code (Python and driver errors): an unrelated
+    server error that merely mentions a timeout (e.g. ORA-12170 "TNS:Connect
+    timeout", ORA-04021 "timeout occurred while waiting to lock object") is not
+    a search timeout and must keep its own handling."""
+    if isinstance(err, TimeoutError):
+        return True
+    s = str(err)
+    if any(m in s for m in _TIMEOUT_MARKERS):
+        return True
+    return not _ORA_CODE_RE.search(s) and bool(_TIMEOUT_PHRASE_RE.search(s))
 
 # Row/data/constraint errors: the statement was wrong for this row (duplicate
 # caller-chosen memory_id, value too large, bad JSON), not the ONNX model.
@@ -157,7 +168,7 @@ class _PolicyError(RuntimeError):
 def _is_session_error(err: Any) -> bool:
     """True when *err* indicates a bad connection/session or client timeout."""
     s = str(err)
-    return isinstance(err, TimeoutError) or any(m in s for m in _SESSION_ERROR_MARKERS)
+    return _is_timeout_error(err) or any(m in s for m in _SESSION_ERROR_MARKERS)
 
 
 def _is_onnx_model_failure(err: Any) -> bool:
@@ -478,6 +489,21 @@ def _lob_text(value: Any) -> str:
     return str(value)
 
 
+def _execute_lobs_as_str(cur: Any, sql: str, binds: Any) -> None:
+    """Execute a query with CLOB columns fetched as str in the same round trip
+    (fetch_lobs=False). Fetching locators costs one more round trip per row
+    for every LOB value read. The value is not truncated (checked with a
+    96 KB CLOB on python-oracledb 26.1 thin). Every caller of one SQL text must
+    use the same setting: a connection's statement cache keeps the first
+    execution's column types for identical SQL."""
+    try:
+        cur.execute(sql, binds, fetch_lobs=False)
+    except TypeError as e:
+        if "fetch_lobs" not in str(e):
+            raise
+        cur.execute(sql, binds)  # driver without the per-execute option
+
+
 def _metadata_dict(value: Any) -> dict:
     if value is None:
         return {}
@@ -518,6 +544,10 @@ class _CallTimeoutPool:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._p, name)
 _FETCH_ARRAYSIZE = 64
+# Hybrid search: a row found only by Oracle Text scores 0.3 x its text score
+# (vector hits score 0.7 x similarity), on the fused path and on the
+# cooldown / degraded text-only paths alike.
+_HYBRID_TEXT_WEIGHT = 0.3
 # Embedding backfill (rows written with a NULL embedding during an ONNX cooldown
 # or a transient error). Failed batches back off exponentially; a row is dropped
 # from the in-memory queue after _BACKFILL_MAX_ATTEMPTS (it keeps its NULL
@@ -2415,6 +2445,8 @@ class OracleMemoryProvider(MemoryProvider):
             raise RuntimeError(self._init_error or "pool not initialized")
         where = ""
         binds: dict[str, Any] = {}
+        if memory_ids and len(memory_ids) > _GET_MAX_LIMIT:
+            raise ValueError(f"oracle_get takes at most {_GET_MAX_LIMIT} memory_ids per call")
         if memory_ids:
             names = []
             for i, m in enumerate(memory_ids):
@@ -2448,7 +2480,9 @@ class OracleMemoryProvider(MemoryProvider):
         with self._acquire_checked() as conn:
             conn.call_timeout = _SEARCH_TIMEOUT_MS
             with conn.cursor() as cur:
-                cur.execute(sql, binds)
+                cur.arraysize = max(_FETCH_ARRAYSIZE, binds["lim"] + 1)
+                cur.prefetchrows = cur.arraysize
+                _execute_lobs_as_str(cur, sql, binds)
                 for row in cur.fetchall():
                     meta = _metadata_dict(row[6])
                     out.append(
@@ -2790,22 +2824,22 @@ class OracleMemoryProvider(MemoryProvider):
                 return True
         return False
 
-    def _fetch_rows(self, cur, sql: str, binds: dict) -> list:
-        # oracledb thin mode returns CLOB columns as LOB objects; a
-        # DB_TYPE_LONG outputtypehandler would silently truncate content over
-        # 32,760 bytes, so do not install one. Instead _fetch_rows reads any
-        # LOB value to str below.
-        fetch_k = binds.get("k", _FETCH_ARRAYSIZE)
-        cur.arraysize = max(_FETCH_ARRAYSIZE, int(fetch_k or 0))
+    def _fetch_rows(self, cur, sql: str, binds: dict, max_rows: int | None = None) -> list:
+        """Run one search query and map its rows. *max_rows* is the most rows the
+        statement can return (2 x k for the fused UNION ALL query); the fetch
+        array covers it, plus one, so the whole result arrives with the execute
+        round trip instead of needing another fetch."""
+        if max_rows is None:
+            max_rows = int(binds.get("k") or 0)
+        cur.arraysize = max(_FETCH_ARRAYSIZE, int(max_rows) + 1)
         cur.prefetchrows = cur.arraysize
-        cur.execute(sql, binds)
+        _execute_lobs_as_str(cur, sql, binds)
         out = []
         for row in cur.fetchall():
             content = row[4]
             if content is not None and not isinstance(content, str):
-                # oracledb thin mode returns CLOB columns as LOB objects, not str;
-                # read them out fully (LOB.read() preserves the whole value, unlike a
-                # DB_TYPE_LONG outputtypehandler which truncates at ~32 KB).
+                # Older drivers without fetch_lobs=False return a LOB locator;
+                # read it out fully (one extra round trip per row).
                 content = content.read() if hasattr(content, "read") else str(content)
             dist = float(row[7]) if row[7] is not None else None
             txt = float(row[6] or 0)
@@ -2829,6 +2863,17 @@ class OracleMemoryProvider(MemoryProvider):
                 }
             )
         return out
+
+    def _fetch_rows_attempt(self, cur: Any, sql: str, binds: dict, attempt: int, max_rows: int | None = None) -> list:
+        """_fetch_rows for one attempt of an ORA-51815 retry loop: the first
+        attempt uses *cur*, every re-execution of the same SQL a fresh cursor on
+        the same connection, so a statement left in a bad state by the failed
+        attempt is never re-used."""
+        conn = getattr(cur, "connection", None) if attempt else None
+        if conn is None:
+            return self._fetch_rows(cur, sql, binds, max_rows=max_rows)
+        with conn.cursor() as fresh:
+            return self._fetch_rows(fresh, sql, binds, max_rows=max_rows)
 
     def _build_text_search_sql(
         self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None,
@@ -3005,16 +3050,16 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
+                    # Same weight as a text-only hit of the fused query, so a
+                    # hybrid score means the same thing on every path.
+                    r["score"] = round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
                     merged[r["memory_id"]] = r
                 for item in merged.values():
                     if self._is_prefix_match(item.get("content"), query):
                         item["score"] = round(min(1.0, item["score"] + 0.15), 4)
             except Exception as e:
                 err_str = str(e)
-                is_timeout_err = isinstance(e, TimeoutError) or any(
-                    code in err_str
-                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                )
+                is_timeout_err = _is_timeout_error(e)
                 if is_timeout_err:
                     logger.warning(
                         "Oracle hybrid text search in cooldown timed out after %ss (%s); failing fast",
@@ -3025,12 +3070,7 @@ class OracleMemoryProvider(MemoryProvider):
                         f"oracle_search hybrid text query timed out after {timeout_s:.0f}s: {e}"
                     ) from e
                 raise
-            ranked = sorted(
-                merged.values(), key=lambda x: x["score"], reverse=True
-            )
-            if not rerank or len(ranked) <= 1:
-                return ranked[:top_k]
-            return self._rerank(query, ranked, top_k, cur=cur)
+            return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
         use_onnx = bool(self._onnx_model)
         if not use_onnx and vec is None:
@@ -3044,7 +3084,7 @@ class OracleMemoryProvider(MemoryProvider):
         degraded_to_text = False
         for attempt in range(_51815_RETRIES):
             try:
-                for r in self._fetch_rows(cur, fused_sql, fused_binds):
+                for r in self._fetch_rows_attempt(cur, fused_sql, fused_binds, attempt, max_rows=2 * fetch_k):
                     prev = merged.get(r["memory_id"])
                     if prev:
                         prev["score"] = round(
@@ -3054,7 +3094,7 @@ class OracleMemoryProvider(MemoryProvider):
                     else:
                         item = dict(r)
                         if item.get("dist") is None and "dist" in item:
-                            item["score"] = round(item["score"] * 0.3, 4)
+                            item["score"] = round(item["score"] * _HYBRID_TEXT_WEIGHT, 4)
                         item.pop("dist", None)
                         merged[r["memory_id"]] = item
                 break
@@ -3073,10 +3113,7 @@ class OracleMemoryProvider(MemoryProvider):
 
                 is_text_err = any(code in err_str for code in ("DRG-", "ORA-29902", "ORA-30600"))
                 is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                is_timeout_err = isinstance(e, TimeoutError) or any(
-                    code in err_str
-                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                )
+                is_timeout_err = _is_timeout_error(e)
                 if use_onnx and not is_text_err and not is_shape_err and not is_timeout_err:
                     self._onnx_mark_failed(err_str)
 
@@ -3101,7 +3138,7 @@ class OracleMemoryProvider(MemoryProvider):
                             vec_sql, vec_binds = self._build_vector_search_sql(
                                 query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                             )
-                            for r in self._fetch_rows(cur, vec_sql, vec_binds):
+                            for r in self._fetch_rows_attempt(cur, vec_sql, vec_binds, vec_attempt):
                                 r.pop("dist", None)
                                 merged[r["memory_id"]] = r
                             vec_fallback_done = True
@@ -3119,10 +3156,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 break
 
                             vec_err_str = str(vec_err)
-                            is_vec_timeout = isinstance(vec_err, TimeoutError) or any(
-                                code in vec_err_str
-                                for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                            )
+                            is_vec_timeout = _is_timeout_error(vec_err)
                             logger.warning(
                                 "In-database ONNX vector fallback failed (%s); external fallback is disabled",
                                 vec_err,
@@ -3158,16 +3192,16 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
+                    # Same weight as a text-only hit of the fused query, so a
+                    # hybrid score means the same thing on every path.
+                    r["score"] = round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
                     merged[r["memory_id"]] = r
                 for item in merged.values():
                     if self._is_prefix_match(item.get("content"), query):
                         item["score"] = round(min(1.0, item["score"] + 0.15), 4)
             except Exception as e:
                 err_str = str(e)
-                is_timeout_err = isinstance(e, TimeoutError) or any(
-                    code in err_str
-                    for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                )
+                is_timeout_err = _is_timeout_error(e)
                 if is_timeout_err:
                     logger.warning(
                         "Oracle hybrid degraded text search timed out after %ss (%s); failing fast",
@@ -3178,24 +3212,17 @@ class OracleMemoryProvider(MemoryProvider):
                         f"oracle_search hybrid degraded text query timed out after {timeout_s:.0f}s: {e}"
                     ) from e
                 logger.warning("Oracle hybrid degraded text search encountered error: %s", e)
-            ranked = sorted(
-                merged.values(), key=lambda x: x["score"], reverse=True
-            )
-            if not rerank or len(ranked) <= 1:
-                return ranked[:top_k]
-            return self._rerank(query, ranked, top_k, cur=cur)
+            return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
         for item in merged.values():
             item.pop("dist", None)
             if self._is_prefix_match(item.get("content"), query):
                 item["score"] = round(min(1.0, item["score"] + 0.15), 4)
 
-        ranked = sorted(
-            merged.values(), key=lambda x: x["score"], reverse=True
-        )
-        if not rerank or len(ranked) <= 1:
-            return ranked[:top_k]
-        return self._rerank(query, ranked, top_k, cur=cur)
+        # Not cut to top_k here: weighting and per-source diversification run
+        # in _search_once over the whole candidate list, and the optional rerank
+        # after them (*rerank* is applied there).
+        return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
     def _apply_weights(self, rows: list[dict[str, Any]], cur: Any = None) -> list[dict[str, Any]]:
         """Apply retrieval weighting to candidate rows based on recency, role, telemetry, and length."""
@@ -3403,10 +3430,7 @@ class OracleMemoryProvider(MemoryProvider):
                         rows = sorted(rows, key=lambda x: x["score"], reverse=True)
                     except Exception as e:
                         err_str = str(e)
-                        is_timeout_err = isinstance(e, TimeoutError) or any(
-                            code in err_str
-                            for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                        )
+                        is_timeout_err = _is_timeout_error(e)
                         if is_timeout_err:
                             logger.warning(
                                 "Oracle text search timed out after %ss (%s); failing fast",
@@ -3434,7 +3458,7 @@ class OracleMemoryProvider(MemoryProvider):
                         )
                         for attempt in range(_51815_RETRIES):
                             try:
-                                rows = self._fetch_rows(cur, sql, binds)
+                                rows = self._fetch_rows_attempt(cur, sql, binds, attempt)
                                 break
                             except Exception as vec_fetch_e:
                                 if _is_51815(vec_fetch_e) and attempt < _51815_RETRIES - 1:
@@ -3449,10 +3473,7 @@ class OracleMemoryProvider(MemoryProvider):
                     except Exception as e:
                         err_str = str(e)
                         is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
-                        is_timeout_err = isinstance(e, TimeoutError) or any(
-                            code in err_str
-                            for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout")
-                        )
+                        is_timeout_err = _is_timeout_error(e)
                         logger.warning(
                             "In-database ONNX vector search failed (%s); external fallback is disabled",
                             e,
@@ -3471,6 +3492,8 @@ class OracleMemoryProvider(MemoryProvider):
                         cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match, timeout_s=query_timeout_s
                     )
                 rows = self._apply_weights(rows, cur)
+                if mode == "hybrid" and rerank and len(rows) > 1:
+                    rows = self._rerank(query, rows, top_k, cur=cur)
         return rows[:top_k]
 
     def _rerank(self, query: str, rows: list, top_k: int, cur=None) -> list:
@@ -3507,7 +3530,9 @@ class OracleMemoryProvider(MemoryProvider):
                     id_rank[mid] = i
             if not id_rank:
                 return rows
-            return sorted(rows, key=lambda r: id_rank.get(r["memory_id"], 999))[:top_k]
+            # Reorder only; the caller cuts to top_k (rows the reranker did not
+            # see keep their order after the reranked head).
+            return sorted(rows, key=lambda r: id_rank.get(r["memory_id"], len(id_rank)))
         except Exception as e:
             logger.debug("DBMS_VECTOR.RERANK skipped: %s", e)
             return rows
@@ -4302,11 +4327,7 @@ class OracleMemoryProvider(MemoryProvider):
                         )
                     return json.dumps({"results": rows, "count": len(rows)}, default=_json_default)
                 except Exception as e:
-                    err_str = str(e)
-                    is_timeout = isinstance(e, TimeoutError) or any(
-                        code in err_str
-                        for code in ("DPI-1067", "DPI-1040", "ORA-01013", "DPY-4011", "DPY-4024", "timed out", "timeout", "TimeoutError")
-                    )
+                    is_timeout = _is_timeout_error(e) or "TimeoutError" in str(e)
                     if is_timeout:
                         logger.warning(
                             "oracle_search query timed out after %ss (%s); clean fallback to empty results",
