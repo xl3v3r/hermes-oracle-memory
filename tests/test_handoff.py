@@ -191,7 +191,8 @@ class TestUpdateTags(unittest.TestCase):
         self.assertIn("required", p.handle_tool_call("oracle_update", {"memory_id": "m1"}))
 
     def test_update_missing_row(self):
-        p, _, _ = _provider(rowcount=0)
+        p, _, cur = _provider(rowcount=0)
+        cur.fetchone.return_value = (0,)  # not a skill-corpus row either
         self.assertIn("Memory not found", p.handle_tool_call("oracle_update", {"memory_id": "nope", "tags": ["a"]}))
 
 

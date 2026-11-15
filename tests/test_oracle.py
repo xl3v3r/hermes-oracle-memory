@@ -948,6 +948,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": ["Fact 1: server is Linux", "Fact 2: Python 3.12 active"],
@@ -957,13 +958,17 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("Batch facts stored (2)", data["result"])
         self.assertEqual(len(data["memory_ids"]), 2)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
 
     def test_oracle_add_batch_facts_via_content_list(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "content": ["Fact A", "Fact B", "Fact C"],
@@ -971,13 +976,17 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 3)
-        self.assertEqual(provider._insert.call_count, 3)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 3)
 
     def test_oracle_add_stringified_json_array(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": '["Fact X: parsed from JSON string", "Fact Y: JSON string"]',
@@ -985,26 +994,34 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
 
     def test_oracle_add_content_stringified_json_array(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "content": '["Fact Alpha", "Fact Beta"]',
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
 
     def test_oracle_add_dict_facts(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._pool = MagicMock()
         provider._session_id = "sess-1"
         provider._insert = MagicMock()
+        provider._insert_many = MagicMock(return_value=[])
 
         res = provider.handle_tool_call("oracle_add", {
             "facts": [{"fact": "Dict fact 1"}, {"text": "Dict fact 2"}],
@@ -1012,11 +1029,15 @@ class TestOraclePlugin(unittest.TestCase):
         })
         data = json.loads(res)
         self.assertEqual(data["count"], 2)
-        self.assertEqual(provider._insert.call_count, 2)
+        # 1.1.1.4: one all-or-nothing array insert per batch
+        provider._insert.assert_not_called()
+        provider._insert_many.assert_called_once()
+        self.assertEqual(len(provider._insert_many.call_args[0][0]), 2)
         # Invalid target must normalize to "memory"
-        self.assertEqual(provider._insert.call_args_list[0][1]["target"], "memory")
-        self.assertEqual(provider._insert.call_args_list[0][1]["content"], "Dict fact 1")
-        self.assertEqual(provider._insert.call_args_list[1][1]["content"], "Dict fact 2")
+        rows = provider._insert_many.call_args[0][0]
+        self.assertEqual(rows[0]["target"], "memory")
+        self.assertEqual([r["content"] for r in rows], ["Dict fact 1", "Dict fact 2"])
+        self.assertEqual(data["memory_ids"], [r["memory_id"] for r in rows])
 
     def test_oracle_add_missing_content(self):
         provider = oracle_plugin.OracleMemoryProvider()

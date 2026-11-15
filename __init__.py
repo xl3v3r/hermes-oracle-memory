@@ -377,6 +377,18 @@ def _skill_md_matches(root: Path, skill_name: str) -> list[Path]:
 _MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/\-]{0,127}$")
 _MAX_TAGS = 32
 _MAX_TAG_LEN = 64
+# Tool-surface bounds (1.1.1.4). One oracle_add call stores at most
+# _ADD_MAX_FACTS facts of at most _MAX_FACT_CHARS characters each (longer text
+# belongs in oracle_chunk); oracle_search returns at most
+# _SEARCH_CONTENT_MAX_CHARS characters of each row (oracle_get has the rest).
+_ADD_MAX_FACTS = 100
+_MAX_FACT_CHARS = 32000
+_SEARCH_CONTENT_MAX_CHARS = 4000
+# DBMS_VECTOR.UTL_TO_CHUNKS by words accepts max 10..1000 (ORA-30584 outside).
+_CHUNK_MIN_WORDS = 10
+_CHUNK_MAX_WORDS = 1000
+# Skill-corpus ids are owned by the skill sync; the generic tools refuse them.
+_SKILL_ID_PREFIX = "skill:"
 _GET_DEFAULT_LIMIT = 20
 _GET_MAX_LIMIT = 100
 
@@ -462,7 +474,9 @@ def _tag_filter_sql(tags: Any, match: str = "all", prefix: str = "tg") -> tuple[
     on existing installs) would otherwise answer the predicate, and that index
     syncs asynchronously -- a handoff row written and read back within ~2 s was
     not found. Wrapping the column makes Oracle evaluate the tags on the rows
-    themselves (read-your-writes)."""
+    themselves (read-your-writes). Matching is case-insensitive: the query tags
+    are lower-cased by _normalize_tags and the stored ones by @.lower(), so rows
+    written by other tools with mixed-case tags still match."""
     norm = _normalize_tags(tags)
     if not norm:
         return "", {}
@@ -472,7 +486,7 @@ def _tag_filter_sql(tags: Any, match: str = "all", prefix: str = "tg") -> tuple[
         name = f"{prefix}{i}"
         binds[name] = tag
         preds.append(
-            f"JSON_EXISTS(JSON_QUERY(metadata, '$.tags' RETURNING JSON), '$[*]?(@ == ${name})' "
+            f"JSON_EXISTS(JSON_QUERY(metadata, '$.tags' RETURNING JSON), '$[*]?(@.lower() == ${name})' "
             f"PASSING :{name} AS \"{name}\")"
         )
     joiner = " OR " if str(match or "all").lower() == "any" else " AND "
@@ -517,6 +531,66 @@ def _metadata_dict(value: Any) -> dict:
         except Exception:
             return {}
     return dict(value) if isinstance(value, dict) else {}
+
+
+_SKILL_ROW_READONLY = (
+    "skill-corpus rows (role='skill') are written by oracle_sync_skills and the skill "
+    "lifecycle hook; edit the SKILL.md and re-sync instead"
+)
+
+
+def _search_tool_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """oracle_search result: each row's content is cut to
+    _SEARCH_CONTENT_MAX_CHARS (flagged, with its full length) and internal
+    ranking fields are dropped."""
+    out_rows = []
+    cut = False
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        item = {k: v for k, v in r.items() if k not in ("dist",)}
+        body = item.get("content")
+        if isinstance(body, str) and len(body) > _SEARCH_CONTENT_MAX_CHARS:
+            item["content"] = body[:_SEARCH_CONTENT_MAX_CHARS]
+            item["content_truncated"] = True
+            item["content_chars"] = len(body)
+            cut = True
+        out_rows.append(item)
+    payload: dict[str, Any] = {"results": out_rows, "count": len(out_rows)}
+    if cut:
+        payload["note"] = "Some contents were cut; oracle_get(memory_id=...) returns the full text."
+    return payload
+
+
+def _chunk_params(max_words: Any, overlap: Any) -> tuple[int, int]:
+    """Validate oracle_chunk sizes: max_words 10..1000 (the UTL_TO_CHUNKS range)
+    and 0 <= overlap <= max_words / 2. Raises ValueError."""
+    try:
+        mw = 80 if max_words in (None, "") else int(max_words)
+        ov = 10 if overlap in (None, "") else int(overlap)
+    except (TypeError, ValueError):
+        raise ValueError("max_words and overlap must be integers") from None
+    if not _CHUNK_MIN_WORDS <= mw <= _CHUNK_MAX_WORDS:
+        raise ValueError(f"max_words must be between {_CHUNK_MIN_WORDS} and {_CHUNK_MAX_WORDS} (got {mw})")
+    if not 0 <= ov <= mw // 2:
+        raise ValueError(f"overlap must be between 0 and max_words/2 = {mw // 2} (got {ov})")
+    return mw, ov
+
+
+def _metadata_tags(value: Any) -> list[str]:
+    """Tags projected as JSON_QUERY(metadata, '$.tags') text (or a list)."""
+    if value is None:
+        return []
+    if hasattr(value, "read"):
+        value = value.read()
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return [str(t) for t in value if isinstance(t, (str, int, float))] if isinstance(value, list) else []
 
 
 class _CallTimeoutPool:
@@ -768,7 +842,7 @@ TOOL_SCHEMAS = [
                 "facts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional list of facts to store in batch.",
+                    "description": "Optional list of facts to store in batch (max 100 facts of 32,000 chars each; all or none are stored).",
                 },
                 "target": {
                     "type": "string",
@@ -868,11 +942,11 @@ TOOL_SCHEMAS = [
                 },
                 "max_words": {
                     "type": "integer",
-                    "description": "Chunk size in words (default 80).",
+                    "description": "Chunk size in words, 10-1000 (default 80).",
                 },
                 "overlap": {
                     "type": "integer",
-                    "description": "Word overlap (default 10).",
+                    "description": "Word overlap, 0 to max_words/2 (default 10).",
                 },
             },
         },
@@ -917,6 +991,14 @@ TOOL_SCHEMAS = [
             "properties": {
                 "action": {"type": "string", "enum": ["fetch", "list"], "default": "fetch"},
                 "skill": {"type": "string", "description": "Skill name (exact, from list). Required for action=fetch."},
+                "path": {
+                    "type": "string",
+                    "description": "action=fetch only: source path of one copy, when the skill exists in several (from the variants list).",
+                },
+                "variant": {
+                    "type": "integer",
+                    "description": "action=fetch only: variant number from the variants list, when the skill exists in several copies.",
+                },
                 "filter": {"type": "string", "description": "action=list only: substring match on name/description."},
                 "offset": {"type": "integer", "description": "action=list only: pagination offset (default 0)."},
             },
@@ -2257,7 +2339,9 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _update_row(self, mid: str, content: str | None, tags: list[str] | None = None) -> int:
         """Update a row's content (re-embedded in-database) and/or replace its
-        metadata.tags. Returns the number of rows updated (0 = not found)."""
+        metadata.tags. Returns the number of rows updated (0 = not found).
+        Skill-corpus rows (role='skill') are never updated here: the next skill
+        sync would silently revert the edit."""
         if not self._pool:
             raise RuntimeError(self._init_error or "pool not initialized")
         meta_set = ""
@@ -2271,7 +2355,7 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')), SET '$.tags' = JSON(:tags))
-                WHERE memory_id = :id
+                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
             """  # nosec B608
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
@@ -2292,7 +2376,7 @@ class OracleMemoryProvider(MemoryProvider):
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET content = :c, embedding = NULL, content_txt = :t,
                     embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                WHERE memory_id = :id
+                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
             """  # nosec B608
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
@@ -2311,7 +2395,7 @@ class OracleMemoryProvider(MemoryProvider):
                         UPDATE /*+ NO_PARALLEL */ {self._table}
                         SET content = :c, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :e AS DATA), content_txt = :t,
                             embedding_model = :m, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                        WHERE memory_id = :id
+                        WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
                         """  # nosec B608
                     cur.execute(
                         sql,
@@ -2375,7 +2459,7 @@ class OracleMemoryProvider(MemoryProvider):
                             UPDATE /*+ NO_PARALLEL */ {self._table}
                             SET content = :c, embedding = NULL, content_txt = :t,
                                 embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                            WHERE memory_id = :id
+                            WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
                         """  # nosec B608
                         try:
                             cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
@@ -2389,6 +2473,19 @@ class OracleMemoryProvider(MemoryProvider):
         if backfill_after_commit and n:
             self._queue_embed_backfill(mid, content)
         return n
+
+    def _is_skill_row(self, mid: str) -> bool:
+        try:
+            with self._acquire_checked() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM {self._table} WHERE memory_id = :id AND role = 'skill'",  # nosec B608
+                        {"id": mid},
+                    )
+                    row = cur.fetchone()
+            return bool(row and row[0])
+        except Exception:
+            return False
 
     def _upsert_fact(
         self,
@@ -2862,6 +2959,9 @@ class OracleMemoryProvider(MemoryProvider):
                     "created_at": row[8] if len(row) > 8 else None,
                 }
             )
+            tags = _metadata_tags(row[9]) if len(row) > 9 else []
+            if tags:
+                out[-1]["tags"] = tags
         return out
 
     def _fetch_rows_attempt(self, cur: Any, sql: str, binds: dict, attempt: int, max_rows: int | None = None) -> list:
@@ -2893,7 +2993,8 @@ class OracleMemoryProvider(MemoryProvider):
 
         sql = f"""
             SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                   SCORE(1) AS txt_score, NULL AS distance, created_at
+                   SCORE(1) AS txt_score, NULL AS distance, created_at,
+                   JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
             {self._JUNK}{tgt_sql}{extra_filters}
@@ -2921,7 +3022,7 @@ class OracleMemoryProvider(MemoryProvider):
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
                        VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
-                       created_at
+                       created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -2934,7 +3035,7 @@ class OracleMemoryProvider(MemoryProvider):
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                        0 AS txt_score,
                        VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
-                       created_at
+                       created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                 FROM {self._table}
                 WHERE embedding IS NOT NULL
                 {self._JUNK}{tgt_sql}{extra_filters}
@@ -2967,12 +3068,12 @@ class OracleMemoryProvider(MemoryProvider):
         if use_onnx and self._onnx_model:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
                            VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
-                           created_at
+                           created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -2981,10 +3082,11 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance, created_at
+                           SCORE(1) AS txt_score, NULL AS distance, created_at,
+                           JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -3000,12 +3102,12 @@ class OracleMemoryProvider(MemoryProvider):
         else:
             fused_sql = f"""
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
                            0 AS txt_score,
                            VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
-                           created_at
+                           created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE embedding IS NOT NULL
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -3014,10 +3116,11 @@ class OracleMemoryProvider(MemoryProvider):
                 )
                 UNION ALL
                 SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at
+                       txt_score, distance, created_at, tags
                 FROM (
                     SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance, created_at
+                           SCORE(1) AS txt_score, NULL AS distance, created_at,
+                           JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
                     FROM {self._table}
                     WHERE CONTAINS(content, :q, 1) > 0
                     {self._JUNK}{tgt_sql}{extra_filters}
@@ -3657,19 +3760,57 @@ class OracleMemoryProvider(MemoryProvider):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if not self._pool or action != "add" or not isinstance(content, str) or not content:
+        """Mirror built-in memory writes. add inserts an md_ row; replace inserts
+        the new entry first, then deletes the mirror of the previous one; remove
+        deletes it. The previous entry is identified only by
+        metadata["previous_content"] (old_text alone is not authoritative), and
+        only this host's mirrors of the same target are touched."""
+        if not self._pool or action not in ("add", "replace", "remove"):
             return
+        meta = dict(metadata or {})
+        previous = meta.pop("previous_content", None)
+        meta.pop("old_text", None)
+        tgt = target if target in ("memory", "user") else "memory"
         try:
-            self._insert(
-                memory_id=f"md_{uuid.uuid4().hex[:16]}",
-                session_id=self._session_id,
-                role="fact",
-                content=content,
-                target=target or "memory",
-                metadata={"kind": "builtin", **(metadata or {})},
-            )
+            if action in ("add", "replace") and isinstance(content, str) and content:
+                self._insert(
+                    memory_id=f"md_{uuid.uuid4().hex[:16]}",
+                    session_id=self._session_id,
+                    role="fact",
+                    content=content,
+                    target=tgt,
+                    metadata={**meta, "kind": "builtin", "host": get_host_id()},
+                )
+            if action == "add":
+                return
+            if not isinstance(previous, str) or not previous:
+                logger.debug("oracle on_memory_write %s without previous_content; old mirror kept", action)
+                return
+            if action == "replace" and previous == content:
+                return
+            self._delete_memory_mirror(tgt, previous)
         except Exception as e:
-            logger.debug("oracle on_memory_write failed: %s", e)
+            logger.debug("oracle on_memory_write %s failed: %s", action, e)
+
+    def _delete_memory_mirror(self, target: str, content: str) -> int:
+        """Delete this host's md_ mirror rows of one built-in memory entry. Rows
+        mirrored before 1.1.1.4 carry no host and match by agent id alone. The
+        host is read from the row itself (JSON_QUERY wrapper), not from the
+        asynchronously synced JSON search index, so a mirror written a moment
+        ago is found."""
+        sql = f"""
+            DELETE /*+ NO_PARALLEL */ FROM {self._table}
+            WHERE memory_id LIKE 'md\\_%' ESCAPE '\\'
+              AND role = 'fact' AND agent_id = :aid AND NVL(target, 'memory') = :tgt
+              AND NVL(JSON_VALUE(JSON_QUERY(metadata, '$' RETURNING JSON), '$.host'), :host) = :host
+              AND DBMS_LOB.COMPARE(content, TO_CLOB(:c)) = 0
+        """  # nosec B608
+        with self._acquire_checked() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"aid": self._agent_id, "tgt": target, "host": get_host_id(), "c": content})
+                n = cur.rowcount or 0
+            conn.commit()
+        return n
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if not self._pool or not isinstance(messages, list) or not messages:
@@ -4325,7 +4466,7 @@ class OracleMemoryProvider(MemoryProvider):
                         return json.dumps(
                             {"result": "No relevant memories found.", "count": 0}
                         )
-                    return json.dumps({"results": rows, "count": len(rows)}, default=_json_default)
+                    return json.dumps(_search_tool_payload(rows), default=_json_default)
                 except Exception as e:
                     is_timeout = _is_timeout_error(e) or "TimeoutError" in str(e)
                     if is_timeout:
@@ -4386,6 +4527,16 @@ class OracleMemoryProvider(MemoryProvider):
 
                 if not facts_to_add:
                     return tool_error("Missing required parameter: content or facts")
+                if len(facts_to_add) > _ADD_MAX_FACTS:
+                    return tool_error(
+                        f"too many facts in one call ({len(facts_to_add)}; max {_ADD_MAX_FACTS}): split the batch"
+                    )
+                too_long = [i for i, f in enumerate(facts_to_add) if len(f) > _MAX_FACT_CHARS]
+                if too_long:
+                    return tool_error(
+                        f"fact {too_long[0]} is {len(facts_to_add[too_long[0]])} characters (max {_MAX_FACT_CHARS}); "
+                        "store long text with oracle_chunk"
+                    )
 
                 try:
                     add_tags = _normalize_tags(args.get("tags"))
@@ -4397,6 +4548,11 @@ class OracleMemoryProvider(MemoryProvider):
                 if add_tags:
                     add_meta["tags"] = add_tags
 
+                if req_mid is not None and req_mid.lower().startswith(_SKILL_ID_PREFIX):
+                    return tool_error(
+                        f"memory_id prefix '{_SKILL_ID_PREFIX}' is reserved for the skill corpus "
+                        "(written by oracle_sync_skills)"
+                    )
                 if req_mid is not None:
                     if len(facts_to_add) != 1:
                         return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
@@ -4425,18 +4581,20 @@ class OracleMemoryProvider(MemoryProvider):
                         out["tags"] = add_tags
                     return json.dumps(out)
                 else:
-                    mids = []
-                    for f in facts_to_add:
-                        mid = f"fact_{uuid.uuid4().hex[:16]}"
-                        self._insert(
-                            memory_id=mid,
-                            session_id=self._session_id,
-                            role="fact",
-                            content=f,
-                            target=target,
-                            metadata=add_meta,
-                        )
-                        mids.append(mid)
+                    # One array insert, committed once: either every fact is
+                    # stored (and its id returned) or none is.
+                    mids = [f"fact_{uuid.uuid4().hex[:16]}" for _ in facts_to_add]
+                    self._insert_many([
+                        {
+                            "memory_id": mid,
+                            "session_id": self._session_id,
+                            "role": "fact",
+                            "content": f,
+                            "target": target,
+                            "metadata": add_meta,
+                        }
+                        for mid, f in zip(mids, facts_to_add)
+                    ])
                     return json.dumps({
                         "result": f"Batch facts stored ({len(mids)}).",
                         "memory_ids": mids,
@@ -4448,12 +4606,18 @@ class OracleMemoryProvider(MemoryProvider):
                 has_tags = args.get("tags") is not None
                 if not mid or (not content and not has_tags):
                     return tool_error("memory_id and content (or tags) required")
+                if len(content) > _MAX_FACT_CHARS:
+                    return tool_error(f"content is {len(content)} characters (max {_MAX_FACT_CHARS})")
+                if mid.lower().startswith(_SKILL_ID_PREFIX):
+                    return tool_error(_SKILL_ROW_READONLY)
                 try:
                     upd_tags = _normalize_tags(args.get("tags")) if has_tags else None
                 except ValueError as ve:
                     return tool_error(str(ve))
                 n = self._update_row(mid, content or None, tags=upd_tags)
                 if not n:
+                    if self._is_skill_row(mid):
+                        return tool_error(_SKILL_ROW_READONLY)
                     return tool_error(f"Memory not found: {mid}")
                 upd_out: dict[str, Any] = {"result": "updated", "memory_id": mid}
                 if upd_tags is not None:
@@ -4542,6 +4706,10 @@ class OracleMemoryProvider(MemoryProvider):
                 file_path = (args.get("file_path") or args.get("path") or "").strip()
                 if not content and not file_path:
                     return tool_error("Missing required parameter: content or file_path")
+                try:
+                    max_words, overlap = _chunk_params(args.get("max_words"), args.get("overlap"))
+                except ValueError as ve:
+                    return tool_error(str(ve))
                 if file_path:
                     try:
                         p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
@@ -4616,9 +4784,7 @@ class OracleMemoryProvider(MemoryProvider):
                             structured_turns = []
 
                         if structured_turns and not content:
-                            mw = int(args.get("max_words") or 80)
-                            ov = int(args.get("overlap") or 10)
-                            ids = self._chunk_and_store("", mw, ov, turns=structured_turns)
+                            ids = self._chunk_and_store("", max_words, overlap, turns=structured_turns)
                             return json.dumps(
                                 {"result": "chunked", "count": len(ids), "memory_ids": ids}
                             )
@@ -4634,8 +4800,6 @@ class OracleMemoryProvider(MemoryProvider):
 
                 if not content:
                     return tool_error("Content is empty")
-                max_words = int(args.get("max_words") or 80)
-                overlap = int(args.get("overlap") or 10)
                 ids = self._chunk_and_store(content, max_words, overlap)
                 return json.dumps(
                     {"result": "chunked", "count": len(ids), "memory_ids": ids}
@@ -4751,9 +4915,14 @@ class OracleMemoryProvider(MemoryProvider):
                         logger.debug("UTL_TO_CHUNKS failed (%s); local split", e)
         if not chunks:
             words = text.split()
-            step = max(1, max_words - overlap)
+            size = max(1, max_words)
+            step = max(1, size - max(0, overlap))
             for i in range(0, len(words), step):
-                chunks.append(" ".join(words[i : i + max_words]))
+                piece = " ".join(words[i : i + size])
+                if piece:
+                    chunks.append(piece)
+                if i + size >= len(words):
+                    break  # the rest is already inside this chunk
         return chunks
 
     def _chunk_and_store(
