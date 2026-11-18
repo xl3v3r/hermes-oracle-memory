@@ -1,298 +1,337 @@
 #!/usr/bin/env python3
-"""Verification script for OracleMemoryProvider with qwen/qwen3-embedding-4b."""
+"""Smoke test for an installed Oracle memory provider.
+
+Starts the provider with the OCI_DB_* settings from the environment (or from
+--env-file) and checks that a memory can be written, read back, found in each
+search mode, updated and deleted.
+
+Every row the run writes carries a session id unique to that run, and the run
+deletes them all before it exits, also when a check fails. It asserts nothing
+about rows that were in the table before, so it holds on any database: an
+empty one, or one that already stores memory.
+
+    export OCI_DB_USER=... OCI_DB_PASSWORD=... OCI_DB_DSN=...
+    python3 tests/verify_provider.py
+
+    python3 tests/verify_provider.py --env-file ~/.hermes/.env
+    python3 tests/verify_provider.py --table HERMES_VERIFY_SCRATCH
+
+Exit status: 0 = every check passed, 1 = a check failed, 2 = could not run.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
+import time
 import types
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-# Load ~/.hermes/.env
-env_file = Path.home() / ".hermes" / ".env"
-if env_file.exists():
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_REQUIRED_ENV = ("OCI_DB_USER", "OCI_DB_PASSWORD", "OCI_DB_DSN")
+_SESSION_PREFIX = "verify-"
+
+
+def load_env(env_file: str | None) -> None:
+    """Load KEY=VALUE settings from *env_file*, only when --env-file is given.
+    Values already in the environment win."""
+    if not env_file:
+        return
+    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            v = v.strip().strip('"').strip("'")
-            os.environ.setdefault(k.strip(), v)
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-# Ensure agent and tools modules are present, providing shims if running standalone
-if "agent" not in sys.modules:
-    try:
-        from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
-        from agent.secret_scope import get_secret
-    except ImportError:
-        agent_mod = types.ModuleType("agent")
-        mp_mod = types.ModuleType("agent.memory_provider")
 
-        class MemoryProvider:
-            def initialize(self, session_id: str) -> None:
-                pass
-            def is_available(self) -> bool:
-                return True
-            def unavailable_reason(self) -> str:
-                return ""
-            def shutdown(self) -> None:
+def _install_host_shims() -> None:
+    """Outside Hermes there is no `agent` or `tools` package; provide the few
+    names the plugin imports."""
+    if "agent" not in sys.modules:
+        try:
+            import agent.memory_provider  # noqa: F401
+            import agent.secret_scope  # noqa: F401
+        except ImportError:
+            agent_mod = types.ModuleType("agent")
+            mp_mod = types.ModuleType("agent.memory_provider")
+
+            class MemoryProvider:
                 pass
 
-        @dataclass
-        class RecallStatus:
-            provider_label: str
-            count: int
+            @dataclass
+            class RecallStatus:
+                provider_label: str
+                count: int
 
-        mp_mod.MemoryProvider = MemoryProvider
-        mp_mod.RecallStatus = RecallStatus
-        mp_mod.is_trivial_prompt = lambda prompt: False
-        agent_mod.memory_provider = mp_mod
-        sys.modules["agent"] = agent_mod
-        sys.modules["agent.memory_provider"] = mp_mod
-
-        sec_mod = types.ModuleType("agent.secret_scope")
-        sec_mod.get_secret = lambda k, default=None: os.environ.get(k, default)
-        agent_mod.secret_scope = sec_mod
-        sys.modules["agent.secret_scope"] = sec_mod
-
-if "tools" not in sys.modules:
-    try:
-        from tools.registry import tool_error
-    except ImportError:
-        tools_mod = types.ModuleType("tools")
-        reg_mod = types.ModuleType("tools.registry")
-        reg_mod.tool_error = lambda msg: f"Error: {msg}"
-        tools_mod.registry = reg_mod
-        sys.modules["tools"] = tools_mod
-        sys.modules["tools.registry"] = reg_mod
-
-root_dir = str(Path(__file__).resolve().parent.parent)
-if root_dir not in sys.path:
-    sys.path.insert(0, root_dir)
-
-from __init__ import OracleMemoryProvider, _EMBED_MODEL, _EMBED_DIM
-
-
-def main() -> None:
-    print(f"Configured model: {_EMBED_MODEL}")
-    print(f"Configured dimensions: {_EMBED_DIM}")
-    assert _EMBED_MODEL == "qwen/qwen3-embedding-4b", f"Unexpected model: {_EMBED_MODEL}"
-    assert _EMBED_DIM == 768, f"Unexpected dim: {_EMBED_DIM}"
-
-    provider = OracleMemoryProvider()
-    print("Provider initialized instance")
-
-    provider.initialize("test-verification-session")
-    is_avail = provider.is_available()
-    print(f"Is available: {is_avail}")
-    if not is_avail:
-        print(f"Unavailable reason: {provider.unavailable_reason()}")
-        if provider._init_error:
-            print(f"Init error: {provider._init_error}")
-        sys.exit(1)
-
-    print(f"Configured ONNX model: {provider._onnx_model}")
-
-    # 1. Verify single embedding generation
-    print("Testing _embed (in-database ONNX VECTOR_EMBEDDING)...")
-    vec = provider._embed("Oracle 26ai Autonomous Database vector search verification")
-    assert vec is not None, "Failed to get vector embedding"
-    assert len(vec) == 768, f"Expected 768 dimensions, got {len(vec)}"
-    print(f"Vector embedding verified: dim={len(vec)}, type={vec.typecode}")
-
-    # 2. Verify batch embedding
-    print("Testing _embed_many with batch of texts...")
-    batch_vecs = provider._embed_many(["valid query", "another query"])
-    assert len(batch_vecs) == 2, f"Expected 2 results, got {len(batch_vecs)}"
-    assert batch_vecs[0] is not None and len(batch_vecs[0]) == 768, "Failed valid query 1"
-    assert batch_vecs[1] is not None and len(batch_vecs[1]) == 768, "Failed valid query 2"
-    print("Batch embedding verified successfully.")
-
-    # 3. Verify vector search
-    print("Testing vector search...")
-    vec_results = provider._search("database memory architecture", mode="vector", top_k=2)
-    print(f"Vector search returned {len(vec_results)} results")
-    if vec_results:
-        print(f"Top vector match id: {vec_results[0].get('memory_id')}, score: {vec_results[0].get('score')}")
-
-    # 4. Verify text search
-    print("Testing text search...")
-    text_results = provider._search("database memory architecture", mode="text", top_k=2)
-    print(f"Text search returned {len(text_results)} results")
-    if text_results:
-        print(f"Top text match id: {text_results[0].get('memory_id')}, score: {text_results[0].get('score')}")
-
-    # 5. Verify hybrid search
-    print("Testing hybrid search...")
-    hybrid_results = provider._search("database memory architecture", mode="hybrid", top_k=2)
-    print(f"Hybrid search returned {len(hybrid_results)} results")
-    if hybrid_results:
-        print(f"Top hybrid match id: {hybrid_results[0].get('memory_id')}, score: {hybrid_results[0].get('score')}")
-
-    # 6. Verify prefetch
-    print("Testing prefetch...")
-    prefetch_out = provider.prefetch("database memory architecture")
-    print(f"Prefetch output length: {len(prefetch_out)} characters")
-
-    # 7. Verify oracle_search tool call
-    print("Testing handle_tool_call oracle_search...")
-    tool_out = provider.handle_tool_call("oracle_search", {
-        "query": "database memory architecture",
-        "mode": "hybrid",
-        "limit": 2,
-    })
-    print(f"Tool call output length: {len(tool_out)} characters")
-    assert len(tool_out) > 0, "Empty tool call output"
-
-    # 8. Verify live add and update tool calls via ONNX
-    print("Testing handle_tool_call oracle_add with ONNX...")
-    import uuid
-    test_fact = f"Verification fact {uuid.uuid4().hex[:8]} for Oracle AI memory"
-    add_out = provider.handle_tool_call("oracle_add", {
-        "content": test_fact,
-        "target": "memory",
-    })
-    print(f"oracle_add response: {add_out}")
-    assert "Fact stored" in add_out or "memory_id" in add_out, "Failed to add fact"
-    add_data = json.loads(add_out)
-    new_mid = add_data.get("memory_id")
-
-    if new_mid:
-        print("Testing handle_tool_call oracle_update with ONNX...")
-        upd_fact = f"Updated verification fact for {new_mid}"
-        upd_out = provider.handle_tool_call("oracle_update", {
-            "memory_id": new_mid,
-            "content": upd_fact,
-        })
-        print(f"oracle_update response: {upd_out}")
-        assert "updated" in upd_out.lower(), "Failed to update fact"
-
-    # 8b. Verify live batch fact ingestion via oracle_add
-    print("Testing handle_tool_call oracle_add with batch facts...")
-    batch_facts = [
-        f"Batch test fact A {uuid.uuid4().hex[:8]}: Hermes uses Oracle 26ai",
-        f"Batch test fact B {uuid.uuid4().hex[:8]}: ADB provides in-database ONNX",
-    ]
-    batch_out = provider.handle_tool_call("oracle_add", {
-        "facts": batch_facts,
-        "target": "memory",
-    })
-    print(f"oracle_add batch response: {batch_out}")
-    batch_data = json.loads(batch_out)
-    assert batch_data.get("count") == 2, f"Expected 2 batch facts stored, got {batch_data.get('count')}"
-    assert len(batch_data.get("memory_ids", [])) == 2, "Expected 2 memory IDs returned"
-    print("Batch facts insertion verified.")
-
-    # 8c. Verify ranking and turn exclusion on HANDOFF query
-    print("Testing oracle_search HANDOFF ranking and turn exclusion...")
-    handoff_out = provider.handle_tool_call("oracle_search", {"query": "HANDOFF"})
-    handoff_data = json.loads(handoff_out)
-    results = handoff_data.get("results", [])
-    print(f"HANDOFF returned {len(results)} results:")
-    for i, r in enumerate(results):
-        print(f"  [{i+1}] {r.get('memory_id')} ({r.get('role')}): score={r.get('score')} content={(r.get('content') or '')[:60].replace(chr(10), ' ')}")
-    assert len(results) >= 2, "Expected at least 2 results for HANDOFF"
-    for r in results:
-        assert r.get("role") not in ("turn", "assistant", "session"), f"Found noise row in results: {r}"
-    top_handoff = [r for r in results[:3] if provider._is_prefix_match(r.get("content"), "HANDOFF")]
-    assert len(top_handoff) >= 2, f"Expected at least 2 prefix-matched HANDOFF facts in top 3, got {len(top_handoff)}"
-    print("HANDOFF ranking and turn exclusion verified successfully.")
-
-    # 9. Verify error handling when ONNX model is unavailable (no external fallback)
-    print("Testing strictly in-database error handling when ONNX model is unavailable...")
-    orig_onnx = provider._onnx_model
-    try:
-        provider._onnx_model = "NONEXISTENT_ONNX_MODEL_TEST"
+            setattr(mp_mod, "MemoryProvider", MemoryProvider)
+            setattr(mp_mod, "RecallStatus", RecallStatus)
+            setattr(mp_mod, "is_trivial_prompt", lambda prompt: False)
+            sec_mod = types.ModuleType("agent.secret_scope")
+            setattr(sec_mod, "get_secret", lambda k, default=None: os.environ.get(k, default))
+            setattr(agent_mod, "memory_provider", mp_mod)
+            setattr(agent_mod, "secret_scope", sec_mod)
+            sys.modules.update({
+                "agent": agent_mod, "agent.memory_provider": mp_mod, "agent.secret_scope": sec_mod,
+            })
+    if "tools" not in sys.modules:
         try:
-            provider._search("database memory architecture", mode="vector", top_k=2)
-            assert False, "Expected RuntimeError when ONNX model does not exist"
-        except RuntimeError as e:
-            print(f"Verified expected RuntimeError on broken ONNX vector search: {e}")
+            import tools.registry  # noqa: F401
+        except ImportError:
+            tools_mod = types.ModuleType("tools")
+            reg_mod = types.ModuleType("tools.registry")
+            setattr(reg_mod, "tool_error", lambda msg, *a, **k: json.dumps({"error": str(msg)}))
+            setattr(tools_mod, "registry", reg_mod)
+            sys.modules.update({"tools": tools_mod, "tools.registry": reg_mod})
+
+
+def _load_plugin() -> Any:
+    _install_host_shims()
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import __init__ as plugin
+
+    return plugin
+
+
+class CheckFailed(Exception):
+    pass
+
+
+class Run:
+    """One verification run: the provider, its unique session, and the report."""
+
+    def __init__(self, provider: Any, session_id: str, text_wait: float, out: Any = None) -> None:
+        self.p = provider
+        self.sid = session_id
+        self.text_wait = text_wait
+        self.out = out or sys.stdout
+        self.failed: list[str] = []
+        self.warned: list[str] = []
+        self.passed = 0
+
+    # -- reporting -----------------------------------------------------------
+
+    def _say(self, mark: str, label: str, detail: str = "") -> None:
+        print(f"  [{mark}] {label}" + (f": {detail}" if detail else ""), file=self.out)
+
+    def ok(self, label: str, detail: str = "") -> None:
+        self.passed += 1
+        self._say(" ok ", label, detail)
+
+    def fail(self, label: str, detail: str = "") -> None:
+        self.failed.append(label)
+        self._say("FAIL", label, detail)
+
+    def warn(self, label: str, detail: str = "") -> None:
+        self.warned.append(label)
+        self._say("warn", label, detail)
+
+    def note(self, label: str, detail: str = "") -> None:
+        """Something about the install worth knowing; never a failure."""
+        self._say("note", label, detail)
+
+    def check(self, label: str, cond: Any, detail: Any = "") -> bool:
+        if cond:
+            self.ok(label)
+        else:
+            self.fail(label, str(detail)[:400])
+        return bool(cond)
+
+    # -- tool calls ----------------------------------------------------------
+
+    def call(self, tool: str, **args: Any) -> dict[str, Any]:
+        """Run one memory tool and return its JSON object. A tool error comes
+        back as {"error": ...}."""
+        raw = self.p.handle_tool_call(tool, args)
         try:
-            provider._insert(
-                memory_id=f"broken_onnx_test_{uuid.uuid4().hex[:8]}",
-                session_id="broken-session",
-                role="user",
-                content="Broken ONNX insert test",
-                target="memory",
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {"error": str(raw)}
+        return data if isinstance(data, dict) else {"error": str(raw)}
+
+    def search_ids(self, query: str, mode: str) -> tuple[list[str], str]:
+        """memory_ids of this run's rows that the search returns, and the
+        error text when the search failed."""
+        res = self.call("oracle_search", query=query, mode=mode, top_k=8, session_id=self.sid)
+        if res.get("error"):
+            return [], str(res["error"])
+        return [r.get("memory_id") for r in res.get("results") or []], ""
+
+    # -- checks --------------------------------------------------------------
+
+    def run_checks(self) -> None:
+        p = self.p
+        marker = uuid.uuid4().hex[:12]
+        fact = f"Verification memory {marker}: the provider stores and recalls this sentence."
+
+        for w in p.health().get("schema_warnings") or []:
+            self.note("schema", w)
+
+        try:
+            vec = p._embed("Oracle memory provider verification")
+            detail = f"got {None if vec is None else len(vec)} dimensions"
+        except Exception as e:  # noqa: BLE001
+            vec, detail = None, str(e).splitlines()[0]
+        if not self.check("in-database embedding returns a 768-dimension vector",
+                          vec is not None and len(vec) == 768,
+                          f"{detail}. Is the ONNX model {p._onnx_model} loaded in this schema?"):
+            raise CheckFailed("no embedding")
+
+        added = self.call("oracle_add", content=fact)
+        mid = str(added.get("memory_id") or "")
+        if not self.check("oracle_add stores a memory", bool(mid), added):
+            raise CheckFailed("nothing stored")
+
+        got = self.call("oracle_get", memory_id=mid)
+        rows = got.get("results") or []
+        self.check("oracle_get returns it unchanged", len(rows) == 1 and rows[0].get("content") == fact, got)
+        self.check("the row carries this run's session id", bool(rows) and rows[0].get("session_id") == self.sid, got)
+
+        batch = self.call("oracle_add", facts=[f"Verification batch {marker} first.", f"Verification batch {marker} second."])
+        self.check("oracle_add stores a batch", batch.get("count") == 2 and len(batch.get("memory_ids") or []) == 2, batch)
+
+        named = f"{_SESSION_PREFIX}{marker}:named"
+        tag = f"verify:{marker}"
+        up = self.call("oracle_add", memory_id=named, content=f"Verification named row {marker}.", tags=[tag])
+        self.check("oracle_add with a memory_id and tags stores a named row", up.get("memory_id") == named, up)
+        by_tag = self.call("oracle_get", tags=[tag])
+        self.check("oracle_get finds it by tag", [r.get("memory_id") for r in by_tag.get("results") or []] == [named], by_tag)
+
+        for mode in ("vector", "hybrid"):
+            ids, err = self.search_ids(fact, mode)
+            self.check(f"{mode} search finds the memory", mid in ids, err or f"returned {ids}")
+
+        self._check_text_search(marker, mid)
+
+        new_text = f"Verification memory {marker}: updated."
+        upd = self.call("oracle_update", memory_id=mid, content=new_text)
+        got = self.call("oracle_get", memory_id=mid)
+        rows = got.get("results") or []
+        self.check("oracle_update replaces the content",
+                   upd.get("result") == "updated" and bool(rows) and rows[0].get("content") == new_text, (upd, got))
+
+        recalled = p.prefetch(fact)
+        self.check("prefetch returns a recall block", isinstance(recalled, str), type(recalled).__name__)
+
+        gone = self.call("oracle_delete", memory_id=mid)
+        got = self.call("oracle_get", memory_id=mid)
+        self.check("oracle_delete removes the memory",
+                   gone.get("result") == "deleted" and got.get("count") == 0, (gone, got))
+
+    def _check_text_search(self, marker: str, mid: str) -> None:
+        """The text index is maintained in the background, so a new row shows
+        up in text search some seconds after the commit. An error is a failure
+        (no usable text index); a row that is not visible yet is a warning."""
+        deadline = time.monotonic() + self.text_wait
+        err = ""
+        while True:
+            ids, err = self.search_ids(marker, "text")
+            if mid in ids or err or time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+        if err:
+            self.fail("text search finds the memory", err)
+        elif mid in ids:
+            self.ok("text search finds the memory")
+        else:
+            self.warn(
+                "text search finds the memory",
+                f"not visible after {self.text_wait:.0f}s; the text index syncs later than that "
+                "(vector and hybrid search are not affected)",
             )
-            assert False, "Expected RuntimeError on broken ONNX insert"
-        except RuntimeError as e:
-            print(f"Verified expected RuntimeError on broken ONNX insert: {e}")
+
+    # -- cleanup -------------------------------------------------------------
+
+    def leftover(self) -> int:
+        with self.p._pool.acquire() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {self.p._table} WHERE session_id = :sid", {"sid": self.sid})  # nosec B608
+            return int(cur.fetchone()[0])
+
+    def cleanup(self) -> None:
+        """Delete every row of this run. The session id is unique to the run,
+        so nothing else can match."""
+        try:
+            with self.p._pool.acquire() as conn, conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {self.p._table} WHERE session_id = :sid", {"sid": self.sid})  # nosec B608
+                conn.commit()
+            left = self.leftover()
+            self.check("the run's rows are deleted", left == 0, f"{left} rows left under session {self.sid}")
+        except Exception as e:  # noqa: BLE001
+            self.fail("the run's rows are deleted", f"{e}; remove them with oracle_delete(session_id=\"{self.sid}\")")
+
+
+def main(argv: list[str] | None = None, out: Any = None) -> int:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    parser.add_argument("--env-file", help="file with KEY=VALUE settings (OCI_DB_*); the environment wins")
+    parser.add_argument("--table", help="memory table to use (sets HERMES_ORACLE_TABLE for this run)")
+    parser.add_argument("--text-wait", type=float, default=30.0,
+                        help="seconds to wait for a new row to appear in text search (default 30)")
+    parser.add_argument("--strict", action="store_true",
+                        help="fail when a new row is not in text search within --text-wait")
+    args = parser.parse_args(argv)
+    out = out or sys.stdout
+
+    try:
+        load_env(args.env_file)
+    except OSError as e:
+        print(f"cannot read --env-file: {e}", file=out)
+        return 2
+    missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
+    if missing:
+        print(f"missing settings: {', '.join(missing)}. Export them or pass --env-file.", file=out)
+        return 2
+
+    saved_table = os.environ.get("HERMES_ORACLE_TABLE")
+    if args.table:
+        os.environ["HERMES_ORACLE_TABLE"] = args.table
+    plugin = _load_plugin()
+    saved_get_secret = plugin.get_secret
+    # Settings come from the environment prepared above, whatever secret store
+    # the host process has.
+    plugin.get_secret = lambda k, default=None: os.environ.get(k, default)
+    session_id = f"{_SESSION_PREFIX}{uuid.uuid4().hex[:16]}"
+    provider = plugin.OracleMemoryProvider()
+    run: Run | None = None
+    try:
+        provider.initialize(session_id)
+        if provider._pool is None:
+            print(f"provider did not start: {provider._init_error or provider.unavailable_reason()}", file=out)
+            return 1
+        print(f"provider {plugin.__version__}, table {provider._table}, model {provider._onnx_model}, "
+              f"session {session_id}", file=out)
+        run = Run(provider, session_id, max(0.0, args.text_wait), out)
+        try:
+            run.run_checks()
+        except CheckFailed:
+            pass
+        except Exception as e:  # noqa: BLE001
+            run.fail("unexpected error", f"{type(e).__name__}: {e}")
+        finally:
+            run.cleanup()
     finally:
-        provider._onnx_model = orig_onnx
-        provider._onnx_failed_at = None
+        try:
+            provider.shutdown()
+        finally:
+            plugin.get_secret = saved_get_secret
+            if args.table:
+                if saved_table is None:
+                    os.environ.pop("HERMES_ORACLE_TABLE", None)
+                else:
+                    os.environ["HERMES_ORACLE_TABLE"] = saved_table
 
-    # 10. Verify local skills full sync & chunk counts against format_skill_payload
-    print("Testing local skills full sync & chunk counts verification...")
-    try:
-        from scripts.sync_skills import format_skill_payload, parse_skill_file, sync_skills_library
-    except ImportError:
-        from sync_skills import format_skill_payload, parse_skill_file, sync_skills_library
-
-    pro_se_file = Path.home() / ".hermes" / "skills" / "legal" / "pro-se-litigation" / "SKILL.md"
-    if pro_se_file.exists():
-        pro_se_skill = parse_skill_file(pro_se_file)
-        if pro_se_skill:
-            expected_chunks = len(format_skill_payload(pro_se_skill, mode="full"))
-            assert expected_chunks == 40, f"Expected 40 chunks for pro-se-litigation, got {expected_chunks}"
-
-            with provider._pool.acquire() as conn, conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT COUNT(*) FROM {provider._table} WHERE role = 'skill' AND conv_ref = :1",
-                    ["pro-se-litigation"],
-                )
-                db_chunks = cur.fetchone()[0]
-
-            if db_chunks < expected_chunks:
-                print(f"pro-se-litigation DB chunk count ({db_chunks}) < {expected_chunks}; running sync on ~/.hermes/skills/legal...")
-                sync_skills_library(
-                    provider=provider,
-                    mode="full",
-                    force=True,
-                    dirs=[Path.home() / ".hermes" / "skills" / "legal"],
-                    batch_size=50,
-                )
-                with provider._pool.acquire() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        f"SELECT COUNT(*) FROM {provider._table} WHERE role = 'skill' AND conv_ref = :1",
-                        ["pro-se-litigation"],
-                    )
-                    db_chunks = cur.fetchone()[0]
-
-            print(f"pro-se-litigation: db_chunks={db_chunks}, expected_chunks={expected_chunks}")
-            assert db_chunks == expected_chunks, f"Expected {expected_chunks} DB chunks for pro-se-litigation, got {db_chunks}"
-            print("pro-se-litigation chunk count verified successfully in database.")
-
-    # 11. Verify skill rows are actually reachable through retrieval
-    #     (v1.0.9.6 regression guard: role priority must never precede the
-    #     similarity key in the SQL top-k cut, or the skill index is starved)
-    print("Testing skill retrieval reachability (role-priority starvation guard)...")
-    with provider._pool.acquire() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {provider._table} WHERE role = 'skill'")
-        skill_total = cur.fetchone()[0]
-    if not skill_total:
-        print("  no role='skill' rows indexed on this host; skipping reachability check")
-    else:
-        print(f"  indexed skill rows: {skill_total}")
-        for query in ("draft an IRAC legal memorandum", "systematic debugging root cause"):
-            rows = provider._search(query, top_k=5, mode="hybrid")
-            skill_rows = [
-                r for r in rows
-                if str(r.get("content") or "").startswith("[skill_ingest]")
-            ]
-            refs = sorted({r.get("conv_ref") for r in skill_rows if r.get("conv_ref")})
-            print(f"  {query!r}: {len(skill_rows)}/{len(rows)} skill rows, refs={refs}")
-            assert skill_rows, (
-                f"skill retrieval starved: no [skill_ingest] rows returned for {query!r}; "
-                "role priority must not precede the similarity key in the top-k cut"
-            )
-        print("Skill retrieval reachability verified successfully.")
-
-    provider.shutdown()
-    print("ALL VERIFICATION CHECKS PASSED!")
+    bad = len(run.failed) + (len(run.warned) if args.strict else 0)
+    print(f"{run.passed} passed, {len(run.failed)} failed, {len(run.warned)} warnings"
+          + (" (strict: warnings count as failures)" if args.strict and run.warned else ""), file=out)
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

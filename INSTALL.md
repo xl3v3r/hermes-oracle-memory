@@ -168,15 +168,52 @@ Verify that the database connection, table initialization, and embedding pipelin
 ### 1. Run Provider Verification Script
 
 ```bash
+export OCI_DB_USER=... OCI_DB_PASSWORD=... OCI_DB_DSN=...
 python3 tests/verify_provider.py
 ```
 
-The script verifies:
-- Oracle ADB 26ai database connection and thin/thick mode initialization.
-- Table schema setup (`HERMES_AGENT_MEMORY`) with `VECTOR(768, FLOAT32)` and Oracle Text search indexes.
-- In-database ONNX inference (`VECTOR_EMBEDDING`) and fallback routing.
-- Storage and hybrid recall of test memories.
-- Skill retrieval reachability: a skill query must return `[skill_ingest]` rows (guards against role-priority starvation of the skill index).
+The script reads the `OCI_*` settings from the environment. To take them from a file instead, add `--env-file <path>` (for example `--env-file "$HERMES_HOME/.env"`); it reads no file on its own.
+
+It starts the provider and checks that:
+- the provider connects and the memory table is usable (an empty schema is bootstrapped first);
+- the in-database ONNX model returns a 768-dimension vector;
+- a memory can be stored, read back, found by vector, hybrid and text search, updated and deleted.
+
+Every row the run writes carries a session id unique to that run (`verify-<random>`), and the run deletes them all before it exits, also when a check fails. It asserts nothing about rows that were already in the table, so it gives the same result on an empty database and on one in use.
+
+| Option | Effect |
+|---|---|
+| `--env-file <path>` | Read `KEY=VALUE` settings from a file. Values already in the environment win. |
+| `--table <name>` | Use another table for this run, for example a scratch table. |
+| `--text-wait <seconds>` | How long to wait for a new row to appear in text search (default 30). |
+| `--strict` | Fail if the row is not in text search within that time (otherwise a warning). |
+
+Exit status: `0` every check passed, `1` a check failed, `2` the script could not run (settings missing).
+
+> **Rows left by the script of 1.1.1.5 and older.** That version stored three rows per run under the session id `test-verification-session` and never removed them. They are ordinary facts, so they can be recalled. To remove them, call `oracle_delete(session_id="test-verification-session")` from a Hermes session.
+
+The same check runs under pytest when you opt in. Without `HERMES_ORACLE_LIVE_TESTS=1` it is skipped, whatever credentials are in the environment:
+
+```bash
+HERMES_ORACLE_LIVE_TESTS=1 python -m pytest -q tests/test_provider_live.py
+```
+
+#### Against a local Oracle AI Database Free container
+
+`tests/smoke_db/` holds what the CI job uses to run the script against an empty database: a tiny embedding model (about 11 KB, 768 dimensions, for testing only) and a script that creates an empty schema user and loads the model.
+
+```bash
+python -m pip install oracledb onnx
+docker run -d --name oracle-free -p 127.0.0.1:1521:1521 -e ORACLE_PWD=<admin password> \
+  container-registry.oracle.com/database/free:23.26.4.0-lite
+
+export OCI_DB_DSN=127.0.0.1:1521/FREEPDB1 OCI_DB_USER=HERMES_SMOKE_USER OCI_DB_PASSWORD=<user password>
+export HERMES_ORACLE_ONNX_MODEL=HERMES_SMOKE_EMBED
+SMOKE_DB_ADMIN_PASSWORD=<admin password> python tests/smoke_db/prepare_database.py
+python tests/verify_provider.py
+```
+
+`prepare_database.py` refuses a database that is not on the local machine and never drops a user or a table. The schema user it creates has `CREATE SESSION`, `CREATE TABLE`, `CREATE MINING MODEL` (to load the model) and a quota on its tablespace. The smoke test passes with these privileges alone.
 
 ### 2. Run Test Suite
 

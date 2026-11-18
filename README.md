@@ -32,8 +32,10 @@ hermes config set memory.provider oracle
 
 ```bash
 hermes memory status             # confirm "oracle" is active
-python3 tests/verify_provider.py
+python3 tests/verify_provider.py --env-file <path to your Hermes .env>
 ```
+
+The script stores a few test memories, searches for them in each mode, and deletes them again. See [INSTALL.md](INSTALL.md#step-5-verification--testing) for its options.
 
 ## Configure
 
