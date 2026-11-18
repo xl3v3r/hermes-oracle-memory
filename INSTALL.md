@@ -1,11 +1,11 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.1.5-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
 
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.1.5) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.2) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 
@@ -287,6 +287,7 @@ When set, the provider runs no DDL at start-up. It checks that the table can be 
 
 - A text index in the `FAILED` state stops the provider with an error, because such an index rejects every write (`ORA-29861`).
 - A missing text or vector index is logged as a warning and listed under `schema_warnings` in `health()`. Search keeps working within the limits the warning names.
+- With `HERMES_ORACLE_SCOPE_MODE=auto` or `required`, a table without the `scope_id` column stops the provider with an error that names the `ALTER TABLE` statement to run (see "Per-user scope" in the README).
 
 Create the schema with the statements the bootstrap runs. Replace `HERMES_AGENT_MEMORY` if `HERMES_ORACLE_TABLE` names another table:
 

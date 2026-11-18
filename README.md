@@ -69,6 +69,38 @@ Embeddings are computed 100% in-house:
 | `HERMES_ORACLE_POOL_WAIT_TIMEOUT_MS` | `20000` | Max wait for a pooled connection before the call fails with `DPY-4005` (never blocks forever) |
 | `HERMES_ORACLE_POOL_IDLE_TIMEOUT` | `300` | Seconds an idle pooled session above the pool minimum stays open |
 | `HERMES_ORACLE_PREFETCH_WAIT` | `3` | Seconds a turn waits for background recall before continuing without it (0.1–7) |
+| `HERMES_ORACLE_SCOPE_MODE` | `off` | `off`, `auto` or `required`: keep each caller's memory apart — see [Per-user scope](#per-user-scope) |
+
+### Per-user scope
+
+By default (`off`) every session that uses the table reads and writes the same rows: recall is global. That suits one operator. It does not suit a frontend that serves several people (Open WebUI and the like), where one user's facts would be recalled into another user's chat.
+
+`HERMES_ORACLE_SCOPE_MODE` binds each session to a scope when it starts:
+
+| Mode | Session has an identity | Session has none |
+|---|---|---|
+| `off` | no scoping | no scoping |
+| `auto` | the caller's own rows | the operator's rows (`global`) |
+| `required` | the caller's own rows | the operator's rows on `cli`, `tui` and `cron`; on any other platform the provider refuses to start |
+
+The identity is what Hermes passes to the provider: the gateway session key (for the API server, the `X-Hermes-Session-Key` header), or else platform and user id. It is never taken from a tool argument or from the database user. A key with an empty user part (`owui:`) counts as none. A forked agent takes the scope of its parent session.
+
+In a scoped session:
+
+- Search, recall, `oracle_get`, `oracle_update` and `oracle_delete` touch only the caller's rows. Rows written before scoping, and rows of sessions without an identity, belong to `global` and are not visible to a user.
+- The skill corpus stays shared and read-only: every scope can search and load skills.
+- The same `memory_id` can be used by two users; each gets a row of their own. Ids are limited to 109 characters there.
+- `oracle_sync_skills` and `oracle_chunk(file_path=...)` are not offered to a user's session (both read this host's disk), and conversation turns are not captured automatically.
+- A tool call from a caller other than the one the session was bound for is refused.
+
+The mode needs the column `scope_id`. The provider adds it (and an index) at start-up; under `HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING` it stops with an error that names the statement to run:
+
+```sql
+ALTER TABLE HERMES_AGENT_MEMORY ADD (scope_id VARCHAR2(300) DEFAULT 'global' NOT NULL);
+CREATE INDEX HERMES_AGENT_MEMORY_SCOPE_IDX ON HERMES_AGENT_MEMORY (scope_id);
+```
+
+Limits: scoping separates the users of a frontend. It does not separate agents or profiles that share one identity, and it is not a database security boundary — every session connects as the same database user.
 
 ## Tools
 
@@ -207,7 +239,20 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
 
 ## What's new in v1.1.2
 
-Follow-up release for #14 — full details in `RELEASE_NOTES_1.1.2.md`:
+Review fixes — full details in `RELEASE_NOTES_1.1.2.md`:
+
+- **Per-user memory scope (#17)**: `HERMES_ORACLE_SCOPE_MODE=auto|required` keeps each caller's rows apart; off by default. See [Per-user scope](#per-user-scope).
+- **Schema (#18)**: the text index is a plain search index; one left `FAILED` by 1.1.1 to 1.1.1.5 (it rejected every write with `ORA-29861`) is repaired at start-up.
+- **Recall (#16)**: a recalled memory body is escaped, so stored text cannot close the memory block or open another; `oracle_delete(session_id=...)` has a dry run and a row limit.
+- **Skill sync (#21)**: broad scan roots are judged by identity and by system-root ancestry.
+- **Profiles (#24)**: home, settings and background threads follow the profile the provider was initialized for.
+- **Scripts (#20, #26)**: one conversation importer; `setup_onnx_model.py` works on a database that is not ADB.
+- **Packaging (#25)**: the wheel carries `scripts/`.
+- **Tests (#19, #22)**: the unit suite cannot reach a database; `verify_provider.py` removes its own rows; CI bootstraps an empty schema in a real database.
+
+## What's new in v1.1.1.5
+
+Follow-up release for #14 — full details in the `[1.1.1.5]` section of `CHANGELOG.md`:
 
 - **Foreign skill copies**: ownership is judged against the profile's own skill dirs, so a sync over a `--dirs` subset updates the copies it stored from the other dirs (a `--dirs` run outside the defaults never takes over a live default skill); `replace_foreign` / `--replace-foreign` replaces a copy left from another profile or a removed root, and the sync result carries a hint when it skipped one.
 - **Lifecycle lookup**: a link into `.archive/` is no longer a live skill; the lookup walks any depth and ends on link loops, like the bulk sync.
