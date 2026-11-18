@@ -1867,11 +1867,7 @@ class OracleMemoryProvider(MemoryProvider):
             if err and not any(code in err for code in _DDL_ALREADY_EXISTS):
                 failures["vector index"] = err
             # upgrade columns
-            steps += [
-                (f"column {column}", f"ALTER TABLE {table} ADD ({column} {definition})")
-                for column, definition in _UPGRADE_COLUMNS
-            ]
-            for what, sql in steps:
+            for what, sql in _UPGRADE_COLUMNS:
                 err = self._run_ddl(cur, sql)
                 if err and not any(code in err for code in _DDL_ALREADY_EXISTS):
                     failures[what] = err
