@@ -117,10 +117,13 @@ def load_model(model_bytes: bytes) -> None:
     })
     logger.info("Wrote file to DATA_PUMP_DIR in %.2fs", time.time() - t0)
 
-    # Verify file exists in DATA_PUMP_DIR
-    cur.execute("SELECT /*+ NO_PARALLEL */ object_name, bytes FROM DBMS_CLOUD.LIST_FILES('DATA_PUMP_DIR') WHERE object_name = :fn", [FILE_NAME])
-    row = cur.fetchone()
-    logger.info("File in DATA_PUMP_DIR: %s", row)
+    # Report the staged file. DBMS_CLOUD exists on Autonomous Database only;
+    # elsewhere the load below is the check.
+    try:
+        cur.execute("SELECT /*+ NO_PARALLEL */ object_name, bytes FROM DBMS_CLOUD.LIST_FILES('DATA_PUMP_DIR') WHERE object_name = :fn", [FILE_NAME])
+        logger.info("File in DATA_PUMP_DIR: %s", cur.fetchone())
+    except Exception as e:
+        logger.info("Could not list DATA_PUMP_DIR (%s); continuing", str(e).splitlines()[0])
 
     # Step 2: Drop existing model if present
     logger.info("Checking if model %s already exists...", MODEL_NAME)
