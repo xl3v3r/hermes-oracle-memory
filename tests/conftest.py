@@ -57,6 +57,36 @@ if 'oci' not in sys.modules:
 
 
 # ---------------------------------------------------------------------------
+# No unit test connects to a database. Database settings inherited from the
+# calling shell are dropped, and the driver's connect functions refuse, so a
+# test that forgets a mock fails instead of reaching whatever OCI_DB_* names.
+# The opt-in live test (HERMES_ORACLE_LIVE_TESTS=1) keeps both.
+# ---------------------------------------------------------------------------
+import os as _os_env
+
+_LIVE_TESTS = _os_env.environ.get("HERMES_ORACLE_LIVE_TESTS") == "1"
+_DATABASE_SETTINGS = ("OCI_WALLET_LOCATION", "OCI_WALLET_PASSWORD", "TNS_ADMIN")
+
+
+def _refuse_database(*_args, **_kwargs):
+    raise AssertionError(
+        "a unit test tried to connect to a database; mock the pool, or run the live test with "
+        "HERMES_ORACLE_LIVE_TESTS=1"
+    )
+
+
+if not _LIVE_TESTS:
+    for _name in list(_os_env.environ):
+        if _name.startswith("OCI_DB_") or _name in _DATABASE_SETTINGS:
+            del _os_env.environ[_name]
+    _driver = sys.modules["oracledb"]
+    for _fn in ("connect", "create_pool", "connect_async", "create_pool_async"):
+        if not getattr(getattr(_driver, _fn, None), "_hom_no_database", False):
+            _refuse_database._hom_no_database = True  # type: ignore[attr-defined]
+            setattr(_driver, _fn, _refuse_database)
+
+
+# ---------------------------------------------------------------------------
 # An inherited HERMES_HOME is dropped for the whole run. The tests build their
 # homes in the temp dir (patching Path.home or setting HERMES_HOME themselves),
 # and a HERMES_HOME exported by the calling shell (the Hermes Desktop shell
