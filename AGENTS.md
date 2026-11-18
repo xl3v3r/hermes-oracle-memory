@@ -49,6 +49,7 @@ Welcome! This file provides context, coding conventions, testing procedures, and
     ├── test_plugin.py      # Tool schema and unavailable_reason tests
     ├── test_provider_live.py# Live Oracle ADB verification test harness
     ├── test_reembed.py     # Re-embedding and vector upgrade tests
+    ├── test_scope.py       # Per-user scope (HERMES_ORACLE_SCOPE_MODE) tests
     ├── test_skill_bundles.py# Manifest discovery and curated symlinks tests
     └── test_sync_skills.py # Native skill library scanner and frontmatter parser tests
 ```

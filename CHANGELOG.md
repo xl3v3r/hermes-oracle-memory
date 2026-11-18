@@ -1,16 +1,34 @@
-## [1.1.2] - 2026-11-18
-
-- **Per-user memory scoping**: scope_id column, HERMES_ORACLE_SCOPE_MODE, GSK validation, skill sync gating (see RELEASE_NOTES_1.1.2.md)
-- **Issue #16 fixed**: No more cross-user memory leakage
-- **Issue #17 implemented**: Per-user memory scoping for multi-user frontends
-- **Issue #18 fixed**: Text index DDL failure handling improved
-- **Issue #25 fixed**: Wheel now includes scripts/ directory
-- **Issue #14 resolved**: Skill identity follow-ups with shared host id and skipped_foreign override
-- **Version bump**: 1.1.1.5 → 1.1.2
-
 # Changelog — `hermes-oracle-memory`
 
 All notable changes to this project are documented in this file.
+
+## [1.1.2] - 2026-11-18
+
+Fixes from the 1.1.1.5 review (#14, #16 to #22, #24 to #27, #32).
+
+### Added
+- **Per-user memory scope (#17)**: `HERMES_ORACLE_SCOPE_MODE` = `off` (default), `auto` or `required`. In `auto` and `required` a session is bound at start to a scope derived from the gateway session key (`X-Hermes-Session-Key`) or from platform and user id; reads are limited to the caller's rows plus the shared skill corpus, and writes, updates and deletes to the caller's rows. `required` refuses to start on a network platform without an identity. A caller-chosen `memory_id` is stored per scope. A user-scoped session has no `oracle_sync_skills`, no `oracle_chunk(file_path=...)` and no automatic turn capture. `health()` reports `scope`.
+- Column `scope_id VARCHAR2(300) DEFAULT 'global' NOT NULL` and index `<table>_SCOPE_IDX`, added at start-up only when the mode is `auto` or `required`. In `off` no statement names the column.
+- `oracle_delete(session_id=...)`: `dry_run` and `max_rows` (#16).
+- `tests/verify_provider.py` removes the rows it wrote; live tests are opt-in; a CI job bootstraps an empty schema in Oracle AI Database Free (#18, #19).
+- Tests: `test_scope.py`.
+
+### Fixed
+- **Text index (#18)**: created as a plain search index. The `FOR JSON` index that 1.1.1 to 1.1.1.5 created on the CLOB column ended `FAILED` and rejected every write (`ORA-29861`); it is dropped and created again at start-up. DDL failures are logged.
+- **Recall (#16)**: the recalled memory body is escaped.
+- **`oracle_sync_skills` (#21)**: broad scan roots are judged by identity and by system-root ancestry.
+- **Profiles (#24)**: home, settings and threads are bound to the profile the provider was initialized for.
+- **Scripts (#20, #26, #32)**: one importer, shared helpers, no external embedding API, `--help` without Hermes; `setup_onnx_model.py` tolerates a database without `DBMS_CLOUD`.
+- **Packaging (#25)**: the wheel carries `scripts/` and no compiled files; CI installs it and checks it.
+- **Tests (#19, #22, #14)**: the unit suite cannot reach a database, drops an inherited `HERMES_HOME`, resolves temp dirs, and runs on macOS in CI.
+- **Docs and prompt (#27)**: the vector index is HNSW, not IVF.
+
+### Changed
+- `handle_tool_call` dispatches to one method per tool; one INSERT builder and one search filter builder; dead embedding paths removed (#32).
+- **Version bumps**: `1.1.1.5` → `1.1.2` across `VERSION`, `plugin.yaml`, `pyproject.toml`, `__version__`, README/INSTALL badges, both `skills/*/SKILL.md` pins, `AGENTS.md` and `NEEDS.md`. Release notes rotated to `RELEASE_NOTES_1.1.2.md`.
+
+### Not in this release
+- #16: agents and profiles that share one identity still share memory. #14 item 1 (profile isolation for a shared host id), #23, #28 to #31, #33 and #34 are open.
 
 ## [1.1.1.5] - 2026-11-15
 

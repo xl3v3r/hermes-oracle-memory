@@ -81,6 +81,29 @@ _UPGRADE_COLUMNS = (
     ("turn_id", "VARCHAR2(64)"),
     ("conv_ref", "VARCHAR2(512)"),
 )
+# Per-user scope (HERMES_ORACLE_SCOPE_MODE=auto|required). In the default mode
+# "off" no statement names the column, so a table without it keeps working.
+_SCOPE_MODES = ("off", "auto", "required")
+_SCOPE_GLOBAL = "global"  # the operator's rows, and every row written before scoping
+_SCOPE_MAX_BYTES = 300
+_SCOPE_COLUMN_DDL = f"scope_id VARCHAR2({_SCOPE_MAX_BYTES}) DEFAULT '{_SCOPE_GLOBAL}' NOT NULL"
+_SCOPE_INDEX_DDL = "CREATE INDEX {index_name} ON {table_name} (scope_id)"
+# Reads: the caller's rows plus the skill corpus, which is shared by role.
+# Writes, updates and deletes: the caller's rows only. Binds :scope.
+_SCOPE_READ = "(scope_id = :scope OR role = 'skill')"
+_SCOPE_WRITE = "scope_id = :scope"
+# Platforms where the caller is the operator of this machine.
+_SCOPE_LOCAL_PLATFORMS = frozenset({"cli", "tui", "cron", "local", "curator"})
+_SCOPE_ID_PREFIX_LEN = len("s.") + 16 + len(":")
+_SCOPED_CHUNK_DESCRIPTION = (
+    "Split long text with in-database DBMS_VECTOR.UTL_TO_CHUNKS, then store each chunk as its own "
+    "VECTOR row. Use for documents, logs, notes, or conversation imports too large for a single "
+    "fact. Provide 'content'."
+)
+_SCOPED_TOOL_REFUSALS = {
+    "oracle_sync_skills": "oracle_sync_skills writes the shared skill corpus from this host's disk and is "
+    "not available in a user-scoped session",
+}
 # "The object is already there" for bootstrap DDL.
 _DDL_ALREADY_EXISTS = (
     "ORA-00955",  # name is already used by an existing object
@@ -118,6 +141,95 @@ def _setting(name: str, default: str = "") -> str:
         return value.strip()
     raw = os.environ.get(name)
     return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+
+class _Scope(tuple):
+    """Result of _derive_scope: (scope, key, error, inherited). scope None with
+    an empty error is the "off" mode; scope None with an error fails closed."""
+
+    __slots__ = ()
+
+    def __new__(cls, scope: str | None = None, key: str = "", error: str = "", inherited: bool = False):
+        return super().__new__(cls, (scope, key, error, inherited))
+
+    scope = property(lambda self: self[0])
+    key = property(lambda self: self[1])
+    error = property(lambda self: self[2])
+    inherited = property(lambda self: self[3])
+
+
+def _scope_key(value: Any) -> str:
+    """A caller's session key, or "" when there is none. A key whose user
+    part is empty ("owui:") names nobody and counts as missing."""
+    if not isinstance(value, str):
+        return ""
+    key = value.strip()
+    if not key or not key.rsplit(":", 1)[-1].strip():
+        return ""
+    return key
+
+
+def _scope_name(raw: str) -> str:
+    """"u:<raw>", or a digest when that does not fit the column. The fixed
+    prefix means no client-chosen value can equal 'global'."""
+    name = "u:" + raw
+    if len(name.encode("utf-8", "surrogatepass")) > _SCOPE_MAX_BYTES:
+        import hashlib
+
+        name = "u:sha256:" + hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return name
+
+
+def _is_fork(kwargs: dict[str, Any]) -> bool:
+    """A delegated or forked agent: it acts for its parent's user, and Hermes
+    does not always hand it the parent's identity."""
+    if kwargs.get("platform") == "subagent" or kwargs.get("agent_context") == "subagent":
+        return True
+    ctx = kwargs.get("agent_context")
+    return bool(kwargs.get("parent_session_id")) and isinstance(ctx, str) and ctx not in ("", "primary", "cron")
+
+
+def _derive_scope(mode: Any, kwargs: dict[str, Any], parent: Any = None) -> _Scope:
+    """The memory scope of a session, from what Hermes passes to initialize()
+    (never from tool arguments or the database user).
+
+    session key -> "u:<key>"; else platform + user id -> "u:<platform>:<id>";
+    else 'global' in auto mode and on local platforms, an error otherwise.
+    A fork takes the scope of its live *parent* provider or fails closed."""
+    mode = mode.strip().lower() if isinstance(mode, str) else ""
+    if mode in ("", "off"):
+        return _Scope()
+    if mode not in _SCOPE_MODES:
+        return _Scope(error=f"HERMES_ORACLE_SCOPE_MODE={mode!r} is not one of {', '.join(_SCOPE_MODES)}")
+    if _is_fork(kwargs):
+        scope = getattr(parent, "_scope_id", None)
+        if isinstance(scope, str) and scope:
+            return _Scope(scope, getattr(parent, "_scope_key", "") or "", "", True)
+        return _Scope(
+            error=f"HERMES_ORACLE_SCOPE_MODE={mode}: this forked agent's parent session has no live memory "
+            "provider in this process, so its memory scope is unknown"
+        )
+    key = _scope_key(kwargs.get("gateway_session_key"))
+    if key:
+        return _Scope(_scope_name(key), key)
+    platform = kwargs.get("platform")
+    platform = platform.strip() if isinstance(platform, str) else ""
+    user_id = kwargs.get("user_id")
+    user_id = "" if user_id is None or isinstance(user_id, bool) else str(user_id).strip()
+    if platform and user_id:
+        return _Scope(_scope_name(f"{platform}:{user_id}"))
+    if mode == "auto" or platform in _SCOPE_LOCAL_PLATFORMS:
+        return _Scope(_SCOPE_GLOBAL)
+    return _Scope(
+        error=f"HERMES_ORACLE_SCOPE_MODE=required: no session key or user id on platform "
+        f"{platform or 'unknown'!r} (send X-Hermes-Session-Key), so no memory scope can be bound"
+    )
+
+
+def _scoped_id_max() -> int:
+    """Longest caller-chosen memory_id in a user-scoped session (the stored
+    id carries a per-scope prefix and the column holds 128)."""
+    return 128 - _SCOPE_ID_PREFIX_LEN
 
 
 def _spawn_thread(target: Any, *, name: str, args: tuple = (), kwargs: dict | None = None) -> threading.Thread:
@@ -297,6 +409,18 @@ import weakref as _weakref
 _LIVE_PROVIDERS: "_weakref.WeakSet[Any]" = _weakref.WeakSet()
 _LIVE_PROVIDERS_LOCK = threading.Lock()
 _LIVE_SEQ = itertools.count(1)
+
+
+def _live_provider_of_session(session_id: Any, exclude: Any = None) -> Any:
+    """The live provider serving *session_id* in this process, or None."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    with _LIVE_PROVIDERS_LOCK:
+        found = [
+            p for p in _LIVE_PROVIDERS
+            if p is not exclude and p._session_id == session_id and p._pool is not None
+        ]
+    return max(found, key=lambda p: getattr(p, "_live_seq", 0)) if found else None
 
 
 def _register_live_provider(provider: Any) -> None:
@@ -1444,6 +1568,11 @@ class OracleMemoryProvider(MemoryProvider):
         self._pool_fingerprint = ""
         self._last_write_at: str | None = None
         self._bg_drop_warned = False
+        # Memory scope, bound in initialize(). None = HERMES_ORACLE_SCOPE_MODE=off.
+        self._scope_id: str | None = None
+        self._scope_key = ""  # the caller's session key the scope came from
+        self._scope_inherited = False  # taken from the parent of a forked agent
+        self._scope_ns: Any = ""
         # Lifecycle writers are tracked per process (module-level
         # _LIFECYCLE_* maps, keyed by _lifecycle_key), not per instance.
         self._sync_threads: list[threading.Thread] = []
@@ -1515,6 +1644,8 @@ class OracleMemoryProvider(MemoryProvider):
             "init_error": self._init_error or None,
             "schema_warnings": list(self._schema_warnings),
             "vector_index": self._vector_index_kind,
+            # The mode only: the scope itself names a user.
+            "scope": "off" if self._scope_id is None else "user" if self._user_scoped() else _SCOPE_GLOBAL,
         }
 
     def is_available(self) -> bool:
@@ -1599,6 +1730,17 @@ class OracleMemoryProvider(MemoryProvider):
         self._schema_policy = _setting("HERMES_ORACLE_SCHEMA_POLICY").upper()
         self._tuning = _read_tuning()
 
+        # Bind the memory scope before anything can reach the database.
+        parent = None
+        if _is_fork(kwargs):
+            parent = _live_provider_of_session(kwargs.get("parent_session_id"), exclude=self)
+        derived = _derive_scope(_setting("HERMES_ORACLE_SCOPE_MODE"), kwargs, parent=parent)
+        self._scope_id, self._scope_key, self._scope_inherited = derived.scope, derived.key, derived.inherited
+        self._scope_ns = ""
+        if derived.error:
+            self._fail_closed(derived.error)
+            return
+
         # Load table name dynamically for OpenClaw shared memory compatibility
         import re as _re
 
@@ -1648,6 +1790,63 @@ class OracleMemoryProvider(MemoryProvider):
 
         with self._pool_lock:
             self._initialize_pool_locked(password, current_fingerprint, pool_call_timeout, pool_wait_ms, pool_idle_s)
+
+    def _fail_closed(self, reason: str) -> None:
+        """No usable scope: this provider must not read or write. An earlier
+        pool of this instance is retired so no call can use it."""
+        self._init_error = reason
+        logger.error("Oracle memory: %s", reason)
+        with self._pool_lock:
+            old_pool, self._pool = self._pool, None
+            self._initialized = False
+            self._pool_fingerprint = ""
+        with _LIVE_PROVIDERS_LOCK:
+            _LIVE_PROVIDERS.discard(self)
+        if old_pool is not None:
+            _retire_pool(old_pool, "scope")
+
+    # -- scope ---------------------------------------------------------------
+    def _user_scoped(self) -> bool:
+        """True for a session bound to one user (not off, not the operator)."""
+        return self._scope_id is not None and self._scope_id != _SCOPE_GLOBAL
+
+    def _id_prefix(self) -> str:
+        if not self._user_scoped():
+            return ""
+        if not self._scope_ns or self._scope_ns[0] != self._scope_id:
+            import hashlib
+
+            digest = hashlib.sha256(str(self._scope_id).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+            self._scope_ns = (self._scope_id, f"s.{digest}:")
+        return self._scope_ns[1]
+
+    def _store_id(self, mid: str) -> str:
+        """The stored form of a caller-chosen memory_id. memory_id is the
+        table's primary key, so two users' "handoff:x" need different rows."""
+        return self._id_prefix() + mid
+
+    def _lookup_ids(self, mid: str) -> list[str]:
+        """Ids a caller's memory_id may be stored under: as given (generated
+        ids such as fact_...) and with this scope's prefix."""
+        stored = self._store_id(mid)
+        return [mid] if stored == mid else [mid, stored]
+
+    def _show_id(self, stored: Any) -> Any:
+        prefix = self._id_prefix()
+        if prefix and isinstance(stored, str) and stored.startswith(prefix):
+            return stored[len(prefix):]
+        return stored
+
+    def _id_match(self, mid: str) -> tuple[str, dict[str, Any]]:
+        """WHERE fragment and binds selecting the caller's own row *mid*."""
+        ids = self._lookup_ids(mid)
+        sql, binds = "memory_id = :id", {"id": mid}
+        if len(ids) > 1:
+            sql, binds = "memory_id IN (:id, :nsid)", {"id": mid, "nsid": ids[1]}
+        if self._scope_id is not None:
+            sql += f" AND {_SCOPE_WRITE}"
+            binds["scope"] = self._scope_id
+        return sql, binds
 
     def _find_wallet_dir(self) -> str:
         """The wallet directory: OCI_WALLET_LOCATION, then TNS_ADMIN (both from
@@ -1826,6 +2025,11 @@ class OracleMemoryProvider(MemoryProvider):
                 (f"column {column}", f"ALTER TABLE {table} ADD ({column} {definition})")
                 for column, definition in _UPGRADE_COLUMNS
             ]
+            if self._scope_id is not None:
+                steps += [
+                    ("column scope_id", f"ALTER TABLE {table} ADD ({_SCOPE_COLUMN_DDL})"),
+                    ("scope index", _SCOPE_INDEX_DDL.format(index_name=f"{table}_SCOPE_IDX", table_name=table)),
+                ]
             for what, sql in steps:
                 err = self._run_ddl(cur, sql)
                 if err:
@@ -1894,6 +2098,20 @@ class OracleMemoryProvider(MemoryProvider):
         with self._pool.acquire() as conn, conn.cursor() as cur:
             cur.execute(f"SELECT /*+ NO_PARALLEL */ COUNT(*) FROM {self._table}")  # nosec B608
             cur.fetchone()
+            if self._scope_id is not None:
+                try:
+                    cur.execute(f"SELECT /*+ NO_PARALLEL */ scope_id FROM {self._table} WHERE 1 = 0")  # nosec B608
+                except Exception as e:
+                    if "ORA-00904" not in str(e):
+                        raise
+                    why = failures.get("column scope_id", "")
+                    raise RuntimeError(
+                        f"HERMES_ORACLE_SCOPE_MODE is on but {table} has no SCOPE_ID column"
+                        + (f" (adding it failed: {why})" if why else "")
+                        + f". Add it: ALTER TABLE {table} ADD ({_SCOPE_COLUMN_DDL}); "
+                        + _SCOPE_INDEX_DDL.format(index_name=f"{table}_SCOPE_IDX", table_name=table)
+                        + " -- or set HERMES_ORACLE_SCOPE_MODE=off"
+                    ) from e
             rows = self._index_rows(cur)
         warnings: list[str] = []
         kind = "unknown"
@@ -2553,6 +2771,10 @@ class OracleMemoryProvider(MemoryProvider):
         if row_columns:
             columns += self._INSERT_ROW_COLUMNS
             values += [bind() for _ in range(4)]
+        if self._scope_id is not None:
+            # Last column, last bind (see _insert_binds).
+            columns += ", scope_id"
+            values.append(bind())
         return (
             f"INSERT /*+ NO_PARALLEL */ INTO {self._table} ({columns}) "  # nosec B608
             f"VALUES ({', '.join(values)})"
@@ -2576,6 +2798,8 @@ class OracleMemoryProvider(MemoryProvider):
             binds.append(self._onnx_model)
         if row_columns:
             binds += [row.get("turn_index"), row.get("chunk_index"), row.get("turn_id"), row.get("conv_ref")]
+        if self._scope_id is not None:
+            binds.append(self._scope_id)
         return tuple(binds)
 
     def _insert_rows(
@@ -2714,22 +2938,25 @@ class OracleMemoryProvider(MemoryProvider):
         sync would silently revert the edit."""
         if not self._pool:
             raise RuntimeError(self._init_error or "pool not initialized")
+        # The caller's own row: in a scoped session the id may carry the
+        # scope's prefix, and another scope's row never matches.
+        id_sql, id_binds = self._id_match(mid)
         meta_set = ""
-        meta_binds: dict[str, Any] = {}
+        meta_binds: dict[str, Any] = dict(id_binds)
         if tags is not None:
             meta_set = ", metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{}')), SET '$.tags' = JSON(:tags))"
-            meta_binds = {"tags": json.dumps(list(tags))}
+            meta_binds["tags"] = json.dumps(list(tags))
         if content is None:
             if tags is None:
                 return 0
             sql = f"""
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')), SET '$.tags' = JSON(:tags))
-                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+                WHERE {id_sql} AND NVL(role, 'fact') <> 'skill'
             """  # nosec B608
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(sql, {"id": mid, **meta_binds})
+                    cur.execute(sql, meta_binds)
                     n = cur.rowcount
                 conn.commit()
             return n
@@ -2746,15 +2973,16 @@ class OracleMemoryProvider(MemoryProvider):
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET content = :c, embedding = NULL, content_txt = :t,
                     embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+                WHERE {id_sql} AND NVL(role, 'fact') <> 'skill'
             """  # nosec B608
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
+                    cur.execute(null_upd_sql, {"c": content, "t": txt, **meta_binds})
                     n = cur.rowcount
                 conn.commit()
             if n:
-                self._queue_embed_backfill(mid, content)
+                for stored in self._lookup_ids(mid):
+                    self._queue_embed_backfill(stored, content)
             return n
         backfill_after_commit = False
         with self._acquire_checked() as conn:
@@ -2765,11 +2993,11 @@ class OracleMemoryProvider(MemoryProvider):
                         UPDATE /*+ NO_PARALLEL */ {self._table}
                         SET content = :c, embedding = VECTOR_EMBEDDING({self._onnx_model} USING :e AS DATA), content_txt = :t,
                             embedding_model = :m, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                        WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+                        WHERE {id_sql} AND NVL(role, 'fact') <> 'skill'
                         """  # nosec B608
                     cur.execute(
                         sql,
-                        {"c": content, "e": embed_txt, "t": txt, "m": self._onnx_model, "id": mid, **meta_binds},
+                        {"c": content, "e": embed_txt, "t": txt, "m": self._onnx_model, **meta_binds},
                     )
                     succeeded = True
                 except Exception as e:
@@ -2783,7 +3011,7 @@ class OracleMemoryProvider(MemoryProvider):
                         for attempt in range(_EMBED_MAX_RETRIES):
                             try:
                                 time.sleep(0.05 * (attempt + 1))
-                                cur.execute(sql, {"c": content, "e": embed_txt, "t": txt, "m": self._onnx_model, "id": mid, **meta_binds})
+                                cur.execute(sql, {"c": content, "e": embed_txt, "t": txt, "m": self._onnx_model, **meta_binds})
                                 succeeded = True
                                 break
                             except Exception as retry_e:
@@ -2797,7 +3025,7 @@ class OracleMemoryProvider(MemoryProvider):
                     if not succeeded and is_54401:
                         conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
                         try:
-                            cur.execute(sql, {"c": content, "e": conservative_txt, "t": txt, "m": self._onnx_model, "id": mid, **meta_binds})
+                            cur.execute(sql, {"c": content, "e": conservative_txt, "t": txt, "m": self._onnx_model, **meta_binds})
                             succeeded = True
                         except Exception as retry_e:
                             err_str = str(retry_e)
@@ -2829,10 +3057,10 @@ class OracleMemoryProvider(MemoryProvider):
                             UPDATE /*+ NO_PARALLEL */ {self._table}
                             SET content = :c, embedding = NULL, content_txt = :t,
                                 embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                            WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+                            WHERE {id_sql} AND NVL(role, 'fact') <> 'skill'
                         """  # nosec B608
                         try:
-                            cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
+                            cur.execute(null_upd_sql, {"c": content, "t": txt, **meta_binds})
                             backfill_after_commit = True
                         except Exception as null_e:
                             raise RuntimeError(
@@ -2841,7 +3069,8 @@ class OracleMemoryProvider(MemoryProvider):
                 n = cur.rowcount
             conn.commit()
         if backfill_after_commit and n:
-            self._queue_embed_backfill(mid, content)
+            for stored in self._lookup_ids(mid):
+                self._queue_embed_backfill(stored, content)
         return n
 
     def _is_skill_row(self, mid: str) -> bool:
@@ -2874,7 +3103,7 @@ class OracleMemoryProvider(MemoryProvider):
         else:
             try:
                 self._insert(
-                    memory_id=mid,
+                    memory_id=self._store_id(mid),
                     session_id=self._session_id,
                     role="fact",
                     content=content,
@@ -2916,10 +3145,14 @@ class OracleMemoryProvider(MemoryProvider):
             raise ValueError(f"oracle_get takes at most {_GET_MAX_LIMIT} memory_ids per call")
         if memory_ids:
             names = []
-            for i, m in enumerate(memory_ids):
+            wanted = [stored for m in memory_ids for stored in self._lookup_ids(m)]
+            for i, m in enumerate(dict.fromkeys(wanted)):
                 binds[f"m{i}"] = m
                 names.append(f":m{i}")
             where += f" AND memory_id IN ({', '.join(names)}) "
+        if self._scope_id is not None:
+            where += f" AND {_SCOPE_READ} "
+            binds["scope"] = self._scope_id
         if session_id:
             where += " AND session_id = :sid "
             binds["sid"] = session_id
@@ -2954,7 +3187,7 @@ class OracleMemoryProvider(MemoryProvider):
                     meta = _metadata_dict(row[6])
                     out.append(
                         {
-                            "memory_id": row[0],
+                            "memory_id": self._show_id(row[0]),
                             "session_id": row[1],
                             "agent_id": row[2],
                             "role": row[3],
@@ -3133,6 +3366,9 @@ class OracleMemoryProvider(MemoryProvider):
         and tag filters the caller asked for."""
         sql = self._JUNK
         binds: dict[str, Any] = {}
+        if self._scope_id is not None:
+            sql += f" AND {_SCOPE_READ} "
+            binds["scope"] = self._scope_id
         if tgt not in ("", "any"):
             sql += " AND target = :tgt "
             binds["tgt"] = tgt
@@ -3714,7 +3950,7 @@ class OracleMemoryProvider(MemoryProvider):
             # The stored text is data: escaped, it cannot close the boundary
             # tag or open another one. Cut first, so no entity is cut in half.
             body = html.escape(body, quote=False)
-            mid = html.escape(str(r.get("memory_id") or ""), quote=True)
+            mid = html.escape(str(self._show_id(r.get("memory_id")) or ""), quote=True)
             target = html.escape(str(r.get("target") or "memory"), quote=True)
             score = html.escape(str(r.get("score") if r.get("score") is not None else 0), quote=True)
             lines.append(
@@ -3803,6 +4039,10 @@ class OracleMemoryProvider(MemoryProvider):
     ) -> None:
         if not self._pool or self._agent_context not in ("primary", ""):
             return
+        if self._user_scoped():
+            # Hermes names no caller on this hook, and a provider can be shared
+            # by two callers of one session id: never store a turn for a user.
+            return
         if not isinstance(user_content, str) or _is_internal_gateway_turn(user_content) or is_trivial_prompt(user_content):
             return
         sid = session_id or self._session_id
@@ -3868,15 +4108,21 @@ class OracleMemoryProvider(MemoryProvider):
               AND NVL(JSON_VALUE(JSON_QUERY(metadata, '$' RETURNING JSON), '$.host'), :host) = :host
               AND DBMS_LOB.COMPARE(content, TO_CLOB(:c)) = 0
         """  # nosec B608
+        binds = {"aid": self._agent_id, "tgt": target, "host": get_host_id(), "c": content}
+        if self._scope_id is not None:
+            sql += f" AND {_SCOPE_WRITE}"
+            binds["scope"] = self._scope_id
         with self._acquire_checked() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, {"aid": self._agent_id, "tgt": target, "host": get_host_id(), "c": content})
+                cur.execute(sql, binds)
                 n = cur.rowcount or 0
             conn.commit()
         return n
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if not self._pool or not isinstance(messages, list) or not messages:
+            return
+        if self._user_scoped():  # see sync_turn
             return
         try:
             user_bits = [
@@ -3919,7 +4165,9 @@ class OracleMemoryProvider(MemoryProvider):
             return self
         with _LIVE_PROVIDERS_LOCK:
             live = [p for p in _LIVE_PROVIDERS
-                    if p is not self and p._pool is not None and not p._write_stop.is_set()]
+                    if p is not self and p._pool is not None and not p._write_stop.is_set()
+                    # a queued row is written with the scope of the provider that writes it
+                    and p._scope_id == self._scope_id]
         if not live:
             return None
         if session_id:
@@ -3935,7 +4183,10 @@ class OracleMemoryProvider(MemoryProvider):
         in every other session with "pool not initialized"."""
         data = args[0] if args and isinstance(args[0], dict) else {}
         sid = kwargs.get("session_id") or data.get("session_id") or ""
-        target = self._live_provider_for(sid if isinstance(sid, str) else "") or self
+        sid = sid if isinstance(sid, str) else ""
+        # The provider of the session the event came from, when it is known:
+        # this instance may belong to another user's session.
+        target = _live_provider_of_session(sid) or self._live_provider_for(sid) or self
         # (falling back to self is safe: _queue_background_insert now drops
         # rather than enqueues when this instance has no usable pool)
         target._on_skill_lifecycle_impl(*args, **kwargs)
@@ -3946,6 +4197,9 @@ class OracleMemoryProvider(MemoryProvider):
         **kwargs: Any,
     ) -> None:
         """Observer hook recording skill usage/load and handling live lifecycle ingestion into Oracle 26ai ADB memory."""
+        if self._user_scoped():
+            # Skill telemetry and corpus writes belong to the operator's sessions.
+            return
         data = args[0] if args and isinstance(args[0], dict) else {}
         action = kwargs.get("action") or data.get("action")
         if not action and args and isinstance(args[0], str):
@@ -4546,7 +4800,45 @@ class OracleMemoryProvider(MemoryProvider):
             return tool_error(f"Failed to list skills: {e}")
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return list(TOOL_SCHEMAS)
+        if not self._user_scoped():
+            return list(TOOL_SCHEMAS)
+        # A user-scoped session gets no tool that reads this host's disk.
+        import copy
+
+        out = []
+        for schema in TOOL_SCHEMAS:
+            name = schema.get("name")
+            if name in _SCOPED_TOOL_REFUSALS:
+                continue
+            if name == "oracle_chunk":
+                schema = copy.deepcopy(schema)
+                schema["parameters"]["properties"].pop("file_path", None)
+                schema["description"] = _SCOPED_CHUNK_DESCRIPTION
+            out.append(schema)
+        return out
+
+    def _show_rows(self, rows: list) -> list:
+        """Search rows with this scope's id prefix removed (copies)."""
+        if not self._id_prefix():
+            return rows
+        return [
+            {**r, "memory_id": self._show_id(r.get("memory_id"))} if isinstance(r, dict) else r
+            for r in rows
+        ]
+
+    def _caller_refusal(self, kwargs: dict[str, Any]) -> str:
+        """Hermes binds a provider once per session id and names the caller on
+        every tool call (caller_gsk). A caller other than the one this
+        provider's scope was bound for is refused. "" = allowed."""
+        if self._scope_id is None or "caller_gsk" not in kwargs:
+            return ""
+        caller = _scope_key(kwargs.get("caller_gsk"))
+        if caller == self._scope_key or (not caller and self._scope_inherited):
+            return ""
+        return (
+            "Oracle memory refused this call: the session's memory scope was bound for a different caller "
+            "(session key mismatch). Start a new session."
+        )
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if not self._pool:
@@ -4560,6 +4852,11 @@ class OracleMemoryProvider(MemoryProvider):
         handler = self._TOOL_HANDLERS.get(tool_name)
         if handler is None:
             return tool_error(f"Unknown tool: {tool_name}")
+        refusal = self._caller_refusal(kwargs)
+        if not refusal and self._user_scoped():
+            refusal = _SCOPED_TOOL_REFUSALS.get(tool_name, "")
+        if refusal:
+            return tool_error(refusal)
         try:
             return getattr(self, handler)(args)
         except Exception as e:
@@ -4600,7 +4897,7 @@ class OracleMemoryProvider(MemoryProvider):
                 return json.dumps(
                     {"result": "No relevant memories found.", "count": 0}
                 )
-            return json.dumps(_search_tool_payload(rows), default=_json_default)
+            return json.dumps(_search_tool_payload(self._show_rows(rows)), default=_json_default)
         except Exception as e:
             is_timeout = _is_timeout_error(e) or "TimeoutError" in str(e)
             if is_timeout:
@@ -4684,6 +4981,8 @@ class OracleMemoryProvider(MemoryProvider):
         if add_tags:
             add_meta["tags"] = add_tags
 
+        if req_mid is not None and self._user_scoped() and len(req_mid) > _scoped_id_max():
+            return tool_error(f"memory_id must be at most {_scoped_id_max()} characters in this session")
         if req_mid is not None and req_mid.lower().startswith(_SKILL_ID_PREFIX):
             return tool_error(
                 f"memory_id prefix '{_SKILL_ID_PREFIX}' is reserved for the skill corpus "
@@ -4831,14 +5130,12 @@ class OracleMemoryProvider(MemoryProvider):
         with self._acquire_checked() as conn:
             with conn.cursor() as cur:
                 # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
+                id_sql, id_binds = self._id_match(mid)
                 query = (
-                    f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                    f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE {id_sql}"  # nosec B608
                     " AND NVL(role, 'fact') <> 'skill'"
                 )
-                cur.execute(
-                    query,
-                    (mid,),
-                )
+                cur.execute(query, id_binds)
                 n = cur.rowcount
                 conn.commit()
         if not n:
@@ -4851,6 +5148,8 @@ class OracleMemoryProvider(MemoryProvider):
         """oracle_chunk: Chunk inline text or a file in the database and store the chunks."""
         content = (args.get("content") or "").strip()
         file_path = (args.get("file_path") or args.get("path") or "").strip()
+        if file_path and self._user_scoped():
+            return tool_error("oracle_chunk reads no file in a user-scoped session; pass the text as content")
         if not content and not file_path:
             return tool_error("Missing required parameter: content or file_path")
         try:
@@ -5027,6 +5326,9 @@ class OracleMemoryProvider(MemoryProvider):
         # Skill-corpus rows are shared across hosts: never purged by thread.
         where = "session_id = :sid AND (role IS NULL OR role <> 'skill')"
         binds = {"sid": sid}
+        if self._scope_id is not None:  # only the caller's rows of that session
+            where += f" AND {_SCOPE_WRITE}"
+            binds["scope"] = self._scope_id
 
         def too_many(n: int) -> str:
             msg = f"session_id '{sid}' has {n} rows, more than this call may delete ({max_rows}). Nothing was deleted."
