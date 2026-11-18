@@ -162,6 +162,25 @@ class TestSharedHelpers(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "v dflt boom")
 
+    def test_host_shims_work_when_the_helper_is_loaded_under_an_unregistered_name(self):
+        # tests/check_wheel.py loads the installed helper by path without
+        # putting it in sys.modules; a @dataclass inside the helper failed there.
+        code = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('anon_helper', {str(REPO / 'scripts' / '_common.py')!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "m.install_host_shims()\n"
+            "from agent.memory_provider import RecallStatus\n"
+            "r = RecallStatus(provider_label='x', count=2)\n"
+            "print(r.provider_label, r.count, 'anon_helper' in sys.modules)\n"
+        )
+        with tempfile.TemporaryDirectory() as home:
+            proc = subprocess.run([sys.executable, "-c", code], env=dict(CLEAN_ENV, HOME=home), cwd=home,
+                                  capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-600:])
+        self.assertEqual(proc.stdout.strip(), "x 2 False")
+
     def test_sync_skills_loads_the_helpers_by_path(self):
         from scripts import sync_skills
 

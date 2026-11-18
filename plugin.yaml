@@ -1,6 +1,9 @@
 name: oracle
 version: 1.1.1.5
 description: "Oracle AI Database 26ai — vector search (HNSW), Oracle Text, fused hybrid recall, shared cross-server skill corpus, live lifecycle ingest, zombie-safe sync."
+# Oldest Hermes release with every API this plugin imports
+# (agent.memory_provider.RecallStatus, is_trivial_prompt, agent.secret_scope).
+requires_hermes: ">=0.21.6"
 provides_hooks:
   - on_skill_lifecycle
 pip_dependencies:

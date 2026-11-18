@@ -17,7 +17,6 @@ import importlib.util
 import os
 import sys
 import types
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -108,10 +107,10 @@ def install_host_shims() -> None:
         class MemoryProvider:
             pass
 
-        @dataclass
         class RecallStatus:
-            provider_label: str
-            count: int
+            def __init__(self, provider_label: str, count: int) -> None:
+                self.provider_label = provider_label
+                self.count = count
 
         setattr(mp_mod, "MemoryProvider", MemoryProvider)
         setattr(mp_mod, "RecallStatus", RecallStatus)

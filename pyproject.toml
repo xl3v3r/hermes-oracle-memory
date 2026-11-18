@@ -30,7 +30,13 @@ onnx = [
 [tool.setuptools]
 packages = ["hermes_oracle_memory"]
 package-dir = {"hermes_oracle_memory" = "."}
-package-data = {"hermes_oracle_memory" = ["plugin.yaml", "skills/**/*"]}
+include-package-data = false
+
+# The provider loads scripts/sync_skills.py (and its helper) at run time, so
+# the scripts are package data. Patterns name file types: a used checkout has
+# __pycache__ directories that must not be packaged.
+[tool.setuptools.package-data]
+hermes_oracle_memory = ["plugin.yaml", "scripts/*.py", "skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

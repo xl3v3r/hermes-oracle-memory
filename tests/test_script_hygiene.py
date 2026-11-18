@@ -51,5 +51,60 @@ class TestEnvFileHygiene(unittest.TestCase):
         self.assertTrue(all("*" not in a for a in allow))
 
 
+class TestPackaging(unittest.TestCase):
+    """#25: the wheel carries what the provider loads at run time. The wheel
+    itself is built, installed and checked in CI (tests/check_wheel.py)."""
+
+    def _package_data(self):
+        py = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r"(?m)^hermes_oracle_memory = \[(.*)\]$", py)
+        assert m is not None, "package-data for hermes_oracle_memory not found"
+        return [x.strip().strip('"') for x in m.group(1).split(",")]
+
+    def test_runtime_files_are_package_data(self):
+        patterns = self._package_data()
+        self.assertIn("plugin.yaml", patterns)
+        self.assertIn("scripts/*.py", patterns)
+        # every file the provider or the registration reads from its own directory
+        import fnmatch
+
+        for rel in ("scripts/sync_skills.py", "scripts/_common.py",
+                    "skills/oracle-import/SKILL.md", "skills/oracle-skill-corpus/SKILL.md"):
+            self.assertTrue((REPO / rel).is_file(), rel)
+            self.assertTrue(any(fnmatch.fnmatch(rel, pat) for pat in patterns), rel)
+
+    def test_package_data_cannot_pick_up_compiled_files(self):
+        import fnmatch
+
+        for pat in self._package_data():
+            self.assertNotIn("**", pat, pat)
+            self.assertFalse(pat.endswith("*"), pat)
+            for junk in ("scripts/__pycache__/sync_skills.cpython-313.pyc",
+                         "skills/oracle-import/__pycache__/x.cpython-313.pyc"):
+                self.assertFalse(fnmatch.fnmatch(junk, pat) and "/" not in pat.split("*")[-1], (pat, junk))
+
+    def test_wheel_check_requires_files_that_exist(self):
+        src = (REPO / "tests" / "check_wheel.py").read_text(encoding="utf-8")
+        required = re.findall(r'^    "([^"]+)",$', src, re.M)
+        self.assertGreaterEqual(len(required), 5)
+        for rel in required:
+            self.assertTrue((REPO / rel).is_file(), rel)
+
+    def test_manifest_names_no_missing_file(self):
+        for line in (REPO / "MANIFEST.in").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] in ("include", "exclude") and "*" not in parts[1]:
+                self.assertTrue((REPO / parts[1]).exists(), line)
+
+    def test_ci_builds_and_installs_the_wheel(self):
+        wf = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        self.assertIn("python -m build", wf)
+        self.assertIn("check_wheel.py", wf)
+
+    def test_manifest_declares_a_hermes_floor(self):
+        manifest = (REPO / "plugin.yaml").read_text(encoding="utf-8")
+        self.assertRegex(manifest, r'(?m)^requires_hermes: ">=0\.\d+\.\d+"$')
+
+
 if __name__ == "__main__":
     unittest.main()
