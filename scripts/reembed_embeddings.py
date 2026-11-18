@@ -3,8 +3,9 @@
 in-database ONNX model. No external provider is ever contacted.
 
 Why this exists (measured on the PHX ADB, 2 OCPU, 2026-10):
-  * `scripts/backfill_embeddings.py` only touches rows WHERE embedding IS NULL,
-    hard-requires OPENROUTER_API_KEY, and falls back to OpenRouter on ONNX error.
+  * Embeddings are computed in the database and nowhere else. (The earlier
+    scripts/backfill_embeddings.py sent row text to an external API; it was
+    removed in 1.1.2. Use `--mode nulls` here instead.)
   * ADB runs `parallel_degree_policy=AUTO` (Exadata auto-DOP). A statement that
     scans this table for >~10s gets parallelised even though the table is
     DEGREE 1; the PX slaves then stall forever in `PX Deq Credit: send blkd`
@@ -60,46 +61,18 @@ _MAX_CONTENT = 4000  # the plugin embeds (content or "")[:4000]
 _PGA_ERR = "ORA-04036"
 
 
-def load_env(env_file: str | None = None) -> None:
-    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
-    when the user passes --env-file. Otherwise the script reads the process
-    environment alone; values already set there win."""
-    if not env_file:
-        return
-    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+try:  # helpers shared by the scripts (scripts/_common.py)
+    from . import _common as common
+except ImportError:  # run as a script, or imported with this directory on sys.path
+    import _common as common  # type: ignore[no-redef]
+
+load_env = common.load_env
 
 
 def connect() -> Any:
     import oracledb
 
-    user = os.environ.get("OCI_DB_USER")
-    password = os.environ.get("OCI_DB_PASSWORD")
-    dsn = os.environ.get("OCI_DB_DSN")
-    if not user or not password or not dsn:
-        raise RuntimeError("Missing OCI_DB_USER / OCI_DB_PASSWORD / OCI_DB_DSN")
-
-    wallet_dir = os.environ.get("OCI_WALLET_LOCATION")
-    if not wallet_dir:
-        for candidate in (Path.home() / ".oci" / "wallet", Path.home() / ".hermes" / "oracle_wallet"):
-            if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
-                wallet_dir = str(candidate)
-                break
-
-    kwargs: dict[str, Any] = {"user": user, "password": password, "dsn": dsn}
-    if wallet_dir:
-        kwargs["config_dir"] = wallet_dir
-        kwargs["wallet_location"] = wallet_dir
-        wallet_pwd = os.environ.get("OCI_WALLET_PASSWORD")
-        if wallet_pwd:
-            kwargs["wallet_password"] = wallet_pwd
-    return oracledb.connect(**kwargs)
+    return oracledb.connect(**common.connect_kwargs())
 
 
 def guard_serial(cur: Any) -> None:
@@ -115,7 +88,18 @@ def guard_serial(cur: Any) -> None:
             logger.debug("could not run %r: %s", stmt, e)
 
 
+# Set once the PX check turned out to be impossible for this database user.
+_PX_CHECK_UNAVAILABLE: set[str] = set()
+_NO_ACCESS = ("ORA-00942", "ORA-01031")  # view not visible / insufficient privileges
+
+
 def assert_no_px(cur: Any) -> None:
+    """Abort when parallel-execution slaves work for this session. The check
+    reads V$PX_SESSION; a user who may not read it (most users other than an
+    Autonomous Database admin) cannot be checked, and guard_serial() has
+    already switched parallel execution off for the session."""
+    if _PX_CHECK_UNAVAILABLE:
+        return
     try:
         cur.execute(
             "SELECT /*+ NO_PARALLEL */ COUNT(*) FROM v$px_session "
@@ -123,9 +107,21 @@ def assert_no_px(cur: Any) -> None:
             "  AND sid != TO_NUMBER(SYS_CONTEXT('USERENV', 'SID'))"
         )
         px = cur.fetchone()[0]
-    except Exception:
-        cur.execute("SELECT /*+ NO_PARALLEL */ COUNT(*) FROM v$px_session")
-        px = cur.fetchone()[0]
+    except Exception as first:
+        try:
+            if any(code in str(first) for code in _NO_ACCESS):
+                raise first
+            cur.execute("SELECT /*+ NO_PARALLEL */ COUNT(*) FROM v$px_session")
+            px = cur.fetchone()[0]
+        except Exception as e:
+            if not any(code in str(e) for code in _NO_ACCESS):
+                raise
+            _PX_CHECK_UNAVAILABLE.add("no access")
+            logger.info(
+                "this database user cannot read V$PX_SESSION, so the parallel-execution check is skipped "
+                "(parallel execution is disabled for the session)"
+            )
+            return
     if px:
         raise RuntimeError(
             f"{px} PX slave session(s) appeared - parallel execution is active and this "

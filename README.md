@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.1.5-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
 ![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
@@ -32,8 +32,10 @@ hermes config set memory.provider oracle
 
 ```bash
 hermes memory status             # confirm "oracle" is active
-python3 tests/verify_provider.py
+python3 tests/verify_provider.py --env-file <path to your Hermes .env>
 ```
+
+The script stores a few test memories, searches for them in each mode, and deletes them again. See [INSTALL.md](INSTALL.md#step-5-verification--testing) for its options.
 
 ## Configure
 
@@ -76,7 +78,7 @@ Embeddings are computed 100% in-house:
 | `oracle_add` | store a durable fact (embedded + indexed); optional stable `memory_id` (upsert) and `tags` |
 | `oracle_get` | exact read by `memory_id`(s) and/or `tags` — no embedding, works during an ONNX cooldown |
 | `oracle_update` | replace a fact's text and/or tags by `memory_id` |
-| `oracle_delete` | delete by `memory_id`, or purge one thread by `session_id` (never skill rows or the shared `skills`/`none` ids) |
+| `oracle_delete` | delete by `memory_id`, or purge one thread by `session_id` (never skill rows or the shared `skills`/`none` ids). A purge takes `dry_run` to count first, and deletes at most 200 rows unless `max_rows` allows more (up to 10,000) |
 | `oracle_chunk` | split inline text or a disk file in-database (refuses credential and system paths: env files, key directories and files, wallets, `/etc`) |
 | `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory |
 | `oracle_load_skill` | load or list skills from the shared Oracle skill corpus at runtime |
@@ -203,9 +205,9 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
   ```
   and automatically refreshes optimizer statistics via `DBMS_STATS.GATHER_TABLE_STATS`.
 
-## What's new in v1.1.1.5
+## What's new in v1.1.2
 
-Follow-up release for #14 — full details in `RELEASE_NOTES_1.1.1.5.md`:
+Follow-up release for #14 — full details in `RELEASE_NOTES_1.1.2.md`:
 
 - **Foreign skill copies**: ownership is judged against the profile's own skill dirs, so a sync over a `--dirs` subset updates the copies it stored from the other dirs (a `--dirs` run outside the defaults never takes over a live default skill); `replace_foreign` / `--replace-foreign` replaces a copy left from another profile or a removed root, and the sync result carries a hint when it skipped one.
 - **Lifecycle lookup**: a link into `.archive/` is no longer a live skill; the lookup walks any depth and ends on link loops, like the bulk sync.

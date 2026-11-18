@@ -104,9 +104,9 @@ class TestSearchPayload(unittest.TestCase):
 
     def test_search_sql_projects_tags(self):
         p, _, _ = _provider()
-        for sql, _ in (p._build_text_search_sql("{q}", 5, "", "any"),
-                       p._build_vector_search_sql("q", None, 5, "", "any"),
-                       p._build_hybrid_search_sql("q", None, "{q}", 5, "", "any")):
+        for sql, _ in (p._build_text_search_sql("{q}", 5, "any"),
+                       p._build_vector_search_sql("q", 5, "any"),
+                       p._build_hybrid_search_sql("q", "{q}", 5, "any")):
             self.assertIn("'$.tags' RETURNING VARCHAR2(4000)", sql)
 
 

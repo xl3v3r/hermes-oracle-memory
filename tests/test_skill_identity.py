@@ -82,8 +82,10 @@ class TestSkillRoots(unittest.TestCase):
         p, conn, cur = _provider()
         cur.fetchone.return_value = None
         with tempfile.TemporaryDirectory() as td:
-            home = Path(td) / "home"
-            prof = Path(td) / "profile"
+            # Resolved: metadata.path is stored under the resolved root, and
+            # the temp dir is itself a link on macOS (/var -> /private/var).
+            home = Path(td).resolve() / "home"
+            prof = Path(td).resolve() / "profile"
             for base, body in ((home / ".hermes" / "skills", "Default"), (prof / "skills", "Profile")):
                 d = base / "cat" / "dual"
                 d.mkdir(parents=True)

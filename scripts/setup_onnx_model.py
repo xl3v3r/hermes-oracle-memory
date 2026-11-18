@@ -1,39 +1,49 @@
 #!/usr/bin/env python3
-"""Export 768-d ONNX pipeline model and load into Oracle ADB via DATA_PUMP_DIR."""
+"""Export the 768-dimension BGE embedding model as an ONNX pipeline and load it
+into Oracle Autonomous AI Database through DATA_PUMP_DIR.
 
+The pipeline (tokenizer, model, pooling, normalisation in one ONNX graph) is
+built by onnx2oracle, a separate project by jasperan
+(https://github.com/jasperan/onnx2oracle, MIT licence). Install it first:
+
+    python -m pip install onnx2oracle
+
+The OCI_DB_* settings come from the environment, or from --env-file.
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
 import logging
-import os
+import sys
 import time
 from pathlib import Path
+
+try:  # helpers shared by the scripts (scripts/_common.py)
+    from . import _common as common
+except ImportError:  # run as a script, or imported with this directory on sys.path
+    import _common as common  # type: ignore[no-redef]
+
+load_env = common.load_env
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("setup_onnx")
 
-from onnx2oracle.presets import ModelSpec
-from onnx2oracle.pipeline import build_augmented
-import oracledb
-
 MODEL_NAME = "BGE_BASE_EN_V1_5"
 FILE_NAME = "bge_base_en_v1_5.onnx"
-
-def load_env(env_file: str | None = None) -> None:
-    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
-    when the user passes --env-file. Otherwise the script reads the process
-    environment alone; values already set there win."""
-    if not env_file:
-        return
-    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+_MISSING_ONNX2ORACLE = (
+    "This script needs onnx2oracle (https://github.com/jasperan/onnx2oracle), which is not installed. "
+    "Install it: python -m pip install onnx2oracle"
+)
 
 
-def main():
+def build_model() -> bytes:
+    """The ONNX pipeline for BAAI/bge-base-en-v1.5, built with onnx2oracle and
+    cached under ~/.cache. Raises ImportError when onnx2oracle is missing."""
+    from onnx2oracle.pipeline import build_augmented
+    from onnx2oracle.presets import ModelSpec
+
     spec = ModelSpec(
         hf_repo="BAAI/bge-base-en-v1.5",
         dims=768,
@@ -42,38 +52,24 @@ def main():
         oracle_name=MODEL_NAME,
         max_length=512,
     )
-    
     local_onnx_path = Path.home() / ".cache" / "bge_base_en_v1_5_sliced.onnx"
     if local_onnx_path.exists():
         logger.info("Loading cached ONNX pipeline from %s", local_onnx_path)
-        model_bytes = local_onnx_path.read_bytes()
-    else:
-        logger.info("Building augmented ONNX pipeline for %s...", spec.hf_repo)
-        t0 = time.time()
-        model_bytes = build_augmented(spec)
-        logger.info("Pipeline built in %.2fs. Size: %.2f MB", time.time() - t0, len(model_bytes) / (1024 * 1024))
-        local_onnx_path.parent.mkdir(parents=True, exist_ok=True)
-        local_onnx_path.write_bytes(model_bytes)
+        return local_onnx_path.read_bytes()
+    logger.info("Building augmented ONNX pipeline for %s...", spec.hf_repo)
+    t0 = time.time()
+    model_bytes = build_augmented(spec)
+    logger.info("Pipeline built in %.2fs. Size: %.2f MB", time.time() - t0, len(model_bytes) / (1024 * 1024))
+    local_onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    local_onnx_path.write_bytes(model_bytes)
+    return model_bytes
+
+
+def load_model(model_bytes: bytes) -> None:
+    import oracledb
 
     logger.info("Connecting to Oracle Database...")
-    wallet_dir = os.environ.get("OCI_WALLET_LOCATION")
-    if not wallet_dir:
-        for candidate in (Path.home() / ".oci" / "wallet", Path.home() / ".hermes" / "oracle_wallet"):
-            if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
-                wallet_dir = str(candidate)
-                break
-    kwargs = {
-        "user": os.environ["OCI_DB_USER"],
-        "password": os.environ["OCI_DB_PASSWORD"],
-        "dsn": os.environ["OCI_DB_DSN"],
-    }
-    if wallet_dir:
-        kwargs["config_dir"] = wallet_dir
-        kwargs["wallet_location"] = wallet_dir
-        pwd = os.environ.get("OCI_WALLET_PASSWORD")
-        if pwd:
-            kwargs["wallet_password"] = pwd
-    conn = oracledb.connect(**kwargs)
+    conn = oracledb.connect(**common.connect_kwargs())
     cur = conn.cursor()
     for stmt in (
         "ALTER SESSION SET parallel_degree_policy = MANUAL",
@@ -121,10 +117,13 @@ def main():
     })
     logger.info("Wrote file to DATA_PUMP_DIR in %.2fs", time.time() - t0)
 
-    # Verify file exists in DATA_PUMP_DIR
-    cur.execute("SELECT /*+ NO_PARALLEL */ object_name, bytes FROM DBMS_CLOUD.LIST_FILES('DATA_PUMP_DIR') WHERE object_name = :fn", [FILE_NAME])
-    row = cur.fetchone()
-    logger.info("File in DATA_PUMP_DIR: %s", row)
+    # Report the staged file. DBMS_CLOUD exists on Autonomous Database only;
+    # elsewhere the load below is the check.
+    try:
+        cur.execute("SELECT /*+ NO_PARALLEL */ object_name, bytes FROM DBMS_CLOUD.LIST_FILES('DATA_PUMP_DIR') WHERE object_name = :fn", [FILE_NAME])
+        logger.info("File in DATA_PUMP_DIR: %s", cur.fetchone())
+    except Exception as e:
+        logger.info("Could not list DATA_PUMP_DIR (%s); continuing", str(e).splitlines()[0])
 
     # Step 2: Drop existing model if present
     logger.info("Checking if model %s already exists...", MODEL_NAME)
@@ -170,10 +169,22 @@ def main():
     logger.info("SUCCESS! Model %s is loaded and working with 768 dimensions!", MODEL_NAME)
     conn.close()
 
-if __name__ == "__main__":
-    import argparse
 
-    _ap = argparse.ArgumentParser(description=__doc__)
-    _ap.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
-    load_env(_ap.parse_args().env_file)
-    main()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    parser.add_argument("--env-file", default=None, help="load OCI_DB_* settings from this KEY=VALUE file (default: environment only)")
+    args = parser.parse_args(argv)
+    load_env(args.env_file)
+    try:
+        model_bytes = build_model()
+    except ImportError as e:
+        if (e.name or "").split(".")[0] != "onnx2oracle":
+            raise
+        print(_MISSING_ONNX2ORACLE, file=sys.stderr)
+        return 2
+    load_model(model_bytes)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

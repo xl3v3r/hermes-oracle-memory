@@ -138,12 +138,30 @@ class TestForeignCopiesJudgedByProfileRoots(unittest.TestCase):
         lib = MagicMock(return_value={})
         prov = MagicMock()
         prov.is_available.return_value = True
+        plugin = MagicMock()
+        plugin.OracleMemoryProvider.return_value = prov
         with patch.object(sys, "argv", ["sync_skills.py", "--replace-foreign"]), \
-                patch.object(oracle_plugin, "OracleMemoryProvider", return_value=prov), \
+                patch.object(ss._load_common(), "load_plugin", return_value=plugin), \
                 patch.object(ss, "sync_skills_library", lib), \
                 patch("builtins.print"):
             ss.main()
         self.assertIs(lib.call_args.kwargs["replace_foreign"], True)
+
+    def test_cli_table_option_reaches_the_provider(self):
+        # The provider reads the table from the settings in initialize(), so
+        # an attribute set before that call was overwritten.
+        seen = {}
+        prov = MagicMock()
+        prov.is_available.return_value = True
+        prov.initialize.side_effect = lambda *a, **k: seen.setdefault("table", os.environ.get("HERMES_ORACLE_TABLE"))
+        plugin = MagicMock()
+        plugin.OracleMemoryProvider.return_value = prov
+        with patch.object(sys, "argv", ["sync_skills.py", "--table", "OTHER_TABLE"]), \
+                patch.object(ss._load_common(), "load_plugin", return_value=plugin), \
+                patch.object(ss, "sync_skills_library", MagicMock(return_value={})), \
+                patch.dict(os.environ), patch("builtins.print"):
+            ss.main()
+        self.assertEqual(seen["table"], "OTHER_TABLE")
 
 
 class TestLifecycleLookup(unittest.TestCase):
@@ -188,7 +206,9 @@ class TestLifecycleLookup(unittest.TestCase):
 
 class TestLoopSafeWalk(unittest.TestCase):
     def _looped_root(self, td):
-        root = Path(td) / "skills"
+        # Resolved: discovery reports paths under the resolved root, and the
+        # temp dir is itself a link on macOS (/var -> /private/var).
+        root = Path(td).resolve() / "skills"
         f = _write_skill(root / "a", "inner", "inner")
         _link_in_tmp(root / "a" / "loop", root / "a")
         _link_in_tmp(root / "back", root)

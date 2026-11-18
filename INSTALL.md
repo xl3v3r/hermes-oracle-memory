@@ -30,7 +30,7 @@ This guide provides complete instructions for installing, configuring, and verif
 The provider delivers enterprise-grade integration across Oracle Cloud Infrastructure:
 
 - **Direct OCI Autonomous AI Database 26ai Vector Capabilities**:
-  - Native 768-dimensional `VECTOR(768, FLOAT32)` storage, in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`, and IVF / HNSW In-Memory Neighbor Graph indexing.
+  - Native 768-dimensional `VECTOR(768, FLOAT32)` storage, in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`, and an in-memory HNSW vector index (`ORGANIZATION INMEMORY NEIGHBOR GRAPH`).
 - **Native OCI GenAI Service Fallback**:
   - Automatic fallback to OCI Generative AI inference (`cohere.embed-v4.0`) via native OCI Instance Principals and API signing when running on OCI Compute or container instances—no static API keys required.
 - **Connection and Signer Caching Across Agent Sessions**:
@@ -109,17 +109,23 @@ hermes config set memory.provider oracle
 
 To achieve **zero external embedding API costs**, configure in-database ONNX inference directly on Oracle ADB 26ai:
 
-1. Export and load `BAAI/bge-base-en-v1.5` into your database:
+1. Install the prerequisite of the setup script. The ONNX pipeline (tokenizer, model, pooling and normalisation in one graph) is built by [onnx2oracle](https://github.com/jasperan/onnx2oracle), a separate project by jasperan. It is not part of this plugin and is needed only for this step:
+   ```bash
+   python -m pip install onnx2oracle
+   ```
+   It brings `onnx`, `onnxruntime`, `onnxruntime-extensions` and `transformers`, so install it in the environment you run the script from, not necessarily the Hermes one. Without it the script stops and says what to install.
+
+2. Export and load `BAAI/bge-base-en-v1.5` into your database:
    ```bash
    python3 scripts/setup_onnx_model.py
    ```
    The helper scripts read `OCI_DB_*` / `OCI_WALLET_*` from the environment. To use the settings from your Hermes env file (Step 4), pass it explicitly: `python3 scripts/setup_onnx_model.py --env-file <path to the env file>`.
 
-   This exports the model with dynamic token slicing (bounded to 512 tokens to avoid `ORA-54401`), stages it via `DATA_PUMP_DIR`, and registers it with `DBMS_VECTOR.LOAD_ONNX_MODEL`.
+   This exports the model with dynamic token slicing (bounded to 512 tokens to avoid `ORA-54401`), stages it via `DATA_PUMP_DIR`, and registers it with `DBMS_VECTOR.LOAD_ONNX_MODEL`. The first run downloads the model from Hugging Face.
 
-2. Specify the ONNX model name in your environment:
+3. Specify the ONNX model name in your environment:
    ```bash
-   echo 'HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5' >> ~/.hermes/.env
+   echo 'HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5' >> "${HERMES_HOME:-$HOME/.hermes}/.env"
    ```
 
 ---
@@ -168,23 +174,62 @@ Verify that the database connection, table initialization, and embedding pipelin
 ### 1. Run Provider Verification Script
 
 ```bash
+export OCI_DB_USER=... OCI_DB_PASSWORD=... OCI_DB_DSN=...
 python3 tests/verify_provider.py
 ```
 
-The script verifies:
-- Oracle ADB 26ai database connection and thin/thick mode initialization.
-- Table schema setup (`HERMES_AGENT_MEMORY`) with `VECTOR(768, FLOAT32)` and Oracle Text search indexes.
-- In-database ONNX inference (`VECTOR_EMBEDDING`) and fallback routing.
-- Storage and hybrid recall of test memories.
-- Skill retrieval reachability: a skill query must return `[skill_ingest]` rows (guards against role-priority starvation of the skill index).
+The script reads the `OCI_*` settings from the environment. To take them from a file instead, add `--env-file <path>` (for example `--env-file "$HERMES_HOME/.env"`); it reads no file on its own.
+
+It starts the provider and checks that:
+- the provider connects and the memory table is usable (an empty schema is bootstrapped first);
+- the in-database ONNX model returns a 768-dimension vector;
+- a memory can be stored, read back, found by vector, hybrid and text search, updated and deleted.
+
+Every row the run writes carries a session id unique to that run (`verify-<random>`), and the run deletes them all before it exits, also when a check fails. It asserts nothing about rows that were already in the table, so it gives the same result on an empty database and on one in use.
+
+| Option | Effect |
+|---|---|
+| `--env-file <path>` | Read `KEY=VALUE` settings from a file. Values already in the environment win. |
+| `--table <name>` | Use another table for this run, for example a scratch table. |
+| `--text-wait <seconds>` | How long to wait for a new row to appear in text search (default 30). |
+| `--strict` | Fail if the row is not in text search within that time (otherwise a warning). |
+
+Exit status: `0` every check passed, `1` a check failed, `2` the script could not run (settings missing).
+
+> **Rows left by the script of 1.1.1.5 and older.** That version stored three rows per run under the session id `test-verification-session` and never removed them. They are ordinary facts, so they can be recalled. To remove them, call `oracle_delete(session_id="test-verification-session")` from a Hermes session. If it reports more than 200 rows, repeat the call with the `max_rows` value it names.
+
+The same check runs under pytest when you opt in. Without `HERMES_ORACLE_LIVE_TESTS=1` it is skipped, whatever credentials are in the environment:
+
+```bash
+HERMES_ORACLE_LIVE_TESTS=1 python -m pytest -q tests/test_provider_live.py
+```
+
+#### Against a local Oracle AI Database Free container
+
+`tests/smoke_db/` holds what the CI job uses to run the script against an empty database: a tiny embedding model (about 11 KB, 768 dimensions, for testing only) and a script that creates an empty schema user and loads the model.
+
+```bash
+python -m pip install oracledb onnx
+docker run -d --name oracle-free -p 127.0.0.1:1521:1521 -e ORACLE_PWD=<admin password> \
+  container-registry.oracle.com/database/free:23.26.4.0-lite
+
+export OCI_DB_DSN=127.0.0.1:1521/FREEPDB1 OCI_DB_USER=HERMES_SMOKE_USER OCI_DB_PASSWORD=<user password>
+export HERMES_ORACLE_ONNX_MODEL=HERMES_SMOKE_EMBED
+SMOKE_DB_ADMIN_PASSWORD=<admin password> python tests/smoke_db/prepare_database.py
+python tests/verify_provider.py
+```
+
+`prepare_database.py` refuses a database that is not on the local machine and never drops a user or a table. The schema user it creates has `CREATE SESSION`, `CREATE TABLE`, `CREATE MINING MODEL` (to load the model) and a quota on its tablespace. The smoke test passes with these privileges alone.
 
 ### 2. Run Test Suite
 
-The unit tests need no database. Run them with `HOME` pointed at a scratch directory so nothing can reach your real `~/.hermes`:
+The unit tests need no database. Run them with `HOME` pointed at a scratch directory and `HERMES_HOME` unset, so nothing can reach your real `~/.hermes`:
 
 ```bash
-HOME="$(mktemp -d)" python -m pytest -q
+env -u HERMES_HOME HOME="$(mktemp -d)" python -m pytest -q
 ```
+
+The suite also drops an inherited `HERMES_HOME` when it starts (the Hermes Desktop shell exports one), so a run without `env -u HERMES_HOME` no longer fails.
 
 > **Warning:** do not run the test suite of v1.1.1.2 or older on a host with an installed plugin. Its drift test copied the checkout over `~/.hermes/plugins/oracle` and every profile copy. From v1.1.1.3 the drift check is read-only and opt-in: `HERMES_ORACLE_DRIFT_DIR=~/.hermes/plugins/oracle python -m pytest -q -k zero_drift`.
 
@@ -206,20 +251,25 @@ hermes chat -q "Where is my preferred deployment target?"
 
 ---
 
-## Step 6: Upgrades & Legacy Data Backfill
+## Step 6: Upgrades & Embedding Maintenance
 
-If upgrading from an earlier version (e.g. 1536-dimensional vectors or null embeddings), run the parallel backfill utility:
+`scripts/reembed_embeddings.py` checks and repairs the embeddings in the memory table. It uses the in-database model only; no text leaves the database.
 
 ```bash
-python3 scripts/backfill_embeddings.py --workers 4 --batch-size 32
+python3 scripts/reembed_embeddings.py --mode verify     # read-only: how many rows match the model
+python3 scripts/reembed_embeddings.py --mode nulls      # embed rows that have no embedding or no model stamp
+python3 scripts/reembed_embeddings.py --mode stale      # recompute and rewrite only rows whose vector differs
+python3 scripts/reembed_embeddings.py --mode reembed    # rewrite every row (after changing the model)
 ```
 
 (Export the `OCI_*` settings first, or add `--env-file <path to the env file>`; no script reads the Hermes env file on its own.)
 
-The backfill utility:
-- Multithreads batch processing across database sessions.
-- Automatically tracks checkpoints in `backfills/backfill_progress_768.json`.
-- Refreshes vector indexes and table optimizer statistics upon completion (`DBMS_STATS.GATHER_TABLE_STATS`).
+- The provider embeds rows as it writes them and backfills the rare row it had to store without an embedding, so `--mode nulls` is needed only after an import that bypassed the provider, or after a long model outage.
+- `--workers` sets the number of database sessions (default 3). `--mode nulls` always runs on one.
+- `--checkpoint <file> --resume` makes a long run resumable.
+- `scripts/audit_embeddings.py` is a quick read-only check for cron: one line when everything is on the expected model.
+
+> **Removed in 1.1.2:** `scripts/backfill_embeddings.py`. It required an `OPENROUTER_API_KEY` and sent row text to an external embedding API when the in-database model failed. Use `--mode nulls` above instead.
 
 ---
 
@@ -233,11 +283,56 @@ In enterprise environments where the database schema is managed via CI/CD migrat
 HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING
 ```
 
-When set, the provider skips runtime DDL attempts (`_ensure_schema()`) and verifies that required tables and indexes exist (`_verify_schema()`).
+When set, the provider runs no DDL at start-up. It checks that the table can be queried and looks up its indexes (`_verify_schema()`):
+
+- A text index in the `FAILED` state stops the provider with an error, because such an index rejects every write (`ORA-29861`).
+- A missing text or vector index is logged as a warning and listed under `schema_warnings` in `health()`. Search keeps working within the limits the warning names.
+
+Create the schema with the statements the bootstrap runs. Replace `HERMES_AGENT_MEMORY` if `HERMES_ORACLE_TABLE` names another table:
+
+```sql
+CREATE TABLE HERMES_AGENT_MEMORY (
+    memory_id VARCHAR2(128) PRIMARY KEY,
+    session_id VARCHAR2(128),
+    agent_id VARCHAR2(64),
+    role VARCHAR2(64),
+    content CLOB,
+    embedding VECTOR(768, FLOAT32),
+    created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
+    target VARCHAR2(32) DEFAULT 'memory',
+    metadata JSON,
+    content_txt VARCHAR2(4000),
+    embedding_model VARCHAR2(64),
+    embedding_updated_at TIMESTAMP(6),
+    turn_index NUMBER,
+    chunk_index NUMBER,
+    turn_id VARCHAR2(64),
+    conv_ref VARCHAR2(512)
+);
+
+CREATE SEARCH INDEX HERMES_AGENT_MEMORY_TXT_IDX ON HERMES_AGENT_MEMORY (content);
+
+CREATE VECTOR INDEX HERMES_AGENT_MEMORY_VEC_IDX ON HERMES_AGENT_MEMORY (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH;
+```
+
+- **Text index.** A plain Oracle Text search index on `content`. The database maintains it in the background, so a new row appears in text search a few seconds after it is committed. Vector search and `oracle_get` see the row at once.
+- **Vector index.** An in-memory HNSW index. It needs the vector pool (`vector_memory_size`); without one the statement fails with `ORA-51962` and vector search compares every row, which is acceptable for a small table. An IVF index (`ORGANIZATION NEIGHBOR PARTITIONS`) needs no vector pool and works with the plugin as well.
+- **JSON search index.** Not required. The bootstrap does not create one on `metadata`.
+
+#### Text index left `FAILED` by 1.1.1 to 1.1.1.5
+
+Those releases created the text index with `FOR JSON` on the `content` CLOB. On an empty schema that statement fails and leaves the index in the `FAILED` state, and every write is then rejected with `ORA-29861`. From 1.1.2 the bootstrap drops that index and creates it again. Under `REQUIRE_EXISTING` it runs no DDL, so the provider stops with an error that names the two statements to run:
+
+```sql
+DROP INDEX HERMES_AGENT_MEMORY_TXT_IDX FORCE;
+CREATE SEARCH INDEX HERMES_AGENT_MEMORY_TXT_IDX ON HERMES_AGENT_MEMORY (content);
+```
 
 ### Prompt Injection Hardening
 
-Prefetched memories injected into prompt context are isolated inside `<retrieved_memory id="..." target="..." score="...">` XML boundary tags with metadata attribute escaping (`html.escape`) and ASCII control-character stripping (`[\x00-\x08\x0b-\x1f\x7f]`).
+Prefetched memories injected into prompt context are isolated inside `<retrieved_memory id="..." target="..." score="...">` XML boundary tags. The attributes and the body are escaped (`html.escape`), and ASCII control characters (`[\x00-\x08\x0b-\x1f\x7f]`) and line breaks are removed, so stored text cannot close the tag or open another one.
+
+The tag marks where recalled text begins and ends. It does not make that text trustworthy: anything stored in the table can be recalled, so treat recalled text as data, not as instructions.
 
 ### Credential Protection
 

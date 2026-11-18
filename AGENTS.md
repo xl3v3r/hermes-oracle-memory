@@ -7,7 +7,7 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ## 1. Project Overview
 
 `hermes-oracle-memory` is a high-performance external memory provider plugin for **Hermes Agent**. It integrates with **Oracle Autonomous AI Database 26ai (ADB)** to provide:
-- Hybrid memory recall combining `VECTOR(768, FLOAT32)` IVF neighbor-partition search and Oracle Text `CONTAINS` index.
+- Hybrid memory recall combining `VECTOR(768, FLOAT32)` search over an in-memory HNSW index and an Oracle Text `CONTAINS` index.
 - In-database ONNX embeddings (`BGE_BASE_EN_V1_5`) strictly in-database via ONNX runtime (no external fallback).
 - In-database text chunking (`DBMS_VECTOR.UTL_TO_CHUNKS`).
 - Tool execution for Hermes memory recall (`oracle_search`, `oracle_add`, `oracle_update`, `oracle_delete`, `oracle_chunk`).
@@ -22,9 +22,9 @@ Welcome! This file provides context, coding conventions, testing procedures, and
 ├── LICENSE                 # Business Source License 1.1
 ├── MANIFEST.in             # Source distribution manifest
 ├── README.md               # Project documentation and usage guide
-├── CHANGELOG.md            # Release changelog (v1.1.1.5)
-├── RELEASE_NOTES_1.1.1.5.md  # Release notes for v1.1.1.5 (only the current release's notes are kept)
-├── VERSION                 # Canonical project version file (1.1.1.5)
+├── CHANGELOG.md            # Release changelog (v1.1.2)
+├── RELEASE_NOTES_1.1.2.md  # Release notes for v1.1.2 (only the current release's notes are kept)
+├── VERSION                 # Canonical project version file (1.1.2)
 ├── __init__.py             # Core plugin implementation and OracleMemoryProvider class
 ├── plugin.yaml             # Hermes plugin manifest and metadata
 ├── pyproject.toml          # Python build, dependencies, and packaging configuration

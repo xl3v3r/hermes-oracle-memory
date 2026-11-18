@@ -1,3 +1,13 @@
+## [1.1.2] - 2026-11-18
+
+- **Per-user memory scoping**: scope_id column, HERMES_ORACLE_SCOPE_MODE, GSK validation, skill sync gating (see RELEASE_NOTES_1.1.2.md)
+- **Issue #16 fixed**: No more cross-user memory leakage
+- **Issue #17 implemented**: Per-user memory scoping for multi-user frontends
+- **Issue #18 fixed**: Text index DDL failure handling improved
+- **Issue #25 fixed**: Wheel now includes scripts/ directory
+- **Issue #14 resolved**: Skill identity follow-ups with shared host id and skipped_foreign override
+- **Version bump**: 1.1.1.5 → 1.1.2
+
 # Changelog — `hermes-oracle-memory`
 
 All notable changes to this project are documented in this file.

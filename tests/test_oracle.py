@@ -217,7 +217,7 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.return_value = mock_conn
         mock_cur.fetchall.return_value = [(0, first), (1, second)]
 
-        result = provider._embed_many(["duplicate", "duplicate", "unique"])
+        result = [v for v, _m in provider._embed_many_tagged(["duplicate", "duplicate", "unique"])]
 
         self.assertEqual(result, [first, first, second])
         self.assertEqual(mock_cur.execute.call_count, 1)
@@ -232,9 +232,9 @@ class TestOraclePlugin(unittest.TestCase):
         provider._pool.acquire.side_effect = Exception("ORA-40284: model does not exist")
 
         with self.assertRaises(RuntimeError):
-            provider._embed_many(["first"])
+            provider._embed_many_tagged(["first"])
         with self.assertRaises(RuntimeError):
-            provider._embed_many(["second"])
+            provider._embed_many_tagged(["second"])
 
         self.assertEqual(provider._pool.acquire.call_count, 1)
         self.assertTrue(provider._onnx_in_cooldown())
@@ -253,7 +253,7 @@ class TestOraclePlugin(unittest.TestCase):
             provider._pool = MagicMock()
             provider._pool.acquire.side_effect = Exception(err)
             with self.assertRaises(RuntimeError):
-                provider._embed_many(["x"])
+                provider._embed_many_tagged(["x"])
             self.assertFalse(provider._onnx_in_cooldown(), err)
 
     def test_search_retries_once_on_session_error_and_drops_connection(self):
@@ -349,19 +349,23 @@ class TestOraclePlugin(unittest.TestCase):
     def test_single_result_skips_rerank(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
-        provider._onnx_model = ""
-        provider._fetch_rows = MagicMock(
-            return_value=[{"memory_id": "m1", "score": 1.0}]
-        )
+        provider._onnx_model = "BGE_BASE_EN_V1_5"
+        provider._pool = MagicMock()
+        row = {"memory_id": "m1", "score": 1.0, "content": "a single durable fact about the setup"}
+        provider._execute_hybrid_search = MagicMock(return_value=[dict(row)])
         provider._rerank = MagicMock(side_effect=AssertionError("unexpected rerank"))
-        row = {"memory_id": "m1", "score": 1.0}
 
-        result = provider._execute_hybrid_search(
-            MagicMock(), "q", [0.1] * 768, "q", 1, 1, "", "any"
-        )
+        result = provider._search("q", top_k=5, mode="hybrid", rerank=True)
 
-        self.assertEqual(result, [row])
+        self.assertEqual([r["memory_id"] for r in result], ["m1"])
         provider._rerank.assert_not_called()
+
+    def test_hybrid_search_without_a_model_is_refused(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._table = "HERMES_AGENT_MEMORY"
+        provider._onnx_model = ""
+        with self.assertRaisesRegex(RuntimeError, "ONNX model is not configured"):
+            provider._execute_hybrid_search(MagicMock(), "q", "q", 1, "any")
 
     def test_execute_hybrid_search_oracle_text_error_fallback(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -385,13 +389,9 @@ class TestOraclePlugin(unittest.TestCase):
         results = provider._execute_hybrid_search(
             mock_cur,
             query="test query with reserved words",
-            vec=None,
             contains_q="{test} ACCUM {query}",
-            top_k=5,
             fetch_k=10,
-            tgt_sql="",
             tgt="any",
-            rerank=False,
         )
 
         # Oracle Text errors must NOT trigger ONNX cooldown
@@ -432,13 +432,9 @@ class TestOraclePlugin(unittest.TestCase):
             results = provider._execute_hybrid_search(
                 mock_cur,
                 query="query",
-                vec=None,
                 contains_q="{query}",
-                top_k=5,
                 fetch_k=10,
-                tgt_sql="",
                 tgt="any",
-                rerank=False,
             )
 
             provider._onnx_mark_failed.assert_not_called()
@@ -459,11 +455,8 @@ class TestOraclePlugin(unittest.TestCase):
             provider._execute_hybrid_search(
                 mock_cur,
                 query="test query",
-                vec=None,
                 contains_q="{test}",
-                top_k=5,
                 fetch_k=10,
-                tgt_sql="",
                 tgt="any",
             )
 
@@ -477,13 +470,13 @@ class TestOraclePlugin(unittest.TestCase):
 
         self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", provider._JUNK)
 
-        txt_sql, _ = provider._build_text_search_sql("query", 8, "", "any")
+        txt_sql, _ = provider._build_text_search_sql("query", 8, "any")
         self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", txt_sql)
 
-        vec_sql, _ = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True)
+        vec_sql, _ = provider._build_vector_search_sql("query", 8, "any")
         self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", vec_sql)
 
-        hybrid_sql, _ = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True)
+        hybrid_sql, _ = provider._build_hybrid_search_sql("query", "query", 8, "any")
         self.assertIn("NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session')", hybrid_sql)
 
     def test_search_sql_role_and_recency_ordering(self):
@@ -499,19 +492,16 @@ class TestOraclePlugin(unittest.TestCase):
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
 
-        txt_sql, _ = provider._build_text_search_sql("query", 8, "", "any")
+        txt_sql, _ = provider._build_text_search_sql("query", 8, "any")
         self.assertIn("ORDER BY txt_score DESC, created_at DESC", txt_sql)
         self.assertNotIn("CASE WHEN role", txt_sql)
 
-        vec_sql_onnx, _ = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True)
+        vec_sql_onnx, _ = provider._build_vector_search_sql("query", 8, "any")
         self.assertIn("ORDER BY distance ASC, created_at DESC", vec_sql_onnx)
         self.assertNotIn("CASE WHEN role", vec_sql_onnx)
 
-        vec_sql_ext, _ = provider._build_vector_search_sql("query", [0.1] * 768, 8, "", "any", use_onnx=False)
-        self.assertIn("ORDER BY distance ASC, created_at DESC", vec_sql_ext)
-        self.assertNotIn("CASE WHEN role", vec_sql_ext)
 
-        hybrid_sql_onnx, _ = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True)
+        hybrid_sql_onnx, _ = provider._build_hybrid_search_sql("query", "query", 8, "any")
         self.assertIn("ORDER BY distance ASC, created_at DESC", hybrid_sql_onnx)
         self.assertIn("ORDER BY txt_score DESC, created_at DESC", hybrid_sql_onnx)
         self.assertNotIn("CASE WHEN role", hybrid_sql_onnx)
@@ -537,13 +527,9 @@ class TestOraclePlugin(unittest.TestCase):
         results = provider._execute_hybrid_search(
             mock_cur,
             query="HANDOFF",
-            vec=None,
             contains_q="{HANDOFF}",
-            top_k=5,
             fetch_k=10,
-            tgt_sql="",
             tgt="any",
-            rerank=False,
         )
 
         for r in results:
@@ -763,7 +749,7 @@ class TestOraclePlugin(unittest.TestCase):
         vec = array.array("f", [0.1] * 768)
         mock_cur.fetchall.return_value = [(0, vec), (1, vec), (2, vec)]
 
-        result = provider._embed_many(["alpha", "beta", "gamma"])
+        result = [v for v, _m in provider._embed_many_tagged(["alpha", "beta", "gamma"])]
 
         self.assertEqual(len(result), 3)
         self.assertTrue(all(v is not None for v in result))
@@ -854,7 +840,7 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual([m for _v, m in result], ["BGE_BASE_EN_V1_5"] * 2)
         # the untagged view stays compatible with search-only callers
         mock_cur.fetchall.return_value = [(0, fake_vec)]
-        self.assertEqual(provider._embed_many(["hello"]), [fake_vec])
+        self.assertEqual([v for v, _m in provider._embed_many_tagged(["hello"])], [fake_vec])
 
     def test_embed_cache_preserves_provenance(self):
         import array
@@ -1133,20 +1119,16 @@ class TestOraclePlugin(unittest.TestCase):
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
 
-        txt_sql, _ = provider._build_text_search_sql("query", 8, "", "any")
+        txt_sql, _ = provider._build_text_search_sql("query", 8, "any")
         self.assertIn("/*+ NO_PARALLEL */", txt_sql)
 
-        vec_sql_onnx, _ = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True)
+        vec_sql_onnx, _ = provider._build_vector_search_sql("query", 8, "any")
         self.assertIn("/*+ NO_PARALLEL */", vec_sql_onnx)
 
-        vec_sql_ext, _ = provider._build_vector_search_sql("query", [0.1] * 768, 8, "", "any", use_onnx=False)
-        self.assertIn("/*+ NO_PARALLEL */", vec_sql_ext)
 
-        hybrid_sql_onnx, _ = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True)
+        hybrid_sql_onnx, _ = provider._build_hybrid_search_sql("query", "query", 8, "any")
         self.assertIn("/*+ NO_PARALLEL */", hybrid_sql_onnx)
 
-        hybrid_sql_ext, _ = provider._build_hybrid_search_sql("query", [0.1] * 768, "query", 8, "", "any", use_onnx=False)
-        self.assertIn("/*+ NO_PARALLEL */", hybrid_sql_ext)
 
     def test_dml_queries_contain_no_parallel_hints(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -1232,11 +1214,20 @@ class TestOraclePlugin(unittest.TestCase):
         sql, _ = mock_cur.executemany.call_args[0]
         self.assertIn("/*+ NO_PARALLEL */", sql)
 
-        # Test _insert_many fallback
-        provider._onnx_model = None
-        provider._insert_many([{"memory_id": "m2", "content": "text 2", "embedding": [0.1] * 768}])
-        sql, _ = mock_cur.executemany.call_args[0]
+        # Test _insert_many during an ONNX cooldown (NULL embedding, backfilled later)
+        with patch.object(provider, "_onnx_in_cooldown", return_value=True), \
+                patch.object(provider, "_queue_embed_backfill") as queued:
+            provider._insert_many([{"memory_id": "m2", "content": "text 2"}])
+        sql, binds_list = mock_cur.executemany.call_args[0]
         self.assertIn("/*+ NO_PARALLEL */", sql)
+        self.assertNotIn("VECTOR_EMBEDDING", sql)
+        self.assertEqual(len(binds_list[0]), 12)
+        queued.assert_called_once_with("m2", "text 2")
+
+        # Without a model there is nothing to embed with, and no external fallback
+        provider._onnx_model = None
+        with self.assertRaises(oracle_plugin._PolicyError):
+            provider._insert_many([{"memory_id": "m3", "content": "text 3"}])
 
         # Test _chunk_text
         provider._chunk_text("Some text to chunk into pieces", 100, 10)
@@ -1275,29 +1266,29 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(res_ok["session_id"], "thread-456")
         self.assertEqual(res_ok["deleted_count"], 5)
         sql, binds = mock_cur.execute.call_args[0]
-        self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY WHERE session_id = :1", sql)
-        self.assertEqual(binds, ("thread-456",))
+        self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY WHERE session_id = :sid", sql)
+        self.assertEqual(binds, {"sid": "thread-456"})
 
     def test_oracle_search_scoped_filters(self):
         provider = oracle_plugin.OracleMemoryProvider()
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
 
-        txt_sql, txt_binds = provider._build_text_search_sql("query", 8, "", "any", session_id="s1", agent_id="a1")
+        txt_sql, txt_binds = provider._build_text_search_sql("query", 8, "any", session_id="s1", agent_id="a1")
         self.assertIn("AND session_id = :sid", txt_sql)
         self.assertIn("AND agent_id = :aid", txt_sql)
         self.assertIn(provider._JUNK.strip(), txt_sql)
         self.assertEqual(txt_binds["sid"], "s1")
         self.assertEqual(txt_binds["aid"], "a1")
 
-        vec_sql, vec_binds = provider._build_vector_search_sql("query", None, 8, "", "any", use_onnx=True, session_id="s1", agent_id="a1")
+        vec_sql, vec_binds = provider._build_vector_search_sql("query", 8, "any", session_id="s1", agent_id="a1")
         self.assertIn("AND session_id = :sid", vec_sql)
         self.assertIn("AND agent_id = :aid", vec_sql)
         self.assertIn(provider._JUNK.strip(), vec_sql)
         self.assertEqual(vec_binds["sid"], "s1")
         self.assertEqual(vec_binds["aid"], "a1")
 
-        hybrid_sql, hybrid_binds = provider._build_hybrid_search_sql("query", None, "query", 8, "", "any", use_onnx=True, session_id="s1", agent_id="a1")
+        hybrid_sql, hybrid_binds = provider._build_hybrid_search_sql("query", "query", 8, "any", session_id="s1", agent_id="a1")
         self.assertIn("AND session_id = :sid", hybrid_sql)
         self.assertIn("AND agent_id = :aid", hybrid_sql)
         self.assertIn(provider._JUNK.strip(), hybrid_sql)
@@ -1351,13 +1342,9 @@ class TestOraclePlugin(unittest.TestCase):
         results = provider._execute_hybrid_search(
             mock_cur,
             query="test query in cooldown",
-            vec=None,
             contains_q="{test} ACCUM {query}",
-            top_k=5,
             fetch_k=10,
-            tgt_sql="",
             tgt="any",
-            rerank=False,
         )
 
         self.assertEqual(len(results), 1)
@@ -1819,11 +1806,8 @@ class TestOraclePlugin(unittest.TestCase):
             provider._execute_hybrid_search(
                 mock_cur,
                 query="overflow query",
-                vec=None,
                 contains_q="{overflow}",
-                top_k=5,
                 fetch_k=10,
-                tgt_sql="",
                 tgt="any",
             )
 
@@ -1862,13 +1846,9 @@ class TestOraclePlugin(unittest.TestCase):
         rows = provider._execute_hybrid_search(
             mock_cur,
             query="test query",
-            vec=None,
             contains_q="{test}",
-            top_k=5,
             fetch_k=10,
-            tgt_sql="",
             tgt="any",
-            rerank=False,
         )
 
         self.assertEqual(len(rows), 1)
@@ -1892,13 +1872,9 @@ class TestOraclePlugin(unittest.TestCase):
         rows = provider._execute_hybrid_search(
             mock_cur,
             query="test query",
-            vec=None,
             contains_q="{test}",
-            top_k=5,
             fetch_k=10,
-            tgt_sql="",
             tgt="any",
-            rerank=False,
         )
 
         self.assertEqual(len(rows), 1)
@@ -1961,14 +1937,12 @@ class TestOraclePlugin(unittest.TestCase):
         mock_pool = MagicMock()
         mock_pool.acquire.return_value.__enter__.return_value = mock_conn
 
-        with patch("scripts.rebuild_index.OracleMemoryProvider") as mock_prov_cls:
-            mock_prov = MagicMock()
-            mock_prov._table = "TEST_TBL"
-            mock_prov._pool = mock_pool
-            mock_prov.is_available.return_value = True
-            mock_prov_cls.return_value = mock_prov
-
+        mock_conn.cursor.return_value = mock_conn.cursor.return_value  # used as a context manager
+        with patch("scripts.rebuild_index.connect", return_value=mock_conn) as connect, \
+                patch.dict(os.environ, {"HERMES_ORACLE_TABLE": "FROM_ENV"}):
             res = rebuild_vector_index(table_name="TEST_TBL", gather_stats=True)
+            connect.assert_called_once()
+            mock_conn.close.assert_called_once()
             self.assertEqual(res["table"], "TEST_TBL")
             self.assertEqual(res["index"], "TEST_TBL_VEC_IDX")
             self.assertEqual(res["status"], "VALID")
@@ -1977,6 +1951,28 @@ class TestOraclePlugin(unittest.TestCase):
             self.assertTrue(any("DROP INDEX" in call for call in exec_calls))
             self.assertTrue(any("CREATE VECTOR INDEX" in call for call in exec_calls))
             self.assertTrue(any("GATHER_TABLE_STATS" in call for call in exec_calls))
+            self.assertIn(oracle_plugin.VECTOR_INDEX_DDL.format(index_name="TEST_TBL_VEC_IDX", table_name="TEST_TBL"),
+                          exec_calls)
+
+    def test_rebuild_index_table_comes_from_the_setting_when_not_given(self):
+        from scripts.rebuild_index import rebuild_vector_index
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("X", "VALID", "VECTOR")
+        with patch("scripts.rebuild_index.connect", return_value=conn), \
+                patch.dict(os.environ, {"HERMES_ORACLE_TABLE": "my_table"}):
+            res = rebuild_vector_index(gather_stats=False)
+        self.assertEqual((res["table"], res["index"]), ("MY_TABLE", "MY_TABLE_VEC_IDX"))
+
+    def test_rebuild_index_refuses_names_that_are_not_identifiers(self):
+        from scripts.rebuild_index import rebuild_vector_index
+        with patch("scripts.rebuild_index.connect", side_effect=AssertionError("must not connect")):
+            for kw in ({"table_name": "T; DROP TABLE X"}, {"table_name": "T", "index_name": "I ON T(x) --"},
+                       {"table_name": ""}, {"table_name": "1T"}):
+                if kw.get("table_name") == "":
+                    continue  # empty means "use the setting"
+                with self.assertRaises(ValueError, msg=str(kw)):
+                    rebuild_vector_index(**kw)
 
     def test_vector_search_in_cooldown_raises_runtime_error(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2041,11 +2037,8 @@ class TestOraclePlugin(unittest.TestCase):
             provider._execute_hybrid_search(
                 mock_cur,
                 query="slow query",
-                vec=None,
                 contains_q="{slow}",
-                top_k=5,
                 fetch_k=10,
-                tgt_sql="",
                 tgt="any",
             )
 
@@ -2086,11 +2079,8 @@ class TestOraclePlugin(unittest.TestCase):
             provider._execute_hybrid_search(
                 mock_cur,
                 query="cooldown slow query",
-                vec=None,
                 contains_q="{cooldown}",
-                top_k=5,
                 fetch_k=10,
-                tgt_sql="",
                 tgt="any",
             )
         self.assertIn(f"timed out after {oracle_plugin._SEARCH_TIMEOUT_SECS:.0f}s", str(ctx.exception))
@@ -2134,7 +2124,6 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertTrue(scripts_dir.is_dir())
         expected_op_scripts = {
             "audit_embeddings.py",
-            "backfill_embeddings.py",
             "import_conversations_ordered.py",
             "rebuild_index.py",
             "reembed_embeddings.py",
@@ -2301,11 +2290,9 @@ class TestOraclePlugin(unittest.TestCase):
         provider._table = "HERMES_AGENT_MEMORY"
         provider._onnx_model = "BGE_BASE_EN_V1_5"
         builders = {
-            "text": provider._build_text_search_sql("IRAC", 10, "", "any"),
-            "vector_onnx": provider._build_vector_search_sql("q", None, 10, "", "any", use_onnx=True),
-            "vector_fallback": provider._build_vector_search_sql("q", [0.0] * 768, 10, "", "any", use_onnx=False),
-            "hybrid_onnx": provider._build_hybrid_search_sql("q", None, "IRAC", 10, "", "any", use_onnx=True),
-            "hybrid_fallback": provider._build_hybrid_search_sql("q", [0.0] * 768, "IRAC", 10, "", "any", use_onnx=False),
+            "text": provider._build_text_search_sql("IRAC", 10, "any"),
+            "vector_onnx": provider._build_vector_search_sql("q", 10, "any"),
+            "hybrid_onnx": provider._build_hybrid_search_sql("q", "IRAC", 10, "any"),
         }
         for name, (sql, _binds) in builders.items():
             with self.subTest(builder=name):

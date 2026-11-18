@@ -65,6 +65,26 @@ class TestChunkSecretGuard(unittest.TestCase):
         for f in ("/private/etc/ssh/sshd_config", "/private/var/db/x", "/private/var/root/notes"):
             self.assertEqual(oracle_plugin._sensitive_path_reason(Path(f)), "system path", f)
 
+    def test_macos_data_volume_spelling_of_system_paths_refused(self):
+        # #21: /System/Volumes/Data/private/etc is /private/etc on APFS.
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True):
+            for f in ("/System/Volumes/Data/private/etc/hosts", "/System/Volumes/Data/private/var/db/x"):
+                self.assertEqual(oracle_plugin._sensitive_path_reason(Path(f)), "system path", f)
+                p, cur = _provider()
+                out = p.handle_tool_call("oracle_chunk", {"file_path": f})
+                self.assertIn("Refusing to read", out, f)
+                cur.execute.assert_not_called()
+
+    def test_macos_home_exemption_matches_either_spelling(self):
+        # A home under a system root stays exempt whichever way it is spelled.
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/private/var/root")), \
+                patch.dict(os.environ, {"HERMES_HOME": ""}):
+            r = oracle_plugin._sensitive_path_reason
+            self.assertEqual(r(Path("/private/var/root/notes.md")), "")
+            self.assertEqual(r(Path("/System/Volumes/Data/private/var/root/notes.md")), "")
+            self.assertEqual(r(Path("/System/Volumes/Data/private/var/db/x")), "system path")
+
     def test_home_and_hermes_home_exempt_from_system_roots_only(self):
         hh = Path("/var/lib/hermes").resolve()  # /private/var/lib/hermes on macOS
         with patch.object(oracle_plugin.Path, "home", return_value=Path("/root")), \
@@ -149,11 +169,104 @@ class TestDeleteGuard(unittest.TestCase):
 
     def test_session_purge_spares_skill_rows(self):
         p, cur = _provider(rowcount=3)
+        cur.fetchone.return_value = (3,)
         out = json.loads(p.handle_tool_call("oracle_delete", {"session_id": "thread-1"}))
         self.assertEqual(out["deleted_count"], 3)
-        sql, binds = cur.execute.call_args[0]
-        self.assertIn("role <> 'skill'", sql)
-        self.assertEqual(binds, ("thread-1",))
+        for call in cur.execute.call_args_list:
+            sql, binds = call[0]
+            self.assertIn("role <> 'skill'", sql)
+            self.assertEqual(binds, {"sid": "thread-1"})
+
+
+class TestSessionPurgeLimits(unittest.TestCase):
+    """#16: oracle_delete(session_id=...) removed every row of a session in
+    one call, with no dry run and no limit."""
+
+    def _purge(self, count, args, rowcount=None):
+        p, cur = _provider(rowcount=count if rowcount is None else rowcount)
+        cur.fetchone.return_value = (count,)
+        conn = p._pool.acquire.return_value
+        out = p.handle_tool_call("oracle_delete", dict({"session_id": "thread-1"}, **args))
+        stmts = [c[0][0].split()[0].upper() for c in cur.execute.call_args_list]
+        return out, stmts, conn
+
+    def test_dry_run_counts_and_deletes_nothing(self):
+        out, stmts, conn = self._purge(42, {"dry_run": True})
+        self.assertEqual(json.loads(out), {"result": "dry_run", "session_id": "thread-1", "would_delete": 42})
+        self.assertEqual(stmts, ["SELECT"])
+        conn.commit.assert_not_called()
+
+    def test_dry_run_text_values(self):
+        for raw in ("true", "1", "yes"):
+            out, stmts, _ = self._purge(1, {"dry_run": raw})
+            self.assertEqual(json.loads(out)["result"], "dry_run", raw)
+        out, stmts, _ = self._purge(1, {"dry_run": "false"})
+        self.assertEqual(json.loads(out)["result"], "thread_deleted")
+
+    def test_small_session_is_deleted_in_one_call(self):
+        out, stmts, conn = self._purge(200, {})
+        self.assertEqual(json.loads(out), {"result": "thread_deleted", "session_id": "thread-1", "deleted_count": 200})
+        self.assertEqual(stmts, ["SELECT", "DELETE"])
+        conn.commit.assert_called_once()
+
+    def test_session_over_the_default_limit_is_refused_untouched(self):
+        out, stmts, conn = self._purge(201, {})
+        self.assertIn("201 rows", out)
+        self.assertIn("Nothing was deleted", out)
+        self.assertIn("max_rows=201", out)
+        self.assertEqual(stmts, ["SELECT"])
+        conn.commit.assert_not_called()
+
+    def test_max_rows_allows_a_larger_purge(self):
+        out, stmts, conn = self._purge(1500, {"max_rows": 1500})
+        self.assertEqual(json.loads(out)["deleted_count"], 1500)
+        conn.commit.assert_called_once()
+
+    def test_max_rows_below_the_count_is_refused(self):
+        out, stmts, conn = self._purge(1500, {"max_rows": 1499})
+        self.assertIn("Nothing was deleted", out)
+        self.assertEqual(stmts, ["SELECT"])
+
+    def test_hard_ceiling_cannot_be_raised(self):
+        top = oracle_plugin._PURGE_HARD_MAX_ROWS
+        out, stmts, conn = self._purge(top + 1, {"max_rows": top + 1})
+        self.assertIn("max_rows must be between 1 and", out)
+        self.assertEqual(stmts, [])
+        out, stmts, conn = self._purge(top + 1, {"max_rows": top})
+        self.assertIn("Nothing was deleted", out)
+        self.assertNotIn("max_rows=", out)  # no call can delete that many
+        self.assertEqual(stmts, ["SELECT"])
+
+    def test_bad_max_rows_refused_before_any_statement(self):
+        for bad in (0, -5, "many", 1.5, True):
+            out, stmts, _ = self._purge(1, {"max_rows": bad})
+            self.assertIn("max_rows must be", out, bad)
+            self.assertEqual(stmts, [], bad)
+
+    def test_rows_added_between_count_and_delete_roll_the_delete_back(self):
+        out, stmts, conn = self._purge(200, {}, rowcount=205)
+        self.assertIn("Nothing was deleted", out)
+        self.assertIn("205 rows", out)
+        self.assertEqual(stmts, ["SELECT", "DELETE"])
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+
+    def test_empty_session_reports_zero(self):
+        out, stmts, conn = self._purge(0, {})
+        self.assertEqual(json.loads(out)["deleted_count"], 0)
+
+    def test_limits_do_not_apply_to_a_single_memory_id(self):
+        p, cur = _provider(rowcount=1)
+        out = json.loads(p.handle_tool_call("oracle_delete", {"memory_id": "fact_1", "dry_run": True}))
+        # dry_run is a session-purge option; one row by id is deleted as before.
+        self.assertEqual(out, {"result": "deleted", "memory_id": "fact_1"})
+
+    def test_schema_documents_the_options(self):
+        schema = next(s for s in oracle_plugin.TOOL_SCHEMAS if s["name"] == "oracle_delete")
+        props = schema["parameters"]["properties"]
+        self.assertEqual(props["dry_run"]["type"], "boolean")
+        self.assertEqual(props["max_rows"]["type"], "integer")
+        self.assertIn(str(oracle_plugin._PURGE_DEFAULT_MAX_ROWS), props["max_rows"]["description"])
 
 
 class TestSyncSkillsArgs(unittest.TestCase):
@@ -181,6 +294,91 @@ class TestSyncSkillsArgs(unittest.TestCase):
                 p, out = self._call({"dirs": [bad]})
                 self.assertIn("refusing to scan", out, bad)
                 p.sync_skills.assert_not_called()
+
+    # #21: the guard compared path prefixes and depth only, which assumes a
+    # Linux layout. A second path to the home directory (an APFS firmlink, a
+    # bind mount) or an ancestor of a system root got past it.
+
+    def test_alias_of_home_or_its_ancestors_refused_by_identity(self):
+        # /alias/data/users/u is the home directory under a second path that
+        # resolve() does not normalise.
+        same = {("/alias/data/users/u", "/srv/users/u"), ("/alias/data/users", "/srv/users")}
+
+        def samefile(a, b):
+            return (str(a), str(b)) in same or str(a) == str(b)
+
+        with patch.object(oracle_plugin.Path, "home", return_value=Path("/srv/users/u")), \
+                patch.object(oracle_plugin.os.path, "samefile", side_effect=samefile):
+            for bad in ("/alias/data/users/u", "/alias/data/users"):
+                p, out = self._call({"dirs": [bad]})
+                self.assertIn("refusing to scan", out, bad)
+                p.sync_skills.assert_not_called()
+            # A directory below the alias is a specific directory again.
+            p, out = self._call({"dirs": ["/alias/data/users/u/skills"]})
+            self.assertNotIn("refusing to scan", out)
+
+    def test_ancestor_of_a_system_root_refused(self):
+        # /private/var holds /private/var/db and /private/var/root (macOS).
+        # It is three parts deep, so the depth rule alone lets it through.
+        p, out = self._call({"dirs": ["/private/var"]})
+        self.assertIn("refusing to scan", out)
+        p.sync_skills.assert_not_called()
+
+    def test_macos_data_volume_paths_refused(self):
+        # /System/Volumes/Data is the APFS data volume, firmlinked into "/".
+        bad = (
+            "/System/Volumes/Data",                # the whole data volume
+            "/System/Volumes",                     # an ancestor of it
+            "/System/Volumes/Data/home",           # /home
+            "/System/Volumes/Data/Users",          # a parent of the home dir
+            "/System/Volumes/Data/Users/u",        # the home dir
+            "/System/Volumes/Data/Users/u/.ssh",   # credentials dir
+            "/System/Volumes/Data/private/etc",    # /etc
+            "/System/Volumes/Data/private/var",    # holds /private/var/db
+        )
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/Users/u")):
+            for d in bad:
+                p, out = self._call({"dirs": [d]})
+                self.assertIn("refusing to scan", out, d)
+                p.sync_skills.assert_not_called()
+            for ok in ("/System/Volumes/Data/Users/u/.hermes/skills", "/Users/u/.hermes/skills"):
+                p, out = self._call({"dirs": [ok]})
+                self.assertNotIn("refusing to scan", out, ok)
+
+    def test_macos_home_given_under_the_data_volume(self):
+        # HOME itself may be spelled with the data-volume prefix.
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/System/Volumes/Data/Users/u")):
+            for d in ("/Users/u", "/Users", "/System/Volumes/Data/Users/u"):
+                p, out = self._call({"dirs": [d]})
+                self.assertIn("refusing to scan", out, d)
+
+    def test_data_volume_prefix_means_nothing_off_macos(self):
+        with patch.object(oracle_plugin, "_IS_DARWIN", False, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/home/u")):
+            p, out = self._call({"dirs": ["/System/Volumes/Data/home/u/skills"]})
+            self.assertNotIn("refusing to scan", out)
+
+    def test_accepted_dir_is_passed_on_as_given(self):
+        # The data-volume prefix is dropped for the checks only: the two
+        # spellings are one directory for firmlinked trees, not for all.
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td).resolve() / "skills"
+            d.mkdir()
+            with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True):
+                p, _ = self._call({"dirs": [str(d)]})
+            self.assertEqual(p.sync_skills.call_args[1]["dirs"], [d])
+
+    @unittest.skipUnless(sys.platform == "darwin", "real APFS paths")
+    def test_real_macos_alias_paths_refused(self):
+        home = Path.home().resolve()
+        cases = ["/home", "/var", "/System/Volumes/Data", "/System/Volumes/Data/Users",
+                 "/System/Volumes/Data" + str(home)]
+        for bad in cases:
+            p, out = self._call({"dirs": [bad]})
+            self.assertIn("refusing to scan", out, bad)
+            p.sync_skills.assert_not_called()
 
     def test_force_text_false_is_false(self):
         for raw, want in (("false", False), ("0", False), ("true", True), (True, True), (None, False)):

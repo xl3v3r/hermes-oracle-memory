@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync local skills (~/.agents/skills and ~/.hermes/skills) into Oracle 26ai vector memory.
+"""Sync local skills (~/.agents/skills and the Hermes home's skills dir) into Oracle 26ai vector memory.
 
 Extracts YAML frontmatter (name, description, tags, category), identifies activation
 triggers from body and frontmatter, and batch-indexes vector rows using byte-safe
@@ -15,7 +15,6 @@ import logging
 import os
 import re
 import sys
-import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -24,17 +23,26 @@ logger = logging.getLogger("hermes.oracle_sync_skills")
 
 
 
-def load_env_file(env_file: Path) -> None:
-    """CLI --env-file: set KEY=VALUE lines that are not already in the
-    environment. The CLI never reads a credentials file on its own (1.1.1.4):
-    export OCI_DB_* or pass --env-file explicitly."""
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+def _load_common() -> Any:
+    """scripts/_common.py, loaded by path. This file is run as a script,
+    imported by tests, and loaded by the plugin under another module name, so
+    neither a relative nor a plain import works in every case."""
+    import importlib.util
+
+    name = "hermes_oracle_scripts_common"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().with_name("_common.py"))
+        if spec is None or spec.loader is None:
+            raise ImportError("scripts/_common.py is missing")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module
 
 
 # --- Interpreter guard -------------------------------------------------------
@@ -58,10 +66,18 @@ def _reexec_with_oracle_driver() -> None:
     import glob
     import subprocess
 
-    pattern = str(
-        Path.home() / ".hermes" / "installs" / "*" / "environments" / "*" / "venv" / "bin" / "python"
-    )
-    for candidate in sorted(glob.glob(pattern)):
+    # Hermes keeps its environments under <home>/installs; the home may be
+    # relocated (HERMES_HOME). bin/python on POSIX, Scripts\python.exe on Windows.
+    homes = [Path.home() / ".hermes"]
+    env_home = (os.environ.get("HERMES_HOME") or "").strip()
+    if env_home:
+        homes.insert(0, Path(os.path.expanduser(env_home)))
+    candidates: list[str] = []
+    for home in homes:
+        for tail in (("bin", "python"), ("Scripts", "python.exe")):
+            pattern = str(home.joinpath("installs", "*", "environments", "*", "venv", *tail))
+            candidates += [c for c in sorted(glob.glob(pattern)) if c not in candidates]
+    for candidate in candidates:
         if not os.path.exists(candidate):
             continue
         if os.path.abspath(candidate) == os.path.abspath(sys.executable):
@@ -82,62 +98,11 @@ if __name__ == "__main__":  # never re-exec a host process that imported us
 
 try:
     from agent.memory_provider import MemoryProvider
-except ImportError:
-    class MemoryProvider:
+except ImportError:  # outside Hermes: only isinstance() checks use it
+    class MemoryProvider:  # type: ignore[no-redef]
         pass
 
-# Standalone shims for agent / tools if not present in sys.modules
-if "agent" not in sys.modules:
-    try:
-        from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt  # noqa: F401
-        from agent.secret_scope import get_secret  # noqa: F401
-    except ImportError:
-        agent_mod = types.ModuleType("agent")
-        mp_mod = types.ModuleType("agent.memory_provider")
-
-        class MemoryProvider:
-            def initialize(self, session_id: str) -> None:
-                pass
-            def is_available(self) -> bool:
-                return True
-            def unavailable_reason(self) -> str:
-                return ""
-            def shutdown(self) -> None:
-                pass
-
-        @dataclass
-        class RecallStatus:
-            provider_label: str
-            count: int
-
-        mp_mod.MemoryProvider = MemoryProvider
-        mp_mod.RecallStatus = RecallStatus
-        mp_mod.is_trivial_prompt = lambda prompt: False
-        agent_mod.memory_provider = mp_mod
-        sys.modules["agent"] = agent_mod
-        sys.modules["agent.memory_provider"] = mp_mod
-
-        sec_mod = types.ModuleType("agent.secret_scope")
-        sec_mod.get_secret = lambda k, default=None: os.environ.get(k, default)
-        agent_mod.secret_scope = sec_mod
-        sys.modules["agent.secret_scope"] = sec_mod
-
-if "tools" not in sys.modules:
-    try:
-        from tools.registry import tool_error  # noqa: F401
-    except ImportError:
-        tools_mod = types.ModuleType("tools")
-        reg_mod = types.ModuleType("tools.registry")
-        reg_mod.tool_error = lambda msg: f"Error: {msg}"
-        tools_mod.registry = reg_mod
-        sys.modules["tools"] = tools_mod
-        sys.modules["tools.registry"] = reg_mod
-
 repo_root = Path(__file__).resolve().parent.parent
-if __name__ == "__main__" and str(repo_root) not in sys.path:
-    # CLI needs the plugin root for `from __init__ import ...`; in-process the
-    # plugin's top-level names must not shadow the host's (tests/, scripts/).
-    sys.path.insert(0, str(repo_root))
 
 
 def _ingest_timeout_ms() -> int:
@@ -177,31 +142,6 @@ class SkillInfo:
             self.hash = self.content_hash
         if isinstance(self.triggers, str):
             self.triggers = [self.triggers]
-
-
-def safe_varchar_bytes(text: str | None, max_bytes: int = 4000) -> str:
-    """Clamp text to fit within max_bytes in UTF-8 encoding.
-    
-    Prevents ORA-12899: value too large for column when inserting into VARCHAR2(4000).
-    """
-    if not text:
-        return ""
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
-
-
-def safe_embed_text(text: str | None, max_chars: int = 1200) -> str:
-    """Clamp text length to safely fit within ONNX model's 512-token limit.
-    
-    Dense inputs can exceed 512 tokens if 4000 characters are passed to
-    VECTOR_EMBEDDING, causing ORA-54401 ONNX broadcast errors.
-    1200 characters safely guarantees token count stays below the 512 sequence limit.
-    """
-    if not text:
-        return ""
-    return text[:max_chars]
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -519,14 +459,7 @@ def hermes_home() -> Path:
     """The active Hermes home (profile-aware). Inside Hermes this is
     hermes_constants.get_hermes_home(), which honours a per-context profile
     override; standalone it is $HERMES_HOME, else ~/.hermes."""
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
-
-        return Path(get_hermes_home())
-    except Exception:
-        pass
-    env = (os.environ.get("HERMES_HOME") or "").strip()
-    return Path(os.path.expanduser(env)) if env else Path.home() / ".hermes"
+    return _load_common().hermes_home()
 
 
 def default_skill_roots() -> list[Path]:
@@ -747,36 +680,6 @@ def chunk_markdown_text(text: str, max_words: int = 80, overlap: int = 10) -> li
         if start + max_words >= len(words):
             break
     return chunks
-
-
-def compute_host_root(skills_or_paths: Sequence[SkillInfo | Path] | None = None) -> str:
-    """Compute the deepest common parent directory of discovered skills."""
-    paths: list[str] = []
-    if skills_or_paths:
-        for item in skills_or_paths:
-            if isinstance(item, SkillInfo):
-                p = item.path
-                if p.name.lower() == "skill.md":
-                    paths.append(str(p.parent.parent))
-                else:
-                    paths.append(str(p.parent if p.is_file() else p))
-            elif isinstance(item, Path):
-                paths.append(str(item.parent if item.is_file() else item))
-            elif isinstance(item, str):
-                paths.append(item)
-    if not paths:
-        for d in default_skill_roots():
-            if d.exists():
-                paths.append(str(d))
-    if not paths:
-        return str(Path.home()) + "/"
-    try:
-        common = os.path.commonpath(paths)
-    except Exception:
-        common = str(Path.home())
-    if not common.endswith(os.sep):
-        common += os.sep
-    return common
 
 
 def get_host_id() -> str:
@@ -1571,8 +1474,8 @@ def main() -> None:
     if args.list_local:
         print(json.dumps(list_local_skills(dirs=args.dirs), indent=2))
         return
-    if args.env_file:
-        load_env_file(Path(args.env_file))
+    common = _load_common()
+    common.load_env(args.env_file)
 
     if args.dry_run and not (args.migrate_host_identity or args.reverse_host_identity):
         skills = discover_skills(dirs=args.dirs)
@@ -1584,10 +1487,11 @@ def main() -> None:
                 print(f"    Triggers: {len(s.triggers)} found")
                 print(f"    Tags: {', '.join(s.tags)}")
 
-    from __init__ import OracleMemoryProvider
-    provider = OracleMemoryProvider()
     if args.table:
-        provider._table = args.table
+        # initialize() reads the table from the settings; an attribute set
+        # before it would be overwritten.
+        os.environ["HERMES_ORACLE_TABLE"] = args.table
+    provider = common.load_plugin().OracleMemoryProvider()
     provider.initialize("skill-sync")
     if not provider.is_available():
         if args.dry_run and not (args.migrate_host_identity or args.reverse_host_identity):

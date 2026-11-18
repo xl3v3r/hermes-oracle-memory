@@ -6,6 +6,8 @@ and optionally gathers optimizer statistics.
 
 Usage:
     python3 scripts/rebuild_index.py [--table TABLE] [--index INDEX] [--yes] [--no-gather-stats]
+
+The OCI_DB_* settings come from the environment, or from --env-file.
 """
 
 from __future__ import annotations
@@ -13,16 +15,33 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
-from pathlib import Path
+import re
+from typing import Any
 
-root_dir = Path(__file__).resolve().parent.parent
-if str(root_dir) not in sys.path:
-    sys.path.insert(0, str(root_dir))
+try:  # helpers shared by the scripts (scripts/_common.py)
+    from . import _common as common
+except ImportError:  # run as a script, or imported with this directory on sys.path
+    import _common as common  # type: ignore[no-redef]
 
-from __init__ import VECTOR_INDEX_DDL, OracleMemoryProvider
+load_env = common.load_env
 
 logger = logging.getLogger("hermes.rebuild_index")
+
+_DEFAULT_TABLE = "HERMES_AGENT_MEMORY"
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]{0,127}$")
+
+
+def connect() -> Any:
+    import oracledb
+
+    return oracledb.connect(**common.connect_kwargs())
+
+
+def _identifier(value: str, what: str) -> str:
+    name = value.strip().strip('"').upper()
+    if not _IDENTIFIER_RE.fullmatch(name):
+        raise ValueError(f"invalid {what}: {value!r}")
+    return name
 
 
 def rebuild_vector_index(
@@ -31,83 +50,64 @@ def rebuild_vector_index(
     gather_stats: bool = True,
     force: bool = False,
 ) -> dict[str, str]:
-    provider = OracleMemoryProvider()
-    if table_name:
-        provider._table = table_name
-    provider.initialize("rebuild-index")
-    if not provider.is_available():
-        raise RuntimeError(f"Oracle memory provider unavailable: {provider.unavailable_reason()}")
-
-    actual_table = provider._table or "HERMES_AGENT_MEMORY"
-    clean_table = actual_table.upper().strip('"')
-    actual_index = index_name.upper().strip('"') if index_name else f"{clean_table}_VEC_IDX"
+    """Drop the vector index and create it again. *force* is accepted for
+    compatibility; the script has no interactive prompt."""
+    clean_table = _identifier(table_name or os.environ.get("HERMES_ORACLE_TABLE") or _DEFAULT_TABLE, "table name")
+    actual_index = _identifier(index_name, "index name") if index_name else f"{clean_table}_VEC_IDX"
+    ddl = common.load_plugin().VECTOR_INDEX_DDL.format(index_name=actual_index, table_name=clean_table)
 
     logger.info("Target table: %s, Vector index: %s", clean_table, actual_index)
 
-    with provider._pool.acquire() as conn, conn.cursor() as cur:
-        # 1. Drop existing index if it exists
-        logger.info("Dropping existing vector index %s (if present)...", actual_index)
-        try:
-            cur.execute(f"DROP INDEX {actual_index}")
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            # 1. Drop existing index if it exists
+            logger.info("Dropping existing vector index %s (if present)...", actual_index)
+            try:
+                cur.execute(f"DROP INDEX {actual_index}")
+                conn.commit()
+                logger.info("Dropped index %s successfully.", actual_index)
+            except Exception as e:
+                err_str = str(e)
+                if "ORA-01418" in err_str:  # specified index does not exist
+                    logger.info("Index %s did not exist; proceeding to create.", actual_index)
+                else:
+                    logger.warning("DROP INDEX %s encountered: %s", actual_index, e)
+
+            # 2. Recreate using canonical VECTOR_INDEX_DDL
+            logger.info("Executing DDL: %s", ddl)
+            cur.execute(ddl)
             conn.commit()
-            logger.info("Dropped index %s successfully.", actual_index)
-        except Exception as e:
-            err_str = str(e)
-            if "ORA-01418" in err_str:  # specified index does not exist
-                logger.info("Index %s did not exist; proceeding to create.", actual_index)
-            else:
-                logger.warning("DROP INDEX %s encountered: %s", actual_index, e)
+            logger.info("Created vector index %s successfully.", actual_index)
 
-        # 2. Recreate using canonical VECTOR_INDEX_DDL
-        ddl = VECTOR_INDEX_DDL.format(index_name=actual_index, table_name=clean_table)
-        logger.info("Executing DDL: %s", ddl)
-        cur.execute(ddl)
-        conn.commit()
-        logger.info("Created vector index %s successfully.", actual_index)
+            # 3. Gather optimizer statistics
+            if gather_stats:
+                logger.info("Gathering table and index statistics for %s...", clean_table)
+                cur.execute(
+                    "BEGIN DBMS_STATS.GATHER_TABLE_STATS(ownname => USER, tabname => UPPER(:1), cascade => TRUE); END;",
+                    [clean_table],
+                )
+                conn.commit()
+                logger.info("Statistics gathered successfully.")
 
-        # 3. Gather optimizer statistics
-        if gather_stats:
-            logger.info("Gathering table and index statistics for %s...", clean_table)
+            # 4. Verify index status
             cur.execute(
-                "BEGIN DBMS_STATS.GATHER_TABLE_STATS(ownname => USER, tabname => UPPER(:1), cascade => TRUE); END;",
-                [clean_table],
+                "SELECT index_name, status, index_type FROM USER_INDEXES WHERE index_name = UPPER(:1)",
+                [actual_index],
             )
-            conn.commit()
-            logger.info("Statistics gathered successfully.")
+            row = cur.fetchone()
+            status = row[1] if row else "UNKNOWN"
+            index_type = row[2] if row else "UNKNOWN"
+            logger.info("Index %s verification: status=%s, type=%s", actual_index, status, index_type)
+    finally:
+        conn.close()
 
-        # 4. Verify index status
-        cur.execute(
-            "SELECT index_name, status, index_type FROM USER_INDEXES WHERE index_name = UPPER(:1)",
-            [actual_index],
-        )
-        row = cur.fetchone()
-        status = row[1] if row else "UNKNOWN"
-        index_type = row[2] if row else "UNKNOWN"
-        logger.info("Index %s verification: status=%s, type=%s", actual_index, status, index_type)
-
-    provider.shutdown()
     return {
         "table": clean_table,
         "index": actual_index,
         "status": status,
         "index_type": index_type,
     }
-
-
-def load_env(env_file: str | None = None) -> None:
-    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
-    when the user passes --env-file. Otherwise the script reads the process
-    environment alone; values already set there win."""
-    if not env_file:
-        return
-    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def main() -> None:

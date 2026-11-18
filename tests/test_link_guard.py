@@ -4,6 +4,7 @@ location or target lies outside the temp dir, so no test can link into the
 installed plugin or the checkout. Installed by tests/conftest.py."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -142,6 +143,88 @@ class TestRuntimeLinkGuard(unittest.TestCase):
             guard.check_link_paths(os.path.join(td, "t"), os.path.join(td, "l"))
             with self.assertRaises(AssertionError):
                 guard.check_link_paths(str(CHECKOUT), os.path.join(td, "l"))
+
+
+class TestInheritedHermesHome(unittest.TestCase):
+    """#14, #22: a HERMES_HOME inherited from the calling shell is dropped for
+    the run, and the guard treats it as a real install."""
+
+    def _import_conftest_in_child(self, hermes_home):
+        code = (
+            "import os, tests.conftest as c\n"
+            "print(os.environ.get('HERMES_HOME'))\n"
+            "print(c._INHERITED_HERMES_HOME)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(CHECKOUT), env=dict(os.environ, HERMES_HOME=hermes_home),
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.splitlines()[:2]
+
+    def test_conftest_drops_an_inherited_hermes_home_and_keeps_its_value(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._import_conftest_in_child(td), ["None", td])
+
+    def test_empty_hermes_home_is_dropped_too(self):
+        self.assertEqual(self._import_conftest_in_child(""), ["None", "None"])
+
+    def test_suite_runs_without_an_inherited_hermes_home(self):
+        self.assertNotIn("HERMES_HOME", os.environ)
+
+    def test_both_conftest_copies_share_the_inherited_value(self):
+        # pytest imports conftest.py as "conftest"; the tests import it again
+        # as "tests.conftest". The second copy must not see an empty value.
+        with tempfile.TemporaryDirectory() as td:
+            code = (
+                "import os, sys\n"
+                "sys.path.insert(0, 'tests')\n"
+                "import conftest as a\n"
+                "import tests.conftest as b\n"
+                "print(a is not b, a._INHERITED_HERMES_HOME == b._INHERITED_HERMES_HOME == sys.argv[1])\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", code, td],
+                cwd=str(CHECKOUT), env=dict(os.environ, HERMES_HOME=td),
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "True True")
+
+    def test_inherited_home_under_an_ancestor_temp_dir_is_refused(self):
+        # A real HERMES_HOME outside the user's home, with TMPDIR set to one
+        # of its ancestors: a link "inside the temp dir" could land in the
+        # installed plugin.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            hh = root / "srv" / "hermes"
+            (hh / "plugins").mkdir(parents=True)
+            with unittest.mock.patch.object(guard, "_INHERITED_HERMES_HOME", str(hh), create=True), \
+                    unittest.mock.patch("tempfile.gettempdir", return_value=str(root / "srv")):
+                with self.assertRaisesRegex(AssertionError, "plugin"):
+                    guard.check_link_paths(str(root / "srv" / "t"), str(root / "srv" / "l"))
+
+    def test_temp_dir_inside_inherited_plugin_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            hh = root / "hh"
+            with unittest.mock.patch.object(guard, "_INHERITED_HERMES_HOME", str(hh), create=True), \
+                    unittest.mock.patch("tempfile.gettempdir", return_value=str(hh / "plugins" / "x")):
+                with self.assertRaisesRegex(AssertionError, "plugin"):
+                    guard.check_link_paths(str(root / "t"), str(root / "l"))
+
+    def test_inherited_home_outside_the_temp_dir_allows_links(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            (root / "hh" / "plugins").mkdir(parents=True)
+            (root / "tmp").mkdir()
+            with unittest.mock.patch.object(guard, "_INHERITED_HERMES_HOME", str(root / "hh"), create=True), \
+                    unittest.mock.patch("tempfile.gettempdir", return_value=str(root / "tmp")):
+                guard.check_link_paths(str(root / "tmp" / "t"), str(root / "tmp" / "l"))
+
+    def test_docstring_names_the_hermes_home_check(self):
+        self.assertIn("HERMES_HOME", guard.check_link_paths.__doc__)
 
 
 class TestStaticLinkScan(unittest.TestCase):

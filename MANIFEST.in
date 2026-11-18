@@ -7,8 +7,8 @@ include RELEASE_NOTES_*.md
 include AGENTS.md
 include LICENSE
 include CLA.md
-recursive-include skills *
-recursive-include scripts *
-exclude test_oracle.py
-exclude pytest.ini
+recursive-include skills *.md
+recursive-include scripts *.py
 recursive-exclude tests *
+global-exclude __pycache__/*
+global-exclude *.py[cod]
