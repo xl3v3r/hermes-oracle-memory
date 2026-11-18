@@ -1,9 +1,9 @@
 # hermes-oracle-memory — what it needs now
 
-**Version in play:** 1.1.1.5 (`VERSION`, `pyproject.toml`, `plugin.yaml`, `__init__.py` agree)
-**Installed at:** `~/.hermes/plugins/oracle` (pinned checkout, tag `v1.1.1.5`)
+**Version in play:** 1.1.2 (`VERSION`, `pyproject.toml`, `plugin.yaml`, `__init__.py` agree)
+**Installed at:** `~/.hermes/plugins/oracle` (pinned checkout, tag `v1.1.2`)
 **Environment:** Oracle 26ai ADB, 2 CPUs, in-DB ONNX `BGE_BASE_EN_V1_5`, `HERMES_ORACLE_DISABLE_EXTERNAL_EMBED=1`, table `hermes_agent_memory`
-**Updated:** 2026-11-15, v1.1.1.5 skill-sync and backfill follow-ups (#14)
+**Updated:** 2026-11-18, v1.1.2 review fixes (#14, #16-#22, #24-#27, #32)
 
 ---
 
