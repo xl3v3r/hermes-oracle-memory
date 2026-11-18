@@ -284,13 +284,13 @@ class TestSearchTags(unittest.TestCase):
     def test_builders_add_bound_tag_predicate(self):
         p, _, _ = _provider()
         for sql, binds in (
-            p._build_text_search_sql("q", 10, "", "any", tags=["handoff"]),
-            p._build_vector_search_sql("q", None, 10, "", "any", tags=["handoff"]),
-            p._build_hybrid_search_sql("q", None, "q", 10, "", "any", tags=["handoff"]),
+            p._build_text_search_sql("q", 10, "any", tags=["handoff"]),
+            p._build_vector_search_sql("q", 10, "any", tags=["handoff"]),
+            p._build_hybrid_search_sql("q", "q", 10, "any", tags=["handoff"]),
         ):
             self.assertIn("JSON_EXISTS(JSON_QUERY(metadata", sql)
             self.assertEqual(binds["tg0"], "handoff")
-        sql, binds = p._build_text_search_sql("q", 10, "", "any")
+        sql, binds = p._build_text_search_sql("q", 10, "any")
         self.assertNotIn("JSON_EXISTS", sql)
         self.assertNotIn("tg0", binds)
 

@@ -53,7 +53,7 @@ class TestTimeoutClassification(unittest.TestCase):
         cur = MagicMock()
         cur.execute.side_effect = RuntimeError("ORA-04021: timeout occurred while waiting to lock object")
         with self.assertRaises(RuntimeError) as cm:
-            p._execute_hybrid_search(cur, "q", None, "{q}", 5, 10, "", "any")
+            p._execute_hybrid_search(cur, "q", "{q}", 10, "any")
         self.assertNotIsInstance(cm.exception, TimeoutError)
 
 
@@ -96,7 +96,7 @@ class TestFetch(unittest.TestCase):
         fresh.fetchall.return_value = [_db_row("m1")]
         cur.connection.cursor.return_value.__enter__.return_value = fresh
         with patch.object(oracle_plugin.time, "sleep"):
-            rows = p._execute_hybrid_search(cur, "q", None, "{q}", 5, 10, "", "any", rerank=False)
+            rows = p._execute_hybrid_search(cur, "q", "{q}", 10, "any")
         self.assertEqual([r["memory_id"] for r in rows], ["m1"])
         cur.execute.assert_called_once()
         fresh.execute.assert_called_once()
@@ -115,7 +115,7 @@ class TestRanking(unittest.TestCase):
         p, _, _ = _provider()
         cur = MagicMock()
         cur.fetchall.return_value = [_db_row(f"m{i}", dist=0.1 + i / 100) for i in range(12)]
-        rows = p._execute_hybrid_search(cur, "q", None, "{q}", 3, 10, "", "any", rerank=True)
+        rows = p._execute_hybrid_search(cur, "q", "{q}", 10, "any")
         self.assertEqual(len(rows), 12)
 
     def test_diversification_cannot_shrink_below_top_k(self):
@@ -148,7 +148,7 @@ class TestRanking(unittest.TestCase):
         p._onnx_failed_at = time.monotonic()
         cur = MagicMock()
         cur.fetchall.return_value = [_db_row("m1", txt=100.0, dist=None, content="unrelated words here")]
-        rows = p._execute_hybrid_search(cur, "q", None, "{q}", 5, 10, "", "any", rerank=False)
+        rows = p._execute_hybrid_search(cur, "q", "{q}", 10, "any")
         self.assertAlmostEqual(rows[0]["score"], 0.3, places=4)
 
     def test_degraded_text_hits_use_hybrid_text_weight(self):
@@ -157,7 +157,7 @@ class TestRanking(unittest.TestCase):
         text_rows = [{"memory_id": "m1", "score": 1.0, "content": "unrelated words", "dist": None}]
         with patch.object(oracle_plugin.time, "sleep"), \
                 patch.object(p, "_fetch_rows", side_effect=[snap, snap, snap, text_rows]):
-            rows = p._execute_hybrid_search(MagicMock(), "q", None, "{q}", 5, 10, "", "any", rerank=False)
+            rows = p._execute_hybrid_search(MagicMock(), "q", "{q}", 10, "any")
         self.assertAlmostEqual(rows[0]["score"], 0.3, places=4)
 
 

@@ -133,11 +133,10 @@ def _env_number(name: str, default: float, *, lo: float | None = None, hi: float
 # under the host's external-prefetch budget (agent/memory_manager.py: 8 s).
 _PREFETCH_WAIT_SECS = _env_number("HERMES_ORACLE_PREFETCH_WAIT", 3.0, lo=0.1, hi=7.0)
 _EMBED_DIM = 768
-_EMBED_MODEL = "qwen/qwen3-embedding-4b"
-_OCI_EMBED_MODEL = "cohere.embed-v4.0"
+# How much of a row's text goes to the embedding model.
+_EMBED_TEXT_CHARS = 1200
 _EMBED_CACHE_MAX = 256
 _EMBED_BATCH = 32
-_OCI_RETRY_AFTER_SECS = 300.0
 _ONNX_RETRY_AFTER_SECS = 60.0
 # ORA errors where the embedding engine/service misbehaved but the row is
 # fine: degrade to NULL-embedding insert + background backfill (turn/skill
@@ -760,7 +759,6 @@ _BACKFILL_MAX_ATTEMPTS = 8
 _BACKFILL_STARTUP_LIMIT = 500
 _BACKFILL_SCANNED: set[str] = set()  # pool fingerprints already scanned in this process
 _BACKFILL_SCANNED_LOCK = threading.Lock()
-_EMBED_TIMEOUT_SECS = 10.0
 # --- Timeouts (1.1.1.3) -------------------------------------------------------
 # Read-path budget for one recall query (oracle_search / prefetch / oracle_get).
 # HERMES_ORACLE_SEARCH_TIMEOUT_MS is the documented knob; before 1.1.1.3 the
@@ -868,10 +866,6 @@ def _telemetry_sql(col: str = "NVL(content_txt, 'x')") -> str:
     return "".join(clauses)
 
 
-_EXTERNAL_EMBED_KILLSWITCH = (
-    os.environ.get("HERMES_ORACLE_DISABLE_EXTERNAL_EMBED", "").strip().lower()
-    in ("1", "true", "yes")
-)
 _MAX_CHUNK_FILE_BYTES = 64 * 1024 * 1024
 _CONTAINS_CLEAN_RE = re.compile(r"[^\w\s]")
 _PREFIX_STOP_WORDS = {
@@ -1366,22 +1360,17 @@ class OracleMemoryProvider(MemoryProvider):
         self._embed_worker: threading.Thread | None = None
         self._backfill_scan_thread: threading.Thread | None = None
         self._pool_lock = threading.RLock()
-        self._oci_embed_failed_at: float | None = None
-        self._oci_client: Any | None = None
-        self._oci_signer: Any | None = None
         self._onnx_failed_at: float | None = None
         self._lock = threading.Lock()
         self._write_queue: queue.Queue = queue.Queue()
         self._write_worker: threading.Thread | None = None
         self._write_lock = threading.Lock()
         self._write_stop = threading.Event()
-        self._external_embed_warned = False
         self._init_error = ""
         self._agent_context = "primary"
         self._initialized = False
         self._pool_fingerprint = ""
         self._last_write_at: str | None = None
-        self._last_restart_seen: float | None = None
         self._bg_drop_warned = False
         # Lifecycle writers are tracked per process (module-level
         # _LIFECYCLE_* maps, keyed by _lifecycle_key), not per instance.
@@ -1920,77 +1909,6 @@ class OracleMemoryProvider(MemoryProvider):
         with self._embed_lock:
             self._onnx_failed_at = None
 
-    def _embed_oci(self, texts: list[str]) -> list[array.array | None] | None:
-        """OCI GenAI cohere.embed-v4.0 via instance principal. None = skip OCI this attempt.
-
-        A transient failure (e.g. IAM not yet propagated) disables OCI for a bounded
-        cooldown, then retries — so the process self-heals once the tenancy grant lands,
-        without hammering a broken path on every write.
-        """
-        now = time.monotonic()
-        with self._embed_lock:
-            failed_at = self._oci_embed_failed_at
-        if failed_at is not None and (now - failed_at) < _OCI_RETRY_AFTER_SECS:
-            return None
-        try:
-            import oci  # type: ignore
-        except Exception:
-            with self._embed_lock:
-                self._oci_embed_failed_at = now
-            return None
-        try:
-            with self._embed_lock:
-                signer = self._oci_signer
-                client = self._oci_client
-                if signer is None:
-                    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-                    self._oci_signer = signer
-            region = (
-                os.environ.get("OCI_GENAI_REGION")
-                or getattr(signer, "region", None)
-                or "us-phoenix-1"
-            )
-            endpoint = f"https://inference.generativeai.{region}.oci.oraclecloud.com"
-            if client is None:
-                with self._embed_lock:
-                    client = self._oci_client
-                    if client is None:
-                        client = oci.generative_ai_inference.GenerativeAiInferenceClient(
-                            config={}, signer=signer, service_endpoint=endpoint
-                        )
-                        self._oci_client = client
-            details = oci.generative_ai_inference.models.EmbedTextDetails(
-                inputs=[t[:8000] for t in texts],
-                serving_mode=oci.generative_ai_inference.models.OnDemandServingMode(
-                    model_id=os.environ.get("OCI_EMBED_MODEL", _OCI_EMBED_MODEL)
-                ),
-                compartment_id=os.environ.get("OCI_COMPARTMENT_ID")
-                or signer.tenancy_id,
-                truncate="END",
-            )
-            try:
-                details.output_dimensions = _EMBED_DIM
-            except Exception:
-                pass
-            resp = client.embed_text(details)
-            embeddings = list(resp.data.embeddings)
-            out: list[array.array | None] = []
-            for vec in embeddings:
-                if vec is None or len(vec) != _EMBED_DIM:
-                    out.append(None)
-                else:
-                    out.append(array.array("f", vec))
-            if len(out) != len(texts):
-                out.extend([None] * (len(texts) - len(out)))
-            with self._embed_lock:
-                self._oci_embed_failed_at = None
-            return out
-        except Exception as e:
-            logger.info("OCI GenAI embed unavailable (%s)", e)
-            with self._embed_lock:
-                self._oci_embed_failed_at = now
-            return None
-
     def _embed_many_tagged(self, texts: list[str]) -> list[tuple[array.array | None, str | None]]:
         """Embed texts via in-database ONNX model and report provenance.
 
@@ -2113,14 +2031,12 @@ class OracleMemoryProvider(MemoryProvider):
                 cached[i] = (vec, model)
         return [c if c is not None else (None, None) for c in cached]
 
-    def _embed_many(self, texts: list[str]) -> list[array.array | None]:
-        """Untagged view for search paths, which never store the vectors."""
-        return [v for v, _m in self._embed_many_tagged(texts)]
-
     def _embed(self, text: str) -> array.array | None:
+        """One text through the in-database model (the vector only). Used by
+        tests/verify_provider.py to check that the model answers."""
         if not text:
             return None
-        return self._embed_many([text])[0]
+        return self._embed_many_tagged([text])[0][0]
 
     def _queue_embed_backfill(self, memory_id: str, content: str) -> None:
         """Queue a row for batched background embedding.
@@ -2497,6 +2413,155 @@ class OracleMemoryProvider(MemoryProvider):
 
     # -- writes / reads ------------------------------------------------------
 
+    _INSERT_COLUMNS = (
+        "memory_id, session_id, agent_id, role, content, embedding, created_at, "
+        "target, metadata, content_txt, embedding_model, embedding_updated_at"
+    )
+    _INSERT_ROW_COLUMNS = ", turn_index, chunk_index, turn_id, conv_ref"
+
+    def _insert_sql(self, *, embed: bool, row_columns: bool) -> str:
+        """The INSERT for one row shape.
+
+        embed: the database computes the embedding from a bound text;
+        otherwise the embedding is NULL and the row is embedded later.
+        row_columns: also write turn_index, chunk_index, turn_id, conv_ref."""
+        n = itertools.count(1)
+
+        def bind() -> str:
+            return f":{next(n)}"
+
+        values = [bind() for _ in range(5)]  # memory_id, session_id, agent_id, role, content
+        values.append(f"VECTOR_EMBEDDING({self._onnx_model} USING {bind()} AS DATA)" if embed else "NULL")
+        values.append("SYSTIMESTAMP")
+        values += [bind(), bind(), bind()]  # target, metadata, content_txt
+        values += [bind() if embed else "NULL", "SYSTIMESTAMP"]  # embedding_model, embedding_updated_at
+        columns = self._INSERT_COLUMNS
+        if row_columns:
+            columns += self._INSERT_ROW_COLUMNS
+            values += [bind() for _ in range(4)]
+        return (
+            f"INSERT /*+ NO_PARALLEL */ INTO {self._table} ({columns}) "  # nosec B608
+            f"VALUES ({', '.join(values)})"
+        )
+
+    def _insert_binds(self, row: dict[str, Any], *, embed_chars: int | None, row_columns: bool) -> tuple[Any, ...]:
+        """The bind tuple for _insert_sql. *embed_chars* is how much of the
+        content goes to the embedding model; None is the NULL-embedding shape."""
+        content = row.get("content")
+        binds: list[Any] = [
+            row.get("memory_id"),
+            row.get("session_id") or self._session_id or "none",
+            self._agent_id,
+            row.get("role"),
+            content,
+        ]
+        if embed_chars is not None:
+            binds.append(self._safe_embed_text(content, embed_chars))
+        binds += [row.get("target"), json.dumps(row.get("metadata") or {}), self._safe_varchar_bytes(content, 4000)]
+        if embed_chars is not None:
+            binds.append(self._onnx_model)
+        if row_columns:
+            binds += [row.get("turn_index"), row.get("chunk_index"), row.get("turn_id"), row.get("conv_ref")]
+        return tuple(binds)
+
+    def _insert_rows(
+        self, rows: list[dict[str, Any]], run: Any, *, what: str, row_columns: bool, raise_duplicate: bool,
+    ) -> list[tuple[str, str]]:
+        """Write *rows* through *run(sql, binds_list)*, embedding in the database.
+
+        Returns the (memory_id, content) pairs written with a NULL embedding,
+        for the caller to hand to the backfill once they are committed.
+
+        The ladder: a full-text embedding; on ORA-51815 (index snapshot too
+        old) the same statement again; on ORA-54401 (input too long) a shorter
+        text; on a transient server condition a NULL embedding, so the row is
+        not lost. Anything else is raised. _TxAborted always propagates."""
+
+        def binds(embed_chars: int | None) -> list[tuple[Any, ...]]:
+            return [self._insert_binds(r, embed_chars=embed_chars, row_columns=row_columns) for r in rows]
+
+        def insert_null() -> list[tuple[str, str]]:
+            run(self._insert_sql(embed=False, row_columns=row_columns), binds(None))
+            return [(str(r["memory_id"]), str(r["content"])) for r in rows if r.get("memory_id") and r.get("content")]
+
+        if not self._onnx_model:
+            raise _PolicyError(
+                "In-database ONNX embedding model is unavailable; external fallback is disabled"
+            )
+        if self._onnx_in_cooldown():
+            # Keep the rows (text search finds them at once) and let the
+            # backfill embed them when the cooldown ends.
+            logger.info("ONNX in cooldown; writing %d row(s) with NULL embeddings and queueing backfill", len(rows))
+            return insert_null()
+
+        sql = self._insert_sql(embed=True, row_columns=row_columns)
+        try:
+            run(sql, binds(_EMBED_TEXT_CHARS))
+            return []
+        except _TxAborted:
+            raise
+        except Exception as e:
+            err_str = str(e)
+            if raise_duplicate and "ORA-00001" in err_str:
+                # Duplicate memory_id: not a model problem, and the
+                # NULL-embedding fallback would hit the same constraint.
+                raise
+            is_51815 = "ORA-51815" in err_str
+            is_54401 = "ORA-54401" in err_str
+            is_shape_err = is_51815 or is_54401
+
+            # 1. ORA-51815: retry transient snapshot conflicts
+            if is_51815:
+                for attempt in range(_EMBED_MAX_RETRIES):
+                    try:
+                        time.sleep(0.05 * (attempt + 1))
+                        run(sql, binds(_EMBED_TEXT_CHARS))
+                        return []
+                    except _TxAborted:
+                        raise
+                    except Exception as retry_e:
+                        err_str = str(retry_e)
+                        if "ORA-51815" not in err_str:
+                            is_54401 = "ORA-54401" in err_str
+                            is_shape_err = is_54401
+                            break
+
+            # 2. ORA-54401: retry with conservative token clamp
+            if is_54401:
+                try:
+                    run(sql, binds(_CONSERVATIVE_EMBED_CHARS))
+                    return []
+                except _TxAborted:
+                    raise
+                except Exception as retry_e:
+                    err_str = str(retry_e)
+                    is_51815 = "ORA-51815" in err_str
+                    is_54401 = "ORA-54401" in err_str
+                    is_shape_err = is_51815 or is_54401
+
+            if not is_shape_err and not self._is_onnx_transient(err_str):
+                self._onnx_mark_failed(err_str)
+                logger.warning("In-database ONNX %s failed (%s); external fallback is disabled", what, err_str)
+                raise RuntimeError(
+                    f"In-database ONNX {what} failed ({err_str}); external fallback is disabled"
+                ) from e
+
+            # 3. Fallback to NULL embedding and background backfill (also for
+            #    transient server conditions: the rows must not be lost).
+            logger.warning(
+                "In-database ONNX %s hit transient/shape error (%s); inserting with null embedding to prevent turn loss",
+                what, err_str,
+            )
+            try:
+                return insert_null()
+            except _TxAborted:
+                raise
+            except Exception as null_e:
+                logger.error("Null-embedding %s fallback failed (%s)", what, null_e)
+                raise RuntimeError(
+                    f"In-database ONNX {what} failed ({err_str}) and fallback {what} failed ({null_e})"
+                ) from null_e
+
     def _insert(
         self,
         *,
@@ -2506,190 +2571,27 @@ class OracleMemoryProvider(MemoryProvider):
         content: str,
         target: str,
         metadata: dict | None = None,
-        embedding: array.array | None = None,
     ) -> None:
+        """Insert one row and commit. A duplicate memory_id raises the
+        database error (ORA-00001) unchanged."""
         if not self._pool:
             raise RuntimeError(self._init_error or "pool not initialized")
-        vec = embedding if embedding is not None else None
-        vec_model = None  # provenance stamp; None means "unknown origin"
-        meta = json.dumps(metadata or {})
-        txt = self._safe_varchar_bytes(content, 4000)
-        embed_txt = self._safe_embed_text(content)
-        onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
-        if onnx_enabled:
-            sql = f"""
-                INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                    (memory_id, session_id, agent_id, role, content, embedding,
-                     created_at, target, metadata, content_txt,
-                     embedding_model, embedding_updated_at)
-                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9,
-                     :10, SYSTIMESTAMP)
-            """
-            binds: tuple[Any, ...] = (
-                memory_id,
-                session_id or self._session_id or "none",
-                self._agent_id,
-                role,
-                content,
-                embed_txt,
-                target,
-                meta,
-                txt,
-                self._onnx_model,
-            )
-            try:
-                with self._pool.acquire() as conn, conn.cursor() as cur:
-                    cur.execute(sql, binds)
-                    conn.commit()
-                return
-            except Exception as e:
-                err_str = str(e)
-                if "ORA-00001" in err_str:
-                    # Duplicate memory_id: not a model problem, and the
-                    # NULL-embedding fallback would hit the same constraint.
-                    raise
-                is_51815 = "ORA-51815" in err_str
-                is_54401 = "ORA-54401" in err_str
-                is_shape_err = is_51815 or is_54401
 
-                # 1. ORA-51815: retry transient snapshot conflicts
-                if is_51815:
-                    for attempt in range(_EMBED_MAX_RETRIES):
-                        try:
-                            time.sleep(0.05 * (attempt + 1))
-                            with self._pool.acquire() as conn, conn.cursor() as cur:
-                                cur.execute(sql, binds)
-                                conn.commit()
-                            return
-                        except Exception as retry_e:
-                            err_str = str(retry_e)
-                            if "ORA-51815" not in err_str:
-                                is_54401 = "ORA-54401" in err_str
-                                is_shape_err = is_54401
-                                break
+        def run(sql: str, binds_list: list[tuple[Any, ...]]) -> None:
+            pool = self._pool
+            if pool is None:
+                raise RuntimeError(self._init_error or "pool not initialized")
+            with pool.acquire() as conn, conn.cursor() as cur:
+                cur.execute(sql, binds_list[0])
+                conn.commit()
 
-                # 2. ORA-54401: retry with conservative token clamp
-                if is_54401:
-                    conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
-                    conservative_binds = (
-                        memory_id,
-                        session_id or self._session_id or "none",
-                        self._agent_id,
-                        role,
-                        content,
-                        conservative_txt,
-                        target,
-                        meta,
-                        txt,
-                        self._onnx_model,
-                    )
-                    try:
-                        with self._pool.acquire() as conn, conn.cursor() as cur:
-                            cur.execute(sql, conservative_binds)
-                            conn.commit()
-                        return
-                    except Exception as retry_e:
-                        err_str = str(retry_e)
-                        is_51815 = "ORA-51815" in err_str
-                        is_54401 = "ORA-54401" in err_str
-                        is_shape_err = is_51815 or is_54401
-
-                if not is_shape_err and not self._is_onnx_transient(err_str):
-                    self._onnx_mark_failed(err_str)
-                    logger.warning(
-                        "In-database ONNX insert failed (%s); external fallback is disabled",
-                        err_str,
-                    )
-                    raise RuntimeError(
-                        f"In-database ONNX insert failed ({err_str}); external fallback is disabled"
-                    ) from e
-
-                # 3. Fallback to NULL embedding and queue background backfill
-                #    (also for transient server conditions — the row must not be
-                #    lost; the backfill re-embeds it out of band)
-                logger.warning(
-                    "In-database ONNX insert hit transient/shape error (%s); inserting row with null embedding to prevent turn loss",
-                    err_str,
-                )
-                try:
-                    self._insert_null_row(memory_id, session_id, role, content, target, meta, txt)
-                    return
-                except Exception as null_e:
-                    logger.error(
-                        "Null-embedding insert fallback failed (%s)", null_e
-                    )
-                    raise RuntimeError(
-                        f"In-database ONNX insert failed ({err_str}) and fallback insert failed ({null_e})"
-                    ) from null_e
-
-        if vec is None:
-            if self._onnx_model:
-                # ONNX cooldown: keep the row (text search finds it at once) and
-                # let the backfill embed it when the cooldown ends.
-                logger.info("ONNX in cooldown; writing %s with a NULL embedding and queueing backfill", memory_id)
-                self._insert_null_row(memory_id, session_id, role, content, target, meta, txt)
-                return
-            raise _PolicyError(
-                "In-database ONNX embedding model is unavailable; external fallback is disabled"
-            )
-
-        sql = f"""
-            INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                (memory_id, session_id, agent_id, role, content, embedding,
-                 created_at, target, metadata, content_txt,
-                 embedding_model, embedding_updated_at)
-            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9,
-                 :10, SYSTIMESTAMP)
-        """
-        binds = (
-            memory_id,
-            session_id or self._session_id or "none",
-            self._agent_id,
-            role,
-            content,
-            vec,
-            target,
-            meta,
-            txt,
-            vec_model,
-        )
-
-        with self._pool.acquire() as conn, conn.cursor() as cur:
-            cur.execute(sql, binds)
-            conn.commit()
-
-        if vec is None:
-            self._queue_embed_backfill(memory_id, content)
-
-    def _insert_null_row(
-        self, memory_id: str, session_id: str, role: str, content: str, target: str, meta: str, txt: str
-    ) -> None:
-        """INSERT one row with a NULL embedding, commit, then queue its backfill."""
-        pool = self._pool
-        if pool is None:
-            raise RuntimeError(self._init_error or "pool not initialized")
-        null_sql = f"""
-            INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                (memory_id, session_id, agent_id, role, content, embedding,
-                 created_at, target, metadata, content_txt,
-                 embedding_model, embedding_updated_at)
-            VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                 NULL, SYSTIMESTAMP)
-        """  # nosec B608
-        null_binds = (
-            memory_id,
-            session_id or self._session_id or "none",
-            self._agent_id,
-            role,
-            content,
-            target,
-            meta,
-            txt,
-        )
-        with pool.acquire() as conn, conn.cursor() as cur:
-            cur.execute(null_sql, null_binds)
-            conn.commit()
-        self._queue_embed_backfill(memory_id, content)
+        row = {
+            "memory_id": memory_id, "session_id": session_id, "role": role,
+            "content": content, "target": target, "metadata": metadata,
+        }
+        pending = self._insert_rows([row], run, what="insert", row_columns=False, raise_duplicate=True)
+        for mid, text in pending:
+            self._queue_embed_backfill(mid, text)
 
     def _update_row(self, mid: str, content: str | None, tags: list[str] | None = None) -> int:
         """Update a row's content (re-embedded in-database) and/or replace its
@@ -2972,238 +2874,14 @@ class OracleMemoryProvider(MemoryProvider):
         if not rows:
             return []
 
-        onnx_enabled = bool(self._onnx_model and not self._onnx_in_cooldown())
-        if onnx_enabled:
-            sql = f"""
-                INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                    (memory_id, session_id, agent_id, role, content, embedding,
-                     created_at, target, metadata, content_txt,
-                     embedding_model, embedding_updated_at,
-                     turn_index, chunk_index, turn_id, conv_ref)
-                VALUES (:1, :2, :3, :4, :5, VECTOR_EMBEDDING({self._onnx_model} USING :6 AS DATA), SYSTIMESTAMP, :7, :8, :9,
-                     :10, SYSTIMESTAMP, :11, :12, :13, :14)
-            """
-            binds_list = []
-            for row in rows:
-                memory_id = row.get("memory_id")
-                session_id = row.get("session_id") or self._session_id or "none"
-                role = row.get("role")
-                content = row.get("content")
-                target = row.get("target")
-                metadata = row.get("metadata")
-                meta = json.dumps(metadata or {})
-                txt = self._safe_varchar_bytes(content, 4000)
-                embed_txt = self._safe_embed_text(content)
-                binds: tuple[Any, ...] = (
-                    memory_id,
-                    session_id,
-                    self._agent_id,
-                    role,
-                    content,
-                    embed_txt,
-                    target,
-                    meta,
-                    txt,
-                    self._onnx_model,
-                    row.get("turn_index"),
-                    row.get("chunk_index"),
-                    row.get("turn_id"),
-                    row.get("conv_ref"),
-                )
-                binds_list.append(binds)
-            try:
-                self._exec_insert(sql, binds_list, tx_conn)
-                return []
-            except _TxAborted:
-                raise
-            except Exception as e:
-                err_str = str(e)
-                is_51815 = "ORA-51815" in err_str
-                is_54401 = "ORA-54401" in err_str
-                is_shape_err = is_51815 or is_54401
-
-                # 1. ORA-51815: retry transient snapshot conflicts
-                if is_51815:
-                    for attempt in range(_EMBED_MAX_RETRIES):
-                        try:
-                            time.sleep(0.05 * (attempt + 1))
-                            self._exec_insert(sql, binds_list, tx_conn)
-                            return []
-                        except _TxAborted:
-                            raise
-                        except Exception as retry_e:
-                            err_str = str(retry_e)
-                            if "ORA-51815" not in err_str:
-                                is_54401 = "ORA-54401" in err_str
-                                is_shape_err = is_54401
-                                break
-
-                # 2. ORA-54401: retry with conservative token clamp
-                if is_54401:
-                    conservative_binds_list = []
-                    for row in rows:
-                        memory_id = row.get("memory_id")
-                        session_id = row.get("session_id") or self._session_id or "none"
-                        role = row.get("role")
-                        content = row.get("content")
-                        target = row.get("target")
-                        metadata = row.get("metadata")
-                        meta = json.dumps(metadata or {})
-                        txt = self._safe_varchar_bytes(content, 4000)
-                        conservative_txt = self._safe_embed_text(content, _CONSERVATIVE_EMBED_CHARS)
-                        binds = (
-                            memory_id,
-                            session_id,
-                            self._agent_id,
-                            role,
-                            content,
-                            conservative_txt,
-                            target,
-                            meta,
-                            txt,
-                            self._onnx_model,
-                            row.get("turn_index"),
-                            row.get("chunk_index"),
-                            row.get("turn_id"),
-                            row.get("conv_ref"),
-                        )
-                        conservative_binds_list.append(binds)
-                    try:
-                        self._exec_insert(sql, conservative_binds_list, tx_conn)
-                        return []
-                    except _TxAborted:
-                        raise
-                    except Exception as retry_e:
-                        err_str = str(retry_e)
-                        is_51815 = "ORA-51815" in err_str
-                        is_54401 = "ORA-54401" in err_str
-                        is_shape_err = is_51815 or is_54401
-
-                if not is_shape_err and not self._is_onnx_transient(err_str):
-                    self._onnx_mark_failed(err_str)
-                    logger.warning(
-                        "In-database ONNX insert_many failed (%s); external fallback is disabled",
-                        err_str,
-                    )
-                    raise RuntimeError(
-                        f"In-database ONNX insert_many failed ({err_str}); external fallback is disabled"
-                    ) from e
-
-                # 3. Fallback to NULL embedding and queue background backfill
-                #    (also for transient server conditions — rows must not be
-                #    lost; the backfill re-embeds them out of band)
-                logger.warning(
-                    "In-database ONNX insert_many hit transient/shape error (%s); inserting rows with null embedding to prevent turn loss",
-                    err_str,
-                )
-                try:
-                    return self._insert_many_null(rows, tx_conn)
-                except _TxAborted:
-                    raise
-                except Exception as null_e:
-                    logger.error(
-                        "Null-embedding insert_many fallback failed (%s)", null_e
-                    )
-                    raise RuntimeError(
-                        f"In-database ONNX insert_many failed ({err_str}) and fallback insert_many failed ({null_e})"
-                    ) from null_e
-
-        if any(r.get("embedding") is None for r in rows):
-            if self._onnx_model:
-                # ONNX cooldown: write the rows now with NULL embeddings and let
-                # the backfill embed them once the cooldown ends.
-                logger.info("ONNX in cooldown; writing %d row(s) with NULL embeddings and queueing backfill", len(rows))
-                return self._insert_many_null(rows, tx_conn)
-            raise _PolicyError(
-                "In-database ONNX embedding model is unavailable; external fallback is disabled"
-            )
-
-        binds_list = []
-        for row in rows:
-            memory_id = row.get("memory_id")
-            session_id = row.get("session_id") or self._session_id or "none"
-            role = row.get("role")
-            content = row.get("content")
-            target = row.get("target")
-            metadata = row.get("metadata")
-            vec = row.get("embedding")
-            model = row.get("embedding_model")
-
-            meta = json.dumps(metadata or {})
-            txt = self._safe_varchar_bytes(content, 4000)
-
-            binds = (
-                memory_id,
-                session_id,
-                self._agent_id,
-                role,
-                content,
-                vec,
-                target,
-                meta,
-                txt,
-                model,
-                row.get("turn_index"),
-                row.get("chunk_index"),
-                row.get("turn_id"),
-                row.get("conv_ref"),
-            )
-            binds_list.append(binds)
-
-        sql = f"""
-            INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                (memory_id, session_id, agent_id, role, content, embedding,
-                 created_at, target, metadata, content_txt,
-                 embedding_model, embedding_updated_at,
-                 turn_index, chunk_index, turn_id, conv_ref)
-            VALUES (:1, :2, :3, :4, :5, :6, SYSTIMESTAMP, :7, :8, :9,
-                 :10, SYSTIMESTAMP, :11, :12, :13, :14)
-        """
-
-        self._exec_insert(sql, binds_list, tx_conn)
-        return []
-
-    def _insert_many_null(self, rows: list[dict[str, Any]], tx_conn: Any = None) -> list[tuple[str, str]]:
-        """INSERT *rows* with NULL embeddings. Without *tx_conn* the backfill is
-        queued here (after the commit in _exec_insert) and [] is returned; with
-        *tx_conn* the (memory_id, content) pairs are returned for the caller to
-        queue after its own commit."""
-        null_sql = f"""
-            INSERT /*+ NO_PARALLEL */ INTO {self._table}
-                (memory_id, session_id, agent_id, role, content, embedding,
-                 created_at, target, metadata, content_txt,
-                 embedding_model, embedding_updated_at,
-                 turn_index, chunk_index, turn_id, conv_ref)
-            VALUES (:1, :2, :3, :4, :5, NULL, SYSTIMESTAMP, :6, :7, :8,
-                 NULL, SYSTIMESTAMP, :9, :10, :11, :12)
-        """  # nosec B608
-        null_binds_list = []
-        for row in rows:
-            content = row.get("content")
-            null_binds_list.append((
-                row.get("memory_id"),
-                row.get("session_id") or self._session_id or "none",
-                self._agent_id,
-                row.get("role"),
-                content,
-                row.get("target"),
-                json.dumps(row.get("metadata") or {}),
-                self._safe_varchar_bytes(content, 4000),
-                row.get("turn_index"),
-                row.get("chunk_index"),
-                row.get("turn_id"),
-                row.get("conv_ref"),
-            ))
-        self._exec_insert(null_sql, null_binds_list, tx_conn)
-        backfill = [
-            (str(row["memory_id"]), str(row["content"]))
-            for row in rows
-            if row.get("memory_id") and row.get("content")
-        ]
+        pending = self._insert_rows(
+            rows, lambda sql, binds_list: self._exec_insert(sql, binds_list, tx_conn),
+            what="insert_many", row_columns=True, raise_duplicate=False,
+        )
         if tx_conn is not None:
-            return backfill  # caller queues after its commit
-        for mid, cnt in backfill:
-            self._queue_embed_backfill(mid, cnt)
+            return pending  # caller queues after its commit
+        for mid, text in pending:
+            self._queue_embed_backfill(mid, text)
         return []
 
     def _exec_insert(self, sql: str, binds_list: list[Any], tx_conn: Any = None) -> None:
@@ -3329,171 +3007,88 @@ class OracleMemoryProvider(MemoryProvider):
         with conn.cursor() as fresh:
             return self._fetch_rows(fresh, sql, binds, max_rows=max_rows)
 
-    def _build_text_search_sql(
-        self, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, session_id: Any = None, agent_id: Any = None,
+    _SEARCH_COLUMNS = "memory_id, session_id, agent_id, role, content, target"
+    _TAGS_COLUMN = "JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags"
+
+    def _row_filters(
+        self, tgt: str = "any", *, session_id: Any = None, agent_id: Any = None,
         tags: Any = None, tag_match: str = "all",
     ) -> tuple[str, dict]:
-        extra_filters = ""
-        binds = {"q": contains_q, "k": fetch_k}
+        """The predicates every search leg shares, as SQL (each starting with
+        " AND") and its binds: junk rows out, then the target, session, agent
+        and tag filters the caller asked for."""
+        sql = self._JUNK
+        binds: dict[str, Any] = {}
+        if tgt not in ("", "any"):
+            sql += " AND target = :tgt "
+            binds["tgt"] = tgt
         if session_id:
-            extra_filters += " AND session_id = :sid "
+            sql += " AND session_id = :sid "
             binds["sid"] = session_id
         if agent_id:
-            extra_filters += " AND agent_id = :aid "
+            sql += " AND agent_id = :aid "
             binds["aid"] = agent_id
         tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
-        extra_filters += tag_sql
+        sql += tag_sql
         binds.update(tag_binds)
+        return sql, binds
 
-        sql = f"""
-            SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
+    def _text_leg_sql(self, filters: str) -> str:
+        """Oracle Text candidates, best first. Binds :q (CONTAINS query), :k."""
+        return f"""
+            SELECT /*+ NO_PARALLEL */ {self._SEARCH_COLUMNS},
                    SCORE(1) AS txt_score, NULL AS distance, created_at,
-                   JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
+                   {self._TAGS_COLUMN}
             FROM {self._table}
             WHERE CONTAINS(content, :q, 1) > 0
-            {self._JUNK}{tgt_sql}{extra_filters}
+            {filters}
             ORDER BY txt_score DESC, created_at DESC
             FETCH FIRST :k ROWS ONLY
-        """
-        if tgt_sql:
-            binds["tgt"] = tgt
-        return sql, binds
+        """  # nosec B608 - table and model names are sanitized at init; values are bound
 
-    def _build_vector_search_sql(
-        self, query: str, vec: Any, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None,
-        tags: Any = None, tag_match: str = "all",
-    ) -> tuple[str, dict]:
-        extra_filters = ""
-        if session_id:
-            extra_filters += " AND session_id = :sid "
-        if agent_id:
-            extra_filters += " AND agent_id = :aid "
-        tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
-        extra_filters += tag_sql
+    def _vector_leg_sql(self, filters: str) -> str:
+        """Nearest rows to the query, embedded in the database. Binds :qv, :k."""
+        return f"""
+            SELECT /*+ NO_PARALLEL */ {self._SEARCH_COLUMNS},
+                   0 AS txt_score,
+                   VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
+                   created_at, {self._TAGS_COLUMN}
+            FROM {self._table}
+            WHERE embedding IS NOT NULL
+            {filters}
+            ORDER BY distance ASC, created_at DESC
+            FETCH FIRST :k ROWS ONLY
+        """  # nosec B608
 
-        if use_onnx and self._onnx_model:
-            sql = f"""
-                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
-                       created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
-                FROM {self._table}
-                WHERE embedding IS NOT NULL
-                {self._JUNK}{tgt_sql}{extra_filters}
-                ORDER BY distance ASC, created_at DESC
-                FETCH FIRST :k ROWS ONLY
-            """
-            binds = {"qv": self._safe_embed_text(query), "k": fetch_k}
-        else:
-            sql = f"""
-                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       0 AS txt_score,
-                       VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
-                       created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
-                FROM {self._table}
-                WHERE embedding IS NOT NULL
-                {self._JUNK}{tgt_sql}{extra_filters}
-                ORDER BY distance ASC, created_at DESC
-                FETCH FIRST :k ROWS ONLY
-            """
-            binds = {"v": vec, "k": fetch_k}
+    def _build_text_search_sql(self, contains_q: str, fetch_k: int, tgt: str = "any", **filters: Any) -> tuple[str, dict]:
+        where, binds = self._row_filters(tgt, **filters)
+        binds.update({"q": contains_q, "k": fetch_k})
+        return self._text_leg_sql(where), binds
 
-        if tgt_sql:
-            binds["tgt"] = tgt
-        if session_id:
-            binds["sid"] = session_id
-        if agent_id:
-            binds["aid"] = agent_id
-        binds.update(tag_binds)
-        return sql, binds
+    def _build_vector_search_sql(self, query: str, fetch_k: int, tgt: str = "any", **filters: Any) -> tuple[str, dict]:
+        where, binds = self._row_filters(tgt, **filters)
+        binds.update({"qv": self._safe_embed_text(query), "k": fetch_k})
+        return self._vector_leg_sql(where), binds
 
     def _build_hybrid_search_sql(
-        self, query: str, vec: Any, contains_q: str, fetch_k: int, tgt_sql: str, tgt: str, use_onnx: bool = True, session_id: Any = None, agent_id: Any = None,
-        tags: Any = None, tag_match: str = "all",
+        self, query: str, contains_q: str, fetch_k: int, tgt: str = "any", **filters: Any
     ) -> tuple[str, dict]:
-        extra_filters = ""
-        if session_id:
-            extra_filters += " AND session_id = :sid "
-        if agent_id:
-            extra_filters += " AND agent_id = :aid "
-        tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
-        extra_filters += tag_sql
-
-        if use_onnx and self._onnx_model:
-            fused_sql = f"""
-                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at, tags
-                FROM (
-                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, VECTOR_EMBEDDING({self._onnx_model} USING :qv AS DATA), COSINE) AS distance,
-                           created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
-                    FROM {self._table}
-                    WHERE embedding IS NOT NULL
-                    {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY distance ASC, created_at DESC
-                    FETCH FIRST :k ROWS ONLY
-                )
-                UNION ALL
-                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at, tags
-                FROM (
-                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance, created_at,
-                           JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
-                    FROM {self._table}
-                    WHERE CONTAINS(content, :q, 1) > 0
-                    {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY txt_score DESC, created_at DESC
-                    FETCH FIRST :k ROWS ONLY
-                )
-            """
-            fused_binds: dict = {
-                "qv": self._safe_embed_text(query),
-                "q": contains_q,
-                "k": fetch_k,
-            }
-        else:
-            fused_sql = f"""
-                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at, tags
-                FROM (
-                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           0 AS txt_score,
-                           VECTOR_DISTANCE(embedding, TO_VECTOR(:v, 768, FLOAT32), COSINE) AS distance,
-                           created_at, JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
-                    FROM {self._table}
-                    WHERE embedding IS NOT NULL
-                    {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY distance ASC, created_at DESC
-                    FETCH FIRST :k ROWS ONLY
-                )
-                UNION ALL
-                SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                       txt_score, distance, created_at, tags
-                FROM (
-                    SELECT /*+ NO_PARALLEL */ memory_id, session_id, agent_id, role, content, target,
-                           SCORE(1) AS txt_score, NULL AS distance, created_at,
-                           JSON_QUERY(metadata, '$.tags' RETURNING VARCHAR2(4000) NULL ON ERROR) AS tags
-                    FROM {self._table}
-                    WHERE CONTAINS(content, :q, 1) > 0
-                    {self._JUNK}{tgt_sql}{extra_filters}
-                    ORDER BY txt_score DESC, created_at DESC
-                    FETCH FIRST :k ROWS ONLY
-                )
-            """
-            fused_binds = {"v": vec, "q": contains_q, "k": fetch_k}
-        if tgt_sql:
-            fused_binds["tgt"] = tgt
-        if session_id:
-            fused_binds["sid"] = session_id
-        if agent_id:
-            fused_binds["aid"] = agent_id
-        fused_binds.update(tag_binds)
-        return fused_sql, fused_binds
+        """Both legs in one statement: up to :k vector rows and up to :k text rows."""
+        where, binds = self._row_filters(tgt, **filters)
+        binds.update({"qv": self._safe_embed_text(query), "q": contains_q, "k": fetch_k})
+        columns = f"{self._SEARCH_COLUMNS}, txt_score, distance, created_at, tags"
+        sql = f"""
+            SELECT /*+ NO_PARALLEL */ {columns}
+            FROM ({self._vector_leg_sql(where)})
+            UNION ALL
+            SELECT /*+ NO_PARALLEL */ {columns}
+            FROM ({self._text_leg_sql(where)})
+        """  # nosec B608
+        return sql, binds
 
     def _execute_hybrid_search(
-        self, cur: Any, query: str, vec: Any, contains_q: str, top_k: int, fetch_k: int, tgt_sql: str, tgt: str, rerank: bool = True, session_id: Any = None, agent_id: Any = None, timeout_s: float | None = None,
+        self, cur: Any, query: str, contains_q: str, fetch_k: int, tgt: str = "any", *,
+        session_id: Any = None, agent_id: Any = None, timeout_s: float | None = None,
         tags: Any = None, tag_match: str = "all",
     ) -> list:
         if timeout_s is None:
@@ -3503,7 +3098,7 @@ class OracleMemoryProvider(MemoryProvider):
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")
             try:
                 sql, binds = self._build_text_search_sql(
-                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                    contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
@@ -3529,13 +3124,12 @@ class OracleMemoryProvider(MemoryProvider):
                 raise
             return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
-        use_onnx = bool(self._onnx_model)
-        if not use_onnx and vec is None:
+        if not self._onnx_model:
             raise RuntimeError(
                 "In-database ONNX model is not configured; external fallback is disabled"
             )
         fused_sql, fused_binds = self._build_hybrid_search_sql(
-            query, vec, contains_q, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+            query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
         )
 
         degraded_to_text = False
@@ -3571,7 +3165,7 @@ class OracleMemoryProvider(MemoryProvider):
                 is_text_err = any(code in err_str for code in ("DRG-", "ORA-29902", "ORA-30600"))
                 is_shape_err = any(code in err_str for code in ("ORA-54401", "ORA-51815"))
                 is_timeout_err = _is_timeout_error(e)
-                if use_onnx and not is_text_err and not is_shape_err and not is_timeout_err:
+                if not is_text_err and not is_shape_err and not is_timeout_err:
                     self._onnx_mark_failed(err_str)
 
                 if is_timeout_err:
@@ -3593,7 +3187,7 @@ class OracleMemoryProvider(MemoryProvider):
                     for vec_attempt in range(_51815_RETRIES):
                         try:
                             vec_sql, vec_binds = self._build_vector_search_sql(
-                                query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                                query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                             )
                             for r in self._fetch_rows_attempt(cur, vec_sql, vec_binds, vec_attempt):
                                 r.pop("dist", None)
@@ -3618,7 +3212,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 "In-database ONNX vector fallback failed (%s); external fallback is disabled",
                                 vec_err,
                             )
-                            if use_onnx and not is_vec_timeout and not any(code in vec_err_str for code in ("ORA-54401", "ORA-51815")):
+                            if not is_vec_timeout and not any(code in vec_err_str for code in ("ORA-54401", "ORA-51815")):
                                 self._onnx_mark_failed(vec_err)
                             if is_vec_timeout:
                                 raise TimeoutError(
@@ -3645,7 +3239,7 @@ class OracleMemoryProvider(MemoryProvider):
             merged.clear()
             try:
                 sql, binds = self._build_text_search_sql(
-                    contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                    contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
@@ -3678,7 +3272,7 @@ class OracleMemoryProvider(MemoryProvider):
 
         # Not cut to top_k here: weighting and per-source diversification run
         # in _search_once over the whole candidate list, and the optional rerank
-        # after them (*rerank* is applied there).
+        # after them.
         return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
 
     def _apply_weights(self, rows: list[dict[str, Any]], cur: Any = None) -> list[dict[str, Any]]:
@@ -3853,9 +3447,7 @@ class OracleMemoryProvider(MemoryProvider):
         top_k = max(1, min(int(top_k or 8), 30))
         mode = (mode or "hybrid").lower()
         tgt = (target or "any").lower()
-        tgt_sql = "" if tgt in ("", "any") else " AND target = :tgt "
         contains_q = self._contains_query(query)
-        vec = None
         if not self._onnx_model and mode != "text":
             raise RuntimeError(
                 "In-database ONNX model is not configured; external fallback is disabled"
@@ -3877,7 +3469,7 @@ class OracleMemoryProvider(MemoryProvider):
                 if mode == "text":
                     try:
                         sql, binds = self._build_text_search_sql(
-                            contains_q, fetch_k, tgt_sql, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                            contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                         )
                         rows = self._fetch_rows(cur, sql, binds)
                         for r in rows:
@@ -3900,18 +3492,13 @@ class OracleMemoryProvider(MemoryProvider):
                         raise
                 elif mode == "vector":
                     rows = []
-                    use_onnx = bool(self._onnx_model)
-                    if not use_onnx and vec is None:
-                        raise RuntimeError(
-                            "In-database ONNX model is not configured; external fallback is disabled"
-                        )
-                    if use_onnx and self._onnx_in_cooldown():
+                    if self._onnx_in_cooldown():
                         raise RuntimeError(
                             "In-database ONNX embedding model is in cooldown; external fallback is disabled"
                         )
                     try:
                         sql, binds = self._build_vector_search_sql(
-                            query, vec, fetch_k, tgt_sql, tgt, use_onnx=use_onnx, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                            query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
                         )
                         for attempt in range(_51815_RETRIES):
                             try:
@@ -3935,7 +3522,7 @@ class OracleMemoryProvider(MemoryProvider):
                             "In-database ONNX vector search failed (%s); external fallback is disabled",
                             e,
                         )
-                        if use_onnx and not is_shape_err and not is_timeout_err:
+                        if not is_shape_err and not is_timeout_err:
                             self._onnx_mark_failed(e)
                         if is_timeout_err:
                             raise TimeoutError(
@@ -3946,7 +3533,8 @@ class OracleMemoryProvider(MemoryProvider):
                         ) from e
                 else:
                     rows = self._execute_hybrid_search(
-                        cur, query, vec, contains_q, top_k, fetch_k, tgt_sql, tgt, rerank=rerank, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match, timeout_s=query_timeout_s
+                        cur, query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id,
+                        tags=tags, tag_match=tag_match, timeout_s=query_timeout_s,
                     )
                 rows = self._apply_weights(rows, cur)
                 if mode == "hybrid" and rerank and len(rows) > 1:
@@ -4598,7 +4186,6 @@ class OracleMemoryProvider(MemoryProvider):
                 err_str = str(e).upper()
                 if any(k in err_str for k in ("ORA-02396", "DPY-3015", "DPY-4024", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-01012", "NOT CONNECTED", "SESSION KILLED")):
                     logger.warning("Stale connection during skill fetch (%s); closing, re-acquiring and retrying once", e)
-                    self._last_restart_seen = time.monotonic()
                     with self._pool.acquire() as conn2:
                         rows = _fetch_skill_rows(conn2)
                 else:
@@ -4835,7 +4422,6 @@ class OracleMemoryProvider(MemoryProvider):
                 err_str = str(e).upper()
                 if any(k in err_str for k in ("ORA-02396", "DPY-3015", "DPY-4024", "ORA-03113", "ORA-03114", "ORA-03135", "ORA-01012", "NOT CONNECTED", "SESSION KILLED")):
                     logger.warning("Stale connection during skill list (%s); closing, re-acquiring and retrying once", e)
-                    self._last_restart_seen = time.monotonic()
                     with self._pool.acquire() as conn2:
                         return _run_list(conn2)
                 else:
@@ -4843,9 +4429,6 @@ class OracleMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.exception("oracle_load_skill list failed: %s", e)
             return tool_error(f"Failed to list skills: {e}")
-
-    def execute_tool(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
-        return self.handle_tool_call(tool_name, args, **kwargs)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(TOOL_SCHEMAS)
