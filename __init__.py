@@ -278,6 +278,27 @@ _SENSITIVE_ROOTS = (
 # Sensitive roots that are also a legitimate home directory (Hermes running as root).
 _HOME_LIKE_ROOTS = frozenset({"/root", "/private/var/root"})
 
+# macOS (APFS): the data volume is mounted at /System/Volumes/Data and
+# firmlinked into "/", so /System/Volumes/Data/Users/u and /Users/u are one
+# directory. Path.resolve() keeps both spellings, so path checks compare the
+# short one.
+_IS_DARWIN = sys.platform == "darwin"
+_DARWIN_DATA_VOLUME = "/System/Volumes/Data"
+
+
+def _volume_canonical(p: Path) -> Path:
+    """*p* without a leading /System/Volumes/Data on macOS; unchanged elsewhere.
+    For path checks only: the two spellings are the same directory for the
+    firmlinked trees (/Users, /private, ...), not for every path."""
+    if not _IS_DARWIN:
+        return p
+    sp = str(p)
+    if sp == _DARWIN_DATA_VOLUME:
+        return Path("/")
+    if sp.startswith(_DARWIN_DATA_VOLUME + "/"):
+        return Path(sp[len(_DARWIN_DATA_VOLUME):])
+    return p
+
 
 def _trusted_home_roots() -> list[Path]:
     """The user's home and HERMES_HOME, exempt from the system-root check (but
@@ -293,7 +314,7 @@ def _trusted_home_roots() -> list[Path]:
         if not raw:
             continue
         try:
-            r = Path(raw).expanduser().resolve()
+            r = _volume_canonical(Path(raw).expanduser().resolve())
         except (OSError, RuntimeError, KeyError):
             continue
         if len(r.parts) < 2:  # never exempt "/"
@@ -309,6 +330,7 @@ def _trusted_home_roots() -> list[Path]:
 
 def _sensitive_path_reason(p: Path) -> str:
     """Non-empty reason when *p* (already resolved) looks like a secret store."""
+    p = _volume_canonical(p)
     sp = str(p)
     if sp == "/":
         return "system path"
@@ -326,6 +348,42 @@ def _sensitive_path_reason(p: Path) -> str:
             or re.fullmatch(r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?", name)):
         return "credentials file"
     return ""
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+def _is_broad_scan_root(dp: Path) -> bool:
+    """True when *dp* (already resolved) is too broad to scan for skills:
+
+    - "/" or a top-level directory;
+    - the home directory or one of its ancestors, by path or by file identity
+      (an alias such as an APFS firmlink or a bind mount is a second path
+      that resolve() does not normalise);
+    - a system or credential path, or an ancestor of a system root;
+    - on macOS, the data volume or an ancestor of it.
+    """
+    if _IS_DARWIN and Path(_DARWIN_DATA_VOLUME).is_relative_to(dp):
+        return True
+    canon = _volume_canonical(dp)
+    if len(canon.parts) < 3:
+        return True
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError, KeyError):
+        home = None
+    if home is not None:
+        if _volume_canonical(home).is_relative_to(canon):
+            return True
+        if any(_same_file(dp, a) for a in (home, *home.parents)):
+            return True
+    if _sensitive_path_reason(canon):
+        return True
+    return any(Path(sr).is_relative_to(canon) for sr in _SENSITIVE_ROOTS)
 
 
 def _as_bool(v: Any) -> bool:
@@ -5035,8 +5093,7 @@ class OracleMemoryProvider(MemoryProvider):
                     for d in raw_dirs:
                         dp = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
                         # Refuse broad roots: "/", $HOME and any ancestor of it, system/credential dirs.
-                        if (Path.home().resolve().is_relative_to(dp) or _sensitive_path_reason(dp)
-                                or len(dp.parts) < 3):
+                        if _is_broad_scan_root(dp):
                             return tool_error(f"refusing to scan {d}: pass a specific skills directory")
                         if not dp.is_dir():
                             return tool_error(f"not a directory: {d}")

@@ -65,6 +65,26 @@ class TestChunkSecretGuard(unittest.TestCase):
         for f in ("/private/etc/ssh/sshd_config", "/private/var/db/x", "/private/var/root/notes"):
             self.assertEqual(oracle_plugin._sensitive_path_reason(Path(f)), "system path", f)
 
+    def test_macos_data_volume_spelling_of_system_paths_refused(self):
+        # #21: /System/Volumes/Data/private/etc is /private/etc on APFS.
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True):
+            for f in ("/System/Volumes/Data/private/etc/hosts", "/System/Volumes/Data/private/var/db/x"):
+                self.assertEqual(oracle_plugin._sensitive_path_reason(Path(f)), "system path", f)
+                p, cur = _provider()
+                out = p.handle_tool_call("oracle_chunk", {"file_path": f})
+                self.assertIn("Refusing to read", out, f)
+                cur.execute.assert_not_called()
+
+    def test_macos_home_exemption_matches_either_spelling(self):
+        # A home under a system root stays exempt whichever way it is spelled.
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/private/var/root")), \
+                patch.dict(os.environ, {"HERMES_HOME": ""}):
+            r = oracle_plugin._sensitive_path_reason
+            self.assertEqual(r(Path("/private/var/root/notes.md")), "")
+            self.assertEqual(r(Path("/System/Volumes/Data/private/var/root/notes.md")), "")
+            self.assertEqual(r(Path("/System/Volumes/Data/private/var/db/x")), "system path")
+
     def test_home_and_hermes_home_exempt_from_system_roots_only(self):
         hh = Path("/var/lib/hermes").resolve()  # /private/var/lib/hermes on macOS
         with patch.object(oracle_plugin.Path, "home", return_value=Path("/root")), \
@@ -181,6 +201,91 @@ class TestSyncSkillsArgs(unittest.TestCase):
                 p, out = self._call({"dirs": [bad]})
                 self.assertIn("refusing to scan", out, bad)
                 p.sync_skills.assert_not_called()
+
+    # #21: the guard compared path prefixes and depth only, which assumes a
+    # Linux layout. A second path to the home directory (an APFS firmlink, a
+    # bind mount) or an ancestor of a system root got past it.
+
+    def test_alias_of_home_or_its_ancestors_refused_by_identity(self):
+        # /alias/data/users/u is the home directory under a second path that
+        # resolve() does not normalise.
+        same = {("/alias/data/users/u", "/srv/users/u"), ("/alias/data/users", "/srv/users")}
+
+        def samefile(a, b):
+            return (str(a), str(b)) in same or str(a) == str(b)
+
+        with patch.object(oracle_plugin.Path, "home", return_value=Path("/srv/users/u")), \
+                patch.object(oracle_plugin.os.path, "samefile", side_effect=samefile):
+            for bad in ("/alias/data/users/u", "/alias/data/users"):
+                p, out = self._call({"dirs": [bad]})
+                self.assertIn("refusing to scan", out, bad)
+                p.sync_skills.assert_not_called()
+            # A directory below the alias is a specific directory again.
+            p, out = self._call({"dirs": ["/alias/data/users/u/skills"]})
+            self.assertNotIn("refusing to scan", out)
+
+    def test_ancestor_of_a_system_root_refused(self):
+        # /private/var holds /private/var/db and /private/var/root (macOS).
+        # It is three parts deep, so the depth rule alone lets it through.
+        p, out = self._call({"dirs": ["/private/var"]})
+        self.assertIn("refusing to scan", out)
+        p.sync_skills.assert_not_called()
+
+    def test_macos_data_volume_paths_refused(self):
+        # /System/Volumes/Data is the APFS data volume, firmlinked into "/".
+        bad = (
+            "/System/Volumes/Data",                # the whole data volume
+            "/System/Volumes",                     # an ancestor of it
+            "/System/Volumes/Data/home",           # /home
+            "/System/Volumes/Data/Users",          # a parent of the home dir
+            "/System/Volumes/Data/Users/u",        # the home dir
+            "/System/Volumes/Data/Users/u/.ssh",   # credentials dir
+            "/System/Volumes/Data/private/etc",    # /etc
+            "/System/Volumes/Data/private/var",    # holds /private/var/db
+        )
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/Users/u")):
+            for d in bad:
+                p, out = self._call({"dirs": [d]})
+                self.assertIn("refusing to scan", out, d)
+                p.sync_skills.assert_not_called()
+            for ok in ("/System/Volumes/Data/Users/u/.hermes/skills", "/Users/u/.hermes/skills"):
+                p, out = self._call({"dirs": [ok]})
+                self.assertNotIn("refusing to scan", out, ok)
+
+    def test_macos_home_given_under_the_data_volume(self):
+        # HOME itself may be spelled with the data-volume prefix.
+        with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/System/Volumes/Data/Users/u")):
+            for d in ("/Users/u", "/Users", "/System/Volumes/Data/Users/u"):
+                p, out = self._call({"dirs": [d]})
+                self.assertIn("refusing to scan", out, d)
+
+    def test_data_volume_prefix_means_nothing_off_macos(self):
+        with patch.object(oracle_plugin, "_IS_DARWIN", False, create=True), \
+                patch.object(oracle_plugin.Path, "home", return_value=Path("/home/u")):
+            p, out = self._call({"dirs": ["/System/Volumes/Data/home/u/skills"]})
+            self.assertNotIn("refusing to scan", out)
+
+    def test_accepted_dir_is_passed_on_as_given(self):
+        # The data-volume prefix is dropped for the checks only: the two
+        # spellings are one directory for firmlinked trees, not for all.
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td).resolve() / "skills"
+            d.mkdir()
+            with patch.object(oracle_plugin, "_IS_DARWIN", True, create=True):
+                p, _ = self._call({"dirs": [str(d)]})
+            self.assertEqual(p.sync_skills.call_args[1]["dirs"], [d])
+
+    @unittest.skipUnless(sys.platform == "darwin", "real APFS paths")
+    def test_real_macos_alias_paths_refused(self):
+        home = Path.home().resolve()
+        cases = ["/home", "/var", "/System/Volumes/Data", "/System/Volumes/Data/Users",
+                 "/System/Volumes/Data" + str(home)]
+        for bad in cases:
+            p, out = self._call({"dirs": [bad]})
+            self.assertIn("refusing to scan", out, bad)
+            p.sync_skills.assert_not_called()
 
     def test_force_text_false_is_false(self):
         for raw, want in (("false", False), ("0", False), ("true", True), (True, True), (None, False)):
