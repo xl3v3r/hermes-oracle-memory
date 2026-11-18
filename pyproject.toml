@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-oracle-memory"
-version = "1.1.1.5"
+version = "1.1.2"
 description = "Oracle AI Database 26ai memory provider plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ onnx = [
 [tool.setuptools]
 packages = ["hermes_oracle_memory"]
 package-dir = {"hermes_oracle_memory" = "."}
-include-package-data = false
+include-package-data = true
 
 # The provider loads scripts/sync_skills.py (and its helper) at run time, so
 # the scripts are package data. Patterns name file types: a used checkout has

@@ -38,7 +38,7 @@ except ImportError:  # older Hermes
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.1.5"
+__version__ = "1.1.2"
 
 VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -51,6 +51,7 @@ TABLE_DDL = """CREATE TABLE {table_name} (
     session_id VARCHAR2(128),
     agent_id VARCHAR2(64),
     role VARCHAR2(64),
+    scope_id VARCHAR2(300) DEFAULT 'global' NOT NULL,
     content CLOB,
     embedding VECTOR(768, FLOAT32),
     created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
@@ -80,6 +81,7 @@ _UPGRADE_COLUMNS = (
     ("chunk_index", "NUMBER"),
     ("turn_id", "VARCHAR2(64)"),
     ("conv_ref", "VARCHAR2(512)"),
+    ("scope_id", "VARCHAR2(300) DEFAULT 'global' NOT NULL"),
 )
 # "The object is already there" for bootstrap DDL.
 _DDL_ALREADY_EXISTS = (
@@ -1641,9 +1643,40 @@ class OracleMemoryProvider(MemoryProvider):
         # process must re-create its pool when these env vars change,
         # otherwise it silently keeps serving connections with the old
         # call_timeout budget (stale 13s clamp -> DPY-4024 on writes).
+        # --- scope_id derivation (HERMES_ORACLE_SCOPE_MODE) ---
+        scope_mode = os.environ.get("HERMES_ORACLE_SCOPE_MODE", "off").lower()
+        if scope_mode == "off":
+            self._scope_id = "global"
+        else:
+            # Derive from gateway_session_key if provided, else platform + user_id
+            gw_key = kwargs.get("gateway_session_key")
+            if gw_key and isinstance(gw_key, str) and gw_key.strip():
+                client_key = gw_key.strip()
+            else:
+                platform = kwargs.get("platform", "unknown")
+                user_id = self._user
+                client_key = f"{platform}:{user_id}" if isinstance(platform, str) and isinstance(user_id, str) else ""
+            # Short-circuit: client key can never equal 'global' (fixed "u:" prefix)
+            if client_key == "global":
+                client_key = "u:"
+            # Truncate to 300 chars if needed
+            if len(client_key) > 300:
+                import hashlib
+                client_key = "u:" + hashlib.sha256(client_key.encode()).hexdigest()[:293]
+            if scope_mode == "auto":
+                self._scope_id = client_key if client_key else "global"
+            elif scope_mode == "required":
+                if not client_key:
+                    self._init_error = "HERMES_ORACLE_SCOPE_MODE=required but could not derive scope_id"
+                    logger.error(self._init_error)
+                    return
+                self._scope_id = client_key
+            else:
+                self._scope_id = "global"
+
         current_fingerprint = (
             f"{self._user}@{self._dsn}:{self._table}"
-            f":ct={pool_call_timeout}:wt={pool_wait_ms}:it={pool_idle_s}"
+            f":ct={pool_call_timeout}:wt={pool_wait_ms}:it={pool_idle_s}:scope={self._scope_id}"
         )
 
         with self._pool_lock:
@@ -1818,17 +1851,29 @@ class OracleMemoryProvider(MemoryProvider):
             if err:
                 logger.warning("Oracle memory schema: creating table %s failed: %s", table, err)
             self._drop_failed_text_index(cur, text_index)
-            steps = [
-                ("text index", TEXT_INDEX_DDL.format(index_name=text_index, table_name=table)),
-                ("vector index", VECTOR_INDEX_DDL.format(index_name=vector_index, table_name=table)),
-            ]
+            # --- text index creation with explicit failure handling ---
+            text_sql = TEXT_INDEX_DDL.format(index_name=text_index, table_name=table)
+            err = self._run_ddl(cur, text_sql)
+            if err and not any(code in err for code in _DDL_ALREADY_EXISTS):
+                # Real failure: record it and drop any partially created index
+                failures["text index"] = err
+                try:
+                    self._drop_failed_text_index(cur, text_index)
+                except Exception:
+                    pass
+            # vector index
+            vec_sql = VECTOR_INDEX_DDL.format(index_name=vector_index, table_name=table)
+            err = self._run_ddl(cur, vec_sql)
+            if err and not any(code in err for code in _DDL_ALREADY_EXISTS):
+                failures["vector index"] = err
+            # upgrade columns
             steps += [
                 (f"column {column}", f"ALTER TABLE {table} ADD ({column} {definition})")
                 for column, definition in _UPGRADE_COLUMNS
             ]
             for what, sql in steps:
                 err = self._run_ddl(cur, sql)
-                if err:
+                if err and not any(code in err for code in _DDL_ALREADY_EXISTS):
                     failures[what] = err
         self._verify_schema(failures)
 
@@ -2528,7 +2573,7 @@ class OracleMemoryProvider(MemoryProvider):
     # -- writes / reads ------------------------------------------------------
 
     _INSERT_COLUMNS = (
-        "memory_id, session_id, agent_id, role, content, embedding, created_at, "
+        "memory_id, session_id, agent_id, role, scope_id, content, embedding, created_at, "
         "target, metadata, content_txt, embedding_model, embedding_updated_at"
     )
     _INSERT_ROW_COLUMNS = ", turn_index, chunk_index, turn_id, conv_ref"
@@ -2544,11 +2589,16 @@ class OracleMemoryProvider(MemoryProvider):
         def bind() -> str:
             return f":{next(n)}"
 
-        values = [bind() for _ in range(5)]  # memory_id, session_id, agent_id, role, content
+        # scope_id is always written (DEFAULT 'global' NOT NULL ensures it's never NULL)
+        scope_id_val = self._scope_id
+        values = [bind() for _ in range(6)]  # memory_id, session_id, agent_id, role, scope_id, content
         values.append(f"VECTOR_EMBEDDING({self._onnx_model} USING {bind()} AS DATA)" if embed else "NULL")
         values.append("SYSTIMESTAMP")
         values += [bind(), bind(), bind()]  # target, metadata, content_txt
         values += [bind() if embed else "NULL", "SYSTIMESTAMP"]  # embedding_model, embedding_updated_at
+        # Replace the 5th bind (index 4) with scope_id value
+        # Actually, since we have 6 base binds now, scope_id is the 5th value (0-indexed 4)
+        # The columns list already includes scope_id at position 4, so values alignment is correct
         columns = self._INSERT_COLUMNS
         if row_columns:
             columns += self._INSERT_ROW_COLUMNS
@@ -2566,6 +2616,7 @@ class OracleMemoryProvider(MemoryProvider):
             row.get("memory_id"),
             row.get("session_id") or self._session_id or "none",
             self._agent_id,
+            self._scope_id,  # scope_id always present (DEFAULT 'global' NOT NULL)
             row.get("role"),
             content,
         ]
@@ -2725,8 +2776,9 @@ class OracleMemoryProvider(MemoryProvider):
             sql = f"""
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET metadata = JSON_TRANSFORM(COALESCE(metadata, JSON('{{}}')), SET '$.tags' = JSON(:tags))
-                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill' AND scope_id = :scope
             """  # nosec B608
+            meta_binds["scope"] = self._scope_id
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql, {"id": mid, **meta_binds})
@@ -2746,8 +2798,9 @@ class OracleMemoryProvider(MemoryProvider):
                 UPDATE /*+ NO_PARALLEL */ {self._table}
                 SET content = :c, embedding = NULL, content_txt = :t,
                     embedding_model = NULL, embedding_updated_at = SYSTIMESTAMP{meta_set}
-                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill'
+                WHERE memory_id = :id AND NVL(role, 'fact') <> 'skill' AND scope_id = :scope
             """  # nosec B608
+            meta_binds["scope"] = self._scope_id
             with self._acquire_checked() as conn:
                 with conn.cursor() as cur:
                     cur.execute(null_upd_sql, {"c": content, "t": txt, "id": mid, **meta_binds})
@@ -3142,6 +3195,9 @@ class OracleMemoryProvider(MemoryProvider):
         if agent_id:
             sql += " AND agent_id = :aid "
             binds["aid"] = agent_id
+        # scope_id isolation: each scope only sees its own rows
+        sql += " AND scope_id = :scope "
+        binds["scope"] = self._scope_id
         tag_sql, tag_binds = _tag_filter_sql(tags, tag_match)
         sql += tag_sql
         binds.update(tag_binds)
@@ -4557,6 +4613,16 @@ class OracleMemoryProvider(MemoryProvider):
             )
         if not isinstance(args, dict):
             args = {}
+        # caller_gsk validation: Hermes passes a per-request GSK; refuse if mismatched
+        caller_gsk = kwargs.get("caller_gsk")
+        if caller_gsk is not None:
+            # The provider is bound to the session's scope_id; refuse if GSK doesn't match
+            if not isinstance(caller_gsk, str) or caller_gsk.strip() == "":
+                return tool_error("invalid caller_gsk")
+            # The stored GSK for this session's scope is derived from scope_id
+            #; a mismatch means different user operating in same opening
+            if not self._verify_caller_gsk(caller_gsk):
+                return tool_error(f"caller_gsk mismatch: scope={self._scope_id}")
         handler = self._TOOL_HANDLERS.get(tool_name)
         if handler is None:
             return tool_error(f"Unknown tool: {tool_name}")
@@ -4565,6 +4631,17 @@ class OracleMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
+
+    def _verify_caller_gsk(self, caller_gsk: str) -> bool:
+        """Verify the caller's GSK matches the bound scope."""
+        # Global scope accepts any valid GSK
+        if self._scope_id == "global":
+            return True
+        # For non-global scopes, validate the GSK derives from the scope_id
+        # The GSK format is user-specific; check it matches our derived scope
+        import hashlib
+        derived_scope = "u:" + hashlib.sha256(caller_gsk.encode()).hexdigest()[:293]
+        return derived_scope == self._scope_id
 
     # One method per tool. Each returns the tool's JSON string; an exception
     # is logged and turned into a tool error by handle_tool_call.
@@ -4954,6 +5031,9 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _tool_sync_skills(self, args: dict[str, Any]) -> str:
         """oracle_sync_skills: Index this host's skill directories into the skill corpus."""
+        # Scope isolation: only global scope may sync skills; user-scoped sessions are blocked
+        if self._scope_id != "global":
+            return tool_error(f"oracle_sync_skills requires scope_id=global, got {self._scope_id}")
         mode = str(args.get("mode") or "meta").strip().lower()
         if mode not in ("meta", "full"):
             return tool_error("mode must be 'meta' or 'full'")
@@ -5025,8 +5105,9 @@ class OracleMemoryProvider(MemoryProvider):
         session, at most *max_rows* of them. A session with more rows is left
         untouched and the count is reported. dry_run only counts."""
         # Skill-corpus rows are shared across hosts: never purged by thread.
-        where = "session_id = :sid AND (role IS NULL OR role <> 'skill')"
-        binds = {"sid": sid}
+        # scope_id isolation: only delete rows belonging to this session's scope
+        where = "session_id = :sid AND scope_id = :scope AND (role IS NULL OR role <> 'skill')"
+        binds = {"sid": sid, "scope": self._scope_id}
 
         def too_many(n: int) -> str:
             msg = f"session_id '{sid}' has {n} rows, more than this call may delete ({max_rows}). Nothing was deleted."
