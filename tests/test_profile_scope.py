@@ -98,8 +98,9 @@ class TestHermesHome(_Saved):
         host.get_hermes_home.return_value = "/var/lib/hermes/profiles/work"
         with patch.dict(sys.modules, {"hermes_constants": host}), patch.dict(os.environ, {"HERMES_HOME": ""}):
             r = oracle_plugin._sensitive_path_reason
-            self.assertEqual(r(Path("/var/lib/hermes/profiles/work/skills/x/SKILL.md")), "")
-            self.assertEqual(r(Path("/var/lib/hermes/profiles/other/notes.md")), "system path")
+            # The function takes resolved paths (on macOS /var is /private/var).
+            self.assertEqual(r(Path("/var/lib/hermes/profiles/work/skills/x/SKILL.md").resolve()), "")
+            self.assertEqual(r(Path("/var/lib/hermes/profiles/other/notes.md").resolve()), "system path")
 
 
 class TestProfileSettings(_Saved):
