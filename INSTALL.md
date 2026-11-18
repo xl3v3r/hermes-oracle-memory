@@ -30,7 +30,7 @@ This guide provides complete instructions for installing, configuring, and verif
 The provider delivers enterprise-grade integration across Oracle Cloud Infrastructure:
 
 - **Direct OCI Autonomous AI Database 26ai Vector Capabilities**:
-  - Native 768-dimensional `VECTOR(768, FLOAT32)` storage, in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`, and IVF / HNSW In-Memory Neighbor Graph indexing.
+  - Native 768-dimensional `VECTOR(768, FLOAT32)` storage, in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`, and an in-memory HNSW vector index (`ORGANIZATION INMEMORY NEIGHBOR GRAPH`).
 - **Native OCI GenAI Service Fallback**:
   - Automatic fallback to OCI Generative AI inference (`cohere.embed-v4.0`) via native OCI Instance Principals and API signing when running on OCI Compute or container instances—no static API keys required.
 - **Connection and Signer Caching Across Agent Sessions**:

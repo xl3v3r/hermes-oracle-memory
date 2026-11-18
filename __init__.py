@@ -1,6 +1,6 @@
 """Oracle 26ai memory plugin — MemoryProvider for Autonomous AI Database.
 
-VECTOR IVF + Oracle Text + JSON search as the primary Hermes memory backend.
+Vector search (in-memory HNSW index) + Oracle Text + JSON as the primary Hermes memory backend.
 Credentials: OCI_DB_USER / OCI_DB_PASSWORD / OCI_DB_DSN in $HERMES_HOME/.env.
 Embeddings: In-database ONNX model (768-d BGE_BASE_EN_V1_5 via VECTOR_EMBEDDING) strictly
 in-database. Keeping all data 100% in-house with zero external third-party endpoint fallback.
@@ -1374,9 +1374,10 @@ class OracleMemoryProvider(MemoryProvider):
         self._table = "hermes_agent_memory"
         self._onnx_model = "BGE_BASE_EN_V1_5"
         # Set by _verify_schema: what the schema lacks, and the vector index
-        # found ("HNSW", "IVF" or "" when there is none or it is unknown).
+        # found: "HNSW", "IVF", "none", or "unknown" (not read yet, the table
+        # belongs to another schema, or a type this version does not know).
         self._schema_warnings: list[str] = []
-        self._vector_index_kind = ""
+        self._vector_index_kind = "unknown"
 
     @property
     def name(self) -> str:
@@ -1384,7 +1385,8 @@ class OracleMemoryProvider(MemoryProvider):
 
     def health(self) -> dict[str, Any]:
         """Return health status of provider: pool, rows (capped), last_write,
-        init_error, schema_warnings (missing indexes found at start-up)."""
+        init_error, schema_warnings (missing indexes found at start-up),
+        vector_index (HNSW, IVF, none or unknown)."""
         rows_count = 0
         if self._pool:
             try:
@@ -1406,6 +1408,7 @@ class OracleMemoryProvider(MemoryProvider):
             "last_write": self._last_write_at or "none",
             "init_error": self._init_error or None,
             "schema_warnings": list(self._schema_warnings),
+            "vector_index": self._vector_index_kind,
         }
 
     def is_available(self) -> bool:
@@ -1766,7 +1769,7 @@ class OracleMemoryProvider(MemoryProvider):
             cur.fetchone()
             rows = self._index_rows(cur)
         warnings: list[str] = []
-        kind = ""
+        kind = "unknown"
         if rows:  # none: not this user's table (a synonym), so nothing to judge
             text = self._text_indexes(rows)
             failed = [str(r[0]) for r in text if str(r[4] or "").upper() == "FAILED"]
@@ -1787,8 +1790,9 @@ class OracleMemoryProvider(MemoryProvider):
             vector = [r for r in rows if r[1] == "VECTOR"]
             if vector:
                 subtype = str(vector[0][2] or "").upper()
-                kind = "HNSW" if "HNSW" in subtype else "IVF" if "IVF" in subtype else ""
+                kind = "HNSW" if "HNSW" in subtype else "IVF" if "IVF" in subtype else "unknown"
             else:
+                kind = "none"
                 why = failures.pop("vector index", "")
                 warnings.append(
                     f"no vector index on {table}.EMBEDDING"
@@ -1812,7 +1816,7 @@ class OracleMemoryProvider(MemoryProvider):
             return f"# Oracle 26ai Memory\nUnavailable ({reason}). No memory store is available. Local memory is prohibited."
         return (
             "# Oracle 26ai Memory (Primary Store)\n"
-            f"Active: ADB VECTOR IVF + Oracle Text + JSON. Agent: {self._agent_id}.\n"
+            f"Active: hybrid search (vector + Oracle Text). Agent: {self._agent_id}.\n"
             f"{_PROMPT_BODY}"
         )
 

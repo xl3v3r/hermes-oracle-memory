@@ -285,7 +285,7 @@ class TestVerifySchema(_Case):
             p, _ = self._verify([PK, TXT, row])
             self.assertEqual(p._vector_index_kind, kind)
         p, _ = self._verify([PK, TXT])
-        self.assertEqual(p._vector_index_kind, "")
+        self.assertEqual(p._vector_index_kind, "none")
 
     def test_health_reports_no_warnings_before_initialize(self):
         self.assertEqual(oracle_plugin.OracleMemoryProvider().health()["schema_warnings"], [])
@@ -306,6 +306,49 @@ class TestVerifySchema(_Case):
         with self.assertLogs(oracle_plugin.logger, level="WARNING"):
             p._verify_schema()
         self.assertIn(f"CREATE SEARCH INDEX {T}_TXT_IDX ON {T} (content)", p.health()["schema_warnings"][0])
+
+
+class TestVectorIndexWording(_Case):
+    """#27: the bootstrap creates an in-memory HNSW index; the plugin used to
+    advertise IVF. An install may have either, so nothing that ships states a
+    type the code does not create, and health() reports what is there."""
+
+    def test_canonical_ddl_is_hnsw(self):
+        self.assertIn("ORGANIZATION INMEMORY NEIGHBOR GRAPH", oracle_plugin.VECTOR_INDEX_DDL)
+
+    def test_nothing_advertises_ivf_as_the_index(self):
+        manifest = (REPO / "plugin.yaml").read_text(encoding="utf-8")
+        description = next(line for line in manifest.splitlines() if line.startswith("description:"))
+        self.assertNotIn("IVF", description)
+        self.assertNotIn("IVF", oracle_plugin.__doc__)
+        self.assertNotIn("IVF", (REPO / "AGENTS.md").read_text(encoding="utf-8"))
+        self.assertNotIn("IVF / HNSW", (REPO / "INSTALL.md").read_text(encoding="utf-8"))
+
+    def test_prompt_banner_names_no_index_type(self):
+        for kind in ("HNSW", "IVF", ""):
+            p = _provider(FakeCursor())
+            p._vector_index_kind = kind
+            p._agent_id = "a1"
+            first_lines = "\n".join(p.system_prompt_block().splitlines()[:2])
+            self.assertNotRegex(first_lines, r"IVF|HNSW|ADB")
+            self.assertIn("Agent: a1.", first_lines)
+
+    def test_health_reports_the_vector_index_found(self):
+        for rows, want in (([PK, TXT, HNSW], "HNSW"), ([PK, TXT, IVF], "IVF"), ([PK, TXT], "none")):
+            cur = FakeCursor(index_rows=rows)
+            p = _provider(cur)
+            p._verify_schema()
+            self.assertEqual(p.health()["vector_index"], want)
+
+    def test_health_before_the_schema_was_read(self):
+        self.assertEqual(oracle_plugin.OracleMemoryProvider().health()["vector_index"], "unknown")
+
+    def test_unrecognised_or_unreadable_index_is_unknown(self):
+        other = (f"{T}_VEC_IDX", "VECTOR", "SOMETHING_NEW", None, None, "EMBEDDING")
+        for rows in ([PK, TXT, other], []):
+            p = _provider(FakeCursor(index_rows=rows))
+            p._verify_schema()
+            self.assertEqual(p.health()["vector_index"], "unknown")
 
 
 class TestCanonicalDdlIsPublished(_Case):
