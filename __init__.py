@@ -39,6 +39,59 @@ VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
 )
 
+# Bootstrap DDL. INSTALL.md lists the same statements for installs that manage
+# the schema themselves (HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING).
+TABLE_DDL = """CREATE TABLE {table_name} (
+    memory_id VARCHAR2(128) PRIMARY KEY,
+    session_id VARCHAR2(128),
+    agent_id VARCHAR2(64),
+    role VARCHAR2(64),
+    content CLOB,
+    embedding VECTOR(768, FLOAT32),
+    created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
+    target VARCHAR2(32) DEFAULT 'memory',
+    metadata JSON,
+    content_txt VARCHAR2(4000),
+    embedding_model VARCHAR2(64),
+    embedding_updated_at TIMESTAMP(6),
+    turn_index NUMBER,
+    chunk_index NUMBER,
+    turn_id VARCHAR2(64),
+    conv_ref VARCHAR2(512)
+)"""
+# A plain Oracle Text search index. CONTAINS(content, ...) needs it, and so
+# does every INSERT once it exists: a domain index left in the FAILED state
+# rejects DML with ORA-29861.
+TEXT_INDEX_DDL = "CREATE SEARCH INDEX {index_name} ON {table_name} (content)"
+# Columns added after the first release; ALTER TABLE brings older tables up to date.
+_UPGRADE_COLUMNS = (
+    ("created_at", "TIMESTAMP DEFAULT SYSTIMESTAMP"),
+    ("target", "VARCHAR2(32) DEFAULT 'memory'"),
+    ("metadata", "JSON"),
+    ("content_txt", "VARCHAR2(4000)"),
+    ("embedding_model", "VARCHAR2(64)"),
+    ("embedding_updated_at", "TIMESTAMP(6)"),
+    ("turn_index", "NUMBER"),
+    ("chunk_index", "NUMBER"),
+    ("turn_id", "VARCHAR2(64)"),
+    ("conv_ref", "VARCHAR2(512)"),
+)
+# "The object is already there" for bootstrap DDL.
+_DDL_ALREADY_EXISTS = (
+    "ORA-00955",  # name is already used by an existing object
+    "ORA-01430",  # column being added already exists in table
+    "ORA-01408",  # such column list already indexed
+    "ORA-29879",  # cannot create multiple domain indexes on a column list using same indextype
+    "ORA-29880",  # such column list already indexed using another domain index and indextype
+)
+_INDEX_STATE_SQL = (
+    "SELECT i.index_name, i.index_type, i.index_subtype, i.ityp_name, i.domidx_opstatus, c.column_name "
+    "FROM user_indexes i LEFT JOIN user_ind_columns c ON c.index_name = i.index_name "
+    "WHERE i.table_name = UPPER(:t)"
+)
+# (pool fingerprint, warning) pairs already logged at warning level.
+_SCHEMA_WARNINGS_LOGGED: set[tuple[str, str]] = set()
+
 _51815_RETRIES = 3
 _51815_BACKOFF_SECS = 0.5
 
@@ -1320,13 +1373,18 @@ class OracleMemoryProvider(MemoryProvider):
         self._sync_threads_lock = threading.Lock()
         self._table = "hermes_agent_memory"
         self._onnx_model = "BGE_BASE_EN_V1_5"
+        # Set by _verify_schema: what the schema lacks, and the vector index
+        # found ("HNSW", "IVF" or "" when there is none or it is unknown).
+        self._schema_warnings: list[str] = []
+        self._vector_index_kind = ""
 
     @property
     def name(self) -> str:
         return "oracle"
 
     def health(self) -> dict[str, Any]:
-        """Return health status of provider: pool, rows (capped), last_write, init_error."""
+        """Return health status of provider: pool, rows (capped), last_write,
+        init_error, schema_warnings (missing indexes found at start-up)."""
         rows_count = 0
         if self._pool:
             try:
@@ -1347,6 +1405,7 @@ class OracleMemoryProvider(MemoryProvider):
             "rows": rows_count,
             "last_write": self._last_write_at or "none",
             "init_error": self._init_error or None,
+            "schema_warnings": list(self._schema_warnings),
         }
 
     def is_available(self) -> bool:
@@ -1619,57 +1678,133 @@ class OracleMemoryProvider(MemoryProvider):
             logger.info("HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING set: skipping runtime DDL and verifying schema")
             self._verify_schema()
             return
-        # Use DBMS_ASSERT to safely quote the table name and EXECUTE IMMEDIATE to run DDL.
-        # This prevents SQL injection vulnerabilities when executing dynamically built schema statements.
-        stmts = [
-            """
-            BEGIN
-                EXECUTE IMMEDIATE 'CREATE TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' (
-                    memory_id VARCHAR2(128) PRIMARY KEY,
-                    session_id VARCHAR2(128),
-                    agent_id VARCHAR2(64),
-                    role VARCHAR2(64),
-                    content CLOB,
-                    embedding VECTOR(768, FLOAT32),
-                    created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
-                    target VARCHAR2(32) DEFAULT ''memory'',
-                    metadata JSON,
-                    content_txt VARCHAR2(4000)
-                )';
-            END;
-            """,
-            """
-            BEGIN
-                EXECUTE IMMEDIATE 'CREATE SEARCH INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_TXT_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(content) FOR JSON';
-            END;
-            """,
-            "BEGIN EXECUTE IMMEDIATE 'CREATE VECTOR INDEX ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name) || '_VEC_IDX') || ' ON ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || '(embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH'; EXCEPTION WHEN OTHERS THEN NULL; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP)'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (target VARCHAR2(32) DEFAULT ''memory'')'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (metadata JSON)'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (content_txt VARCHAR2(4000))'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (embedding_model VARCHAR2(64))'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (embedding_updated_at TIMESTAMP(6))'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (turn_index NUMBER)'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (chunk_index NUMBER)'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (turn_id VARCHAR2(64))'; END;",
-            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE ' || DBMS_ASSERT.ENQUOTE_NAME(UPPER(:table_name)) || ' ADD (conv_ref VARCHAR2(512))'; END;",
-        ]
+        # self._table is sanitized to [A-Za-z0-9_] in initialize(), so it is
+        # safe to interpolate (DDL takes no bind variables).
+        table = self._table.upper()
+        text_index, vector_index = f"{table}_TXT_IDX", f"{table}_VEC_IDX"
+        failures: dict[str, str] = {}
         with self._pool.acquire() as conn, conn.cursor() as cur:
-            for sql in stmts:
-                try:
-                    cur.execute(sql, [self._table])
-                except Exception as e:
-                    if "ORA-01430" not in str(e):  # column already exists
-                        logger.debug("schema stmt skipped: %s", e)
-        self._verify_schema()
+            err = self._run_ddl(cur, TABLE_DDL.format(table_name=table))
+            if err:
+                logger.warning("Oracle memory schema: creating table %s failed: %s", table, err)
+            self._drop_failed_text_index(cur, text_index)
+            steps = [
+                ("text index", TEXT_INDEX_DDL.format(index_name=text_index, table_name=table)),
+                ("vector index", VECTOR_INDEX_DDL.format(index_name=vector_index, table_name=table)),
+            ]
+            steps += [
+                (f"column {column}", f"ALTER TABLE {table} ADD ({column} {definition})")
+                for column, definition in _UPGRADE_COLUMNS
+            ]
+            for what, sql in steps:
+                err = self._run_ddl(cur, sql)
+                if err:
+                    failures[what] = err
+        self._verify_schema(failures)
 
-    def _verify_schema(self) -> None:
-        """Raise if the memory table is not queryable, so `initialize` surfaces
-        the failure instead of reporting the provider as active while broken."""
+    @staticmethod
+    def _run_ddl(cur: Any, sql: str) -> str:
+        """Run one bootstrap statement. Returns "" when it ran or the object
+        is already there (the normal case on every start but the first), and
+        the first line of the error otherwise."""
+        try:
+            cur.execute(sql)
+            return ""
+        except Exception as e:
+            first = (str(e).strip().splitlines() or [type(e).__name__])[0]
+            if any(code in first for code in _DDL_ALREADY_EXISTS):
+                return ""
+            return first
+
+    def _index_rows(self, cur: Any) -> list[tuple]:
+        """(index_name, index_type, index_subtype, ityp_name, domidx_opstatus,
+        column_name) for the table's indexes; [] when the dictionary has none
+        (the table belongs to another schema) or cannot be read."""
+        try:
+            cur.execute(_INDEX_STATE_SQL, [self._table])
+            return [tuple(r) for r in cur.fetchall() if isinstance(r, (tuple, list)) and len(r) == 6]
+        except Exception as e:
+            logger.debug("oracle schema: index lookup skipped: %s", e)
+            return []
+
+    @staticmethod
+    def _text_indexes(rows: list[tuple]) -> list[tuple]:
+        """Oracle Text indexes on CONTENT (the JSON search index on METADATA
+        has the same index type and is not one of them)."""
+        return [
+            r for r in rows
+            if r[1] == "DOMAIN" and str(r[3] or "").upper().startswith("CONTEXT") and str(r[5] or "").upper() == "CONTENT"
+        ]
+
+    def _drop_failed_text_index(self, cur: Any, index_name: str) -> None:
+        """1.1.1 to 1.1.1.5 created the text index FOR JSON on the CLOB column.
+        That statement fails and leaves a FAILED domain index, which rejects
+        every INSERT (ORA-29861). Drop it so it can be created again. Only the
+        index this bootstrap names is touched, and only in the FAILED state."""
+        for row in self._text_indexes(self._index_rows(cur)):
+            if str(row[0]).upper() == index_name.upper() and str(row[4] or "").upper() == "FAILED":
+                logger.warning(
+                    "Oracle memory schema: text index %s is marked FAILED (left by an earlier bootstrap); "
+                    "dropping it and creating it again", index_name,
+                )
+                try:
+                    cur.execute(f"DROP INDEX {index_name} FORCE")
+                except Exception as e:
+                    logger.warning("Oracle memory schema: dropping %s failed: %s", index_name, e)
+
+    def _verify_schema(self, failures: dict[str, str] | None = None) -> None:
+        """Raise if the memory table is not usable, so `initialize` surfaces
+        the failure instead of reporting the provider as active while broken:
+        the table must be queryable, and a text index in the FAILED state is
+        fatal because it rejects every write. A missing text or vector index
+        only degrades search, so it is logged and kept for health().
+        *failures* maps a bootstrap step to the error it ended with."""
+        table = self._table.upper()
+        failures = dict(failures or {})
         with self._pool.acquire() as conn, conn.cursor() as cur:
             cur.execute(f"SELECT /*+ NO_PARALLEL */ COUNT(*) FROM {self._table}")  # nosec B608
             cur.fetchone()
+            rows = self._index_rows(cur)
+        warnings: list[str] = []
+        kind = ""
+        if rows:  # none: not this user's table (a synonym), so nothing to judge
+            text = self._text_indexes(rows)
+            failed = [str(r[0]) for r in text if str(r[4] or "").upper() == "FAILED"]
+            if failed:
+                raise RuntimeError(
+                    f"text index {failed[0]} on {table}.CONTENT is marked FAILED, so no row can be written "
+                    f"(ORA-29861). Drop it and create it again: DROP INDEX {failed[0]} FORCE; "
+                    + TEXT_INDEX_DDL.format(index_name=f"{table}_TXT_IDX", table_name=table)
+                )
+            if not text:
+                why = failures.pop("text index", "")
+                warnings.append(
+                    f"no Oracle Text index on {table}.CONTENT"
+                    + (f" (creating it failed: {why})" if why else "")
+                    + ": text search fails and hybrid search runs on the vector leg only. Create it: "
+                    + TEXT_INDEX_DDL.format(index_name=f"{table}_TXT_IDX", table_name=table)
+                )
+            vector = [r for r in rows if r[1] == "VECTOR"]
+            if vector:
+                subtype = str(vector[0][2] or "").upper()
+                kind = "HNSW" if "HNSW" in subtype else "IVF" if "IVF" in subtype else ""
+            else:
+                why = failures.pop("vector index", "")
+                warnings.append(
+                    f"no vector index on {table}.EMBEDDING"
+                    + (f" (creating it failed: {why})" if why else "")
+                    + ": vector search compares every row"
+                )
+        warnings += [f"creating the {what} failed: {err}" for what, err in failures.items()]
+        for w in warnings:
+            # Hermes builds a provider per agent and per API session; say it
+            # once per process, and keep it in health() for every instance.
+            seen = (self._pool_fingerprint, w)
+            level = logging.DEBUG if seen in _SCHEMA_WARNINGS_LOGGED else logging.WARNING
+            _SCHEMA_WARNINGS_LOGGED.add(seen)
+            logger.log(level, "Oracle memory schema: %s", w)
+        self._schema_warnings = warnings
+        self._vector_index_kind = kind
 
     def system_prompt_block(self) -> str:
         if not self._pool:

@@ -235,7 +235,50 @@ In enterprise environments where the database schema is managed via CI/CD migrat
 HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING
 ```
 
-When set, the provider skips runtime DDL attempts (`_ensure_schema()`) and verifies that required tables and indexes exist (`_verify_schema()`).
+When set, the provider runs no DDL at start-up. It checks that the table can be queried and looks up its indexes (`_verify_schema()`):
+
+- A text index in the `FAILED` state stops the provider with an error, because such an index rejects every write (`ORA-29861`).
+- A missing text or vector index is logged as a warning and listed under `schema_warnings` in `health()`. Search keeps working within the limits the warning names.
+
+Create the schema with the statements the bootstrap runs. Replace `HERMES_AGENT_MEMORY` if `HERMES_ORACLE_TABLE` names another table:
+
+```sql
+CREATE TABLE HERMES_AGENT_MEMORY (
+    memory_id VARCHAR2(128) PRIMARY KEY,
+    session_id VARCHAR2(128),
+    agent_id VARCHAR2(64),
+    role VARCHAR2(64),
+    content CLOB,
+    embedding VECTOR(768, FLOAT32),
+    created_at TIMESTAMP DEFAULT SYSTIMESTAMP,
+    target VARCHAR2(32) DEFAULT 'memory',
+    metadata JSON,
+    content_txt VARCHAR2(4000),
+    embedding_model VARCHAR2(64),
+    embedding_updated_at TIMESTAMP(6),
+    turn_index NUMBER,
+    chunk_index NUMBER,
+    turn_id VARCHAR2(64),
+    conv_ref VARCHAR2(512)
+);
+
+CREATE SEARCH INDEX HERMES_AGENT_MEMORY_TXT_IDX ON HERMES_AGENT_MEMORY (content);
+
+CREATE VECTOR INDEX HERMES_AGENT_MEMORY_VEC_IDX ON HERMES_AGENT_MEMORY (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH;
+```
+
+- **Text index.** A plain Oracle Text search index on `content`. The database maintains it in the background, so a new row appears in text search a few seconds after it is committed. Vector search and `oracle_get` see the row at once.
+- **Vector index.** An in-memory HNSW index. It needs the vector pool (`vector_memory_size`); without one the statement fails with `ORA-51962` and vector search compares every row, which is acceptable for a small table. An IVF index (`ORGANIZATION NEIGHBOR PARTITIONS`) needs no vector pool and works with the plugin as well.
+- **JSON search index.** Not required. The bootstrap does not create one on `metadata`.
+
+#### Text index left `FAILED` by 1.1.1 to 1.1.1.5
+
+Those releases created the text index with `FOR JSON` on the `content` CLOB. On an empty schema that statement fails and leaves the index in the `FAILED` state, and every write is then rejected with `ORA-29861`. From 1.1.2 the bootstrap drops that index and creates it again. Under `REQUIRE_EXISTING` it runs no DDL, so the provider stops with an error that names the two statements to run:
+
+```sql
+DROP INDEX HERMES_AGENT_MEMORY_TXT_IDX FORCE;
+CREATE SEARCH INDEX HERMES_AGENT_MEMORY_TXT_IDX ON HERMES_AGENT_MEMORY (content);
+```
 
 ### Prompt Injection Hardening
 
