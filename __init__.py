@@ -31,6 +31,11 @@ from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_promp
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
+try:  # Hermes copies the caller's context (profile home, secret scope) into the thread
+    from agent.memory_provider import spawn_context_thread as _spawn_context_thread
+except ImportError:  # older Hermes
+    _spawn_context_thread = None
+
 logger = logging.getLogger(__name__)
 
 __version__ = "1.1.1.5"
@@ -99,15 +104,60 @@ _51815_BACKOFF_SECS = 0.5
 def _is_51815(err: Any) -> bool:
     return "ORA-51815" in str(err)
 
-def _env_number_opt(name: str) -> float | None:
-    """Positive finite number from the environment (int or float text), or None
-    when unset, empty, or invalid (invalid values are logged)."""
+def _setting(name: str, default: str = "") -> str:
+    """A setting of the active profile: its secret scope (the profile's .env)
+    first, then the process environment. Hermes binds the scope to the turn's
+    context, so inside initialize(), a tool call or a context thread this is
+    the profile's own value. Without a scope (import time, a plain thread)
+    only the process environment is read."""
+    try:
+        value = get_secret(name)
+    except Exception:  # no scope on a multiplexed gateway: never guess a profile
+        value = None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     raw = os.environ.get(name)
-    if raw is None or not str(raw).strip():
+    return raw.strip() if isinstance(raw, str) and raw.strip() else default
+
+
+def _spawn_thread(target: Any, *, name: str, args: tuple = (), kwargs: dict | None = None) -> threading.Thread:
+    """An unstarted daemon thread for a background job. With Hermes'
+    spawn_context_thread it runs under the caller's context, so the job sees
+    the profile home and secret scope of the session that started it."""
+    if _spawn_context_thread is not None:
+        return _spawn_context_thread(target, name=name, daemon=True, args=args, kwargs=kwargs)
+    return threading.Thread(target=target, name=name, daemon=True, args=args, kwargs=kwargs)
+
+
+def _hermes_home_path(value: Any = None) -> Path | None:
+    """The Hermes home: *value* (the hermes_home Hermes passes to
+    initialize()), else the active profile's home, else $HERMES_HOME, else
+    ~/.hermes. None when no home can be determined."""
+    try:
+        if isinstance(value, (str, os.PathLike)) and str(value).strip():
+            return Path(str(value)).expanduser()
+        try:
+            from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+
+            return Path(get_hermes_home())
+        except Exception:
+            pass
+        env = (os.environ.get("HERMES_HOME") or "").strip()
+        return Path(env).expanduser() if env else Path.home() / ".hermes"
+    except (OSError, RuntimeError, KeyError):  # HOME unset and no pwd entry
+        return None
+
+
+def _env_number_opt(name: str, *, allow_zero: bool = False) -> float | None:
+    """Positive finite number from the settings (int or float text), or None
+    when unset, empty, or invalid (invalid values are logged). *allow_zero*
+    also accepts 0."""
+    raw = _setting(name)
+    if not raw:
         return None
     try:
-        val = float(str(raw).strip())
-        if not math.isfinite(val) or val <= 0:
+        val = float(raw)
+        if not math.isfinite(val) or val < 0 or (val == 0 and not allow_zero):
             raise ValueError
     except ValueError:
         logging.getLogger(__name__).warning("ignoring invalid %s=%r; using the default", name, raw)
@@ -115,10 +165,12 @@ def _env_number_opt(name: str) -> float | None:
     return val
 
 
-def _env_number(name: str, default: float, *, lo: float | None = None, hi: float | None = None) -> float:
+def _env_number(
+    name: str, default: float, *, lo: float | None = None, hi: float | None = None, allow_zero: bool = False
+) -> float:
     """Like _env_number_opt, falling back to *default*; an explicit value is
     clamped to [lo, hi] when given."""
-    val = _env_number_opt(name)
+    val = _env_number_opt(name, allow_zero=allow_zero)
     if val is None:
         return default
     if lo is not None:
@@ -300,9 +352,7 @@ def _retire_pool(pool: Any, reason: str) -> None:
             logger.debug("oracle %s pool close: %s", reason, e)
             return
         logger.info("oracle %s pool close deferred until busy connections return: %s", reason, e)
-        threading.Thread(
-            target=_close_pool_when_idle, args=(pool,), daemon=True, name="oracle-pool-close"
-        ).start()
+        _spawn_thread(_close_pool_when_idle, args=(pool,), name="oracle-pool-close").start()
 
 
 _RESERVED_SESSION_IDS = frozenset({"skills", "none", "null"})
@@ -361,7 +411,8 @@ def _trusted_home_roots() -> list[Path]:
     """The user's home and HERMES_HOME, exempt from the system-root check (but
     not from the credential name checks): when Hermes runs as root its home is
     /root, and service installs may use HERMES_HOME=/var/lib/hermes."""
-    raws = [os.environ.get("HERMES_HOME", "")]
+    hermes_home = _hermes_home_path()  # the active profile's home inside Hermes
+    raws = [str(hermes_home) if hermes_home is not None else ""]
     try:
         raws.append(str(Path.home()))
     except (OSError, RuntimeError, KeyError):  # HOME unset and no pwd entry
@@ -800,16 +851,13 @@ _SEARCH_TIMEOUT_MS = _search_timeout_ms()
 _SEARCH_TIMEOUT_SECS = _SEARCH_TIMEOUT_MS / 1000.0
 _INGEST_TIMEOUT_SECS = _ingest_timeout_secs()
 _INGEST_TIMEOUT_MS = int(_INGEST_TIMEOUT_SECS * 1000)
-_SKILL_FETCH_MAX_CHUNKS = int(os.environ.get("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", "400"))
+_SKILL_FETCH_MAX_CHUNKS = int(_env_number("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", 400, lo=1))
 _EMBED_MAX_RETRIES = 2
 _CONSERVATIVE_EMBED_CHARS = 400
 _RERANK_MAX_DOCS = 8
-_RERANK_ENABLED = (
-    os.environ.get("HERMES_ORACLE_DISABLE_RERANK", "").strip().lower()
-    not in ("1", "true", "yes")
-)
-_WEIGHT_RECENCY_FLOOR = float(os.environ.get("HERMES_ORACLE_RECENCY_FLOOR", "0.85"))
-_WEIGHT_RECENCY_SCALE_DAYS = float(os.environ.get("HERMES_ORACLE_RECENCY_SCALE_DAYS", "120"))
+_RERANK_ENABLED = _setting("HERMES_ORACLE_DISABLE_RERANK").lower() not in ("1", "true", "yes")
+_WEIGHT_RECENCY_FLOOR = _env_number("HERMES_ORACLE_RECENCY_FLOOR", 0.85, hi=1.0, allow_zero=True)
+_WEIGHT_RECENCY_SCALE_DAYS = _env_number("HERMES_ORACLE_RECENCY_SCALE_DAYS", 120.0)
 # Role preference is applied HERE, after candidates are selected, and must never be
 # pushed back into the SQL top-k cut. Encoding "facts first" as an ORDER BY term ahead
 # of the similarity key inside `FETCH FIRST :k` starves every non-fact role out of the
@@ -821,13 +869,37 @@ _WEIGHT_ROLE = {"fact": 1.0, "session": 0.9, "user": 0.9, "skill": 0.85, "turn":
 # Chunked corpora produce many near-identical embeddings, so a single skill can fill
 # every result slot on chunk multiplicity alone. Cap how many chunks one skill
 # (conv_ref) may contribute; rows without a conv_ref (facts, turns) are never capped.
-_MAX_CHUNKS_PER_SOURCE = int(os.environ.get("HERMES_ORACLE_MAX_CHUNKS_PER_SKILL", "2"))
+_MAX_CHUNKS_PER_SOURCE = int(_env_number("HERMES_ORACLE_MAX_CHUNKS_PER_SKILL", 2, allow_zero=True))
 # Minimum candidates pulled per branch before post-fusion ranking. Must comfortably
 # exceed top_k so role weighting and prefix boosting have material to re-rank.
-_MIN_CANDIDATE_POOL = int(os.environ.get("HERMES_ORACLE_MIN_CANDIDATE_POOL", "50"))
-_WEIGHT_TELEMETRY = float(os.environ.get("HERMES_ORACLE_TELEMETRY_WEIGHT", "0.05"))
+_MIN_CANDIDATE_POOL = int(_env_number("HERMES_ORACLE_MIN_CANDIDATE_POOL", 50, lo=1))
+_WEIGHT_TELEMETRY = _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, allow_zero=True)
 _WEIGHT_SHORT_CHARS = 25
 _WEIGHT_SHORT_FACTOR = 0.9
+
+
+def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
+    """The ranking and limit settings. Read from the settings of the active
+    profile, or (use_module_values) the process-wide values read at import."""
+    if use_module_values:
+        return {
+            "skill_fetch_max_chunks": _SKILL_FETCH_MAX_CHUNKS,
+            "rerank_enabled": _RERANK_ENABLED,
+            "recency_floor": _WEIGHT_RECENCY_FLOOR,
+            "recency_scale_days": _WEIGHT_RECENCY_SCALE_DAYS,
+            "max_chunks_per_source": _MAX_CHUNKS_PER_SOURCE,
+            "min_candidate_pool": _MIN_CANDIDATE_POOL,
+            "telemetry_weight": _WEIGHT_TELEMETRY,
+        }
+    return {
+        "skill_fetch_max_chunks": int(_env_number("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", 400, lo=1)),
+        "rerank_enabled": _setting("HERMES_ORACLE_DISABLE_RERANK").lower() not in ("1", "true", "yes"),
+        "recency_floor": _env_number("HERMES_ORACLE_RECENCY_FLOOR", 0.85, hi=1.0, allow_zero=True),
+        "recency_scale_days": _env_number("HERMES_ORACLE_RECENCY_SCALE_DAYS", 120.0),
+        "max_chunks_per_source": int(_env_number("HERMES_ORACLE_MAX_CHUNKS_PER_SKILL", 2, allow_zero=True)),
+        "min_candidate_pool": int(_env_number("HERMES_ORACLE_MIN_CANDIDATE_POOL", 50, lo=1)),
+        "telemetry_weight": _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, allow_zero=True),
+    }
 _TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
 
 
@@ -1378,6 +1450,14 @@ class OracleMemoryProvider(MemoryProvider):
         self._sync_threads_lock = threading.Lock()
         self._table = "hermes_agent_memory"
         self._onnx_model = "BGE_BASE_EN_V1_5"
+        # Bound in initialize() from the session's profile (never process-wide):
+        # the profile home, its timeouts and its schema policy. None means
+        # "not initialized": the module-level defaults apply.
+        self._hermes_home: Path | None = None
+        self._search_timeout_ms: int | None = None
+        self._ingest_timeout_ms: int | None = None
+        self._schema_policy: str | None = None
+        self._tuning: dict[str, Any] | None = None
         # Set by _verify_schema: what the schema lacks, and the vector index
         # found: "HNSW", "IVF", "none", or "unknown" (not read yet, the table
         # belongs to another schema, or a type this version does not know).
@@ -1388,6 +1468,27 @@ class OracleMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "oracle"
 
+    # This provider's own budgets and ranking settings. initialize() reads
+    # them inside the profile's scope; before that the process-wide defaults
+    # apply.
+    @property
+    def _search_ms(self) -> int:
+        return _SEARCH_TIMEOUT_MS if self._search_timeout_ms is None else self._search_timeout_ms
+
+    @property
+    def _search_secs(self) -> float:
+        return self._search_ms / 1000.0
+
+    @property
+    def _ingest_ms(self) -> int:
+        return _INGEST_TIMEOUT_MS if self._ingest_timeout_ms is None else self._ingest_timeout_ms
+
+    def _tune(self, key: str) -> Any:
+        """One ranking or limit setting of this provider's profile."""
+        if self._tuning is not None:
+            return self._tuning[key]
+        return _read_tuning(use_module_values=True)[key]
+
     def health(self) -> dict[str, Any]:
         """Return health status of provider: pool, rows (capped), last_write,
         init_error, schema_warnings (missing indexes found at start-up),
@@ -1397,7 +1498,7 @@ class OracleMemoryProvider(MemoryProvider):
             try:
                 with self._pool.acquire() as conn:
                     try:
-                        conn.call_timeout = _SEARCH_TIMEOUT_MS
+                        conn.call_timeout = self._search_ms
                     except Exception:
                         pass
                     with conn.cursor() as cur:
@@ -1493,6 +1594,10 @@ class OracleMemoryProvider(MemoryProvider):
         self._agent_id = agent_id if isinstance(agent_id, str) and agent_id else "hermes"
         agent_ctx = kwargs.get("agent_context")
         self._agent_context = agent_ctx if isinstance(agent_ctx, str) and agent_ctx else "primary"
+        # Hermes passes the profile-scoped home; never assume ~/.hermes.
+        self._hermes_home = _hermes_home_path(kwargs.get("hermes_home"))
+        self._schema_policy = _setting("HERMES_ORACLE_SCHEMA_POLICY").upper()
+        self._tuning = _read_tuning()
 
         # Load table name dynamically for OpenClaw shared memory compatibility
         import re as _re
@@ -1520,11 +1625,13 @@ class OracleMemoryProvider(MemoryProvider):
             self._init_error = "OCI_DB_PASSWORD or OCI_DB_DSN missing"
             logger.error("Oracle memory: %s", self._init_error)
             return
-        # Single env read for every timeout; refresh the module-level read-path
-        # clamps too so .env changes picked up by a re-initialize apply everywhere.
+        # One read of every timeout, inside the profile's scope. This provider
+        # keeps its own values; the module-level ones are refreshed as well and
+        # serve only providers that were never initialized.
         global _SEARCH_TIMEOUT_MS, _SEARCH_TIMEOUT_SECS, _INGEST_TIMEOUT_SECS, _INGEST_TIMEOUT_MS
         search_timeout_ms = _search_timeout_ms()
         ingest_timeout_ms = int(_ingest_timeout_secs() * 1000)
+        self._search_timeout_ms, self._ingest_timeout_ms = search_timeout_ms, ingest_timeout_ms
         _SEARCH_TIMEOUT_MS, _SEARCH_TIMEOUT_SECS = search_timeout_ms, search_timeout_ms / 1000.0
         _INGEST_TIMEOUT_MS, _INGEST_TIMEOUT_SECS = ingest_timeout_ms, ingest_timeout_ms / 1000.0
         pool_wait_ms = _pool_wait_timeout_ms()
@@ -1541,6 +1648,30 @@ class OracleMemoryProvider(MemoryProvider):
 
         with self._pool_lock:
             self._initialize_pool_locked(password, current_fingerprint, pool_call_timeout, pool_wait_ms, pool_idle_s)
+
+    def _find_wallet_dir(self) -> str:
+        """The wallet directory: OCI_WALLET_LOCATION, then TNS_ADMIN (both from
+        the profile's settings), then the first of ~/.oci/wallet and
+        <Hermes home>/oracle_wallet that holds a wallet. "" when there is none."""
+        for name in ("OCI_WALLET_LOCATION", "TNS_ADMIN"):
+            value = _setting(name)
+            if value:
+                return value
+        candidates: list[Path] = []
+        try:
+            candidates.append(Path.home() / ".oci" / "wallet")
+        except (OSError, RuntimeError, KeyError):
+            pass
+        home = self._hermes_home or _hermes_home_path()
+        if home is not None:
+            candidates.append(home / "oracle_wallet")
+        for candidate in candidates:
+            try:
+                if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
+                    return str(candidate)
+            except OSError:
+                continue
+        return ""
 
     def _initialize_pool_locked(
         self, password: str, current_fingerprint: str, pool_call_timeout: int, pool_wait_ms: int, pool_idle_s: int
@@ -1583,23 +1714,7 @@ class OracleMemoryProvider(MemoryProvider):
                 "call_timeout": pool_call_timeout,
             }
 
-            raw_wallet = get_secret("OCI_WALLET_LOCATION")
-            wallet_dir = (
-                raw_wallet
-                if isinstance(raw_wallet, str) and raw_wallet
-                else (os.environ.get("TNS_ADMIN") or "")
-            )
-            if not wallet_dir:
-                for candidate in (
-                    Path.home() / ".oci" / "wallet",
-                    Path.home() / ".hermes" / "oracle_wallet",
-                ):
-                    try:
-                        if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
-                            wallet_dir = str(candidate)
-                            break
-                    except Exception:
-                        pass
+            wallet_dir = self._find_wallet_dir()
 
             if wallet_dir and isinstance(wallet_dir, str):
                 try:
@@ -1614,15 +1729,19 @@ class OracleMemoryProvider(MemoryProvider):
                 except Exception:
                     pass
 
+            # Captured by value: the callback must not hold the provider, or the
+            # pool and the provider keep each other alive after a dropped agent.
+            session_call_timeout = max(self._search_ms, self._ingest_ms)
+
             def _session_callback(conn: Any, tag: Any = None) -> None:
                 try:
                     # Default per-connection budget must cover writes: bulk
                     # inserts (_insert_many) acquire a fresh pool connection and
                     # were being clamped to the 13s search default -> DPY-4024.
                     # Read paths that want a tight fail-fast window set
-                    # conn.call_timeout = _SEARCH_TIMEOUT_MS themselves after
+                    # conn.call_timeout to the search budget themselves after
                     # acquire (health, search, skill fetch, list).
-                    conn.call_timeout = max(_SEARCH_TIMEOUT_MS, _INGEST_TIMEOUT_MS)
+                    conn.call_timeout = session_call_timeout
                 except Exception:
                     pass
                 try:
@@ -1681,7 +1800,10 @@ class OracleMemoryProvider(MemoryProvider):
     def _ensure_schema(self) -> None:
         if not self._pool:
             return
-        policy = (os.environ.get("HERMES_ORACLE_SCHEMA_POLICY") or "").strip().upper()
+        # The profile's policy as read in initialize(); a direct call reads it now.
+        policy = self._schema_policy
+        if policy is None:
+            policy = _setting("HERMES_ORACLE_SCHEMA_POLICY").upper()
         if policy == "REQUIRE_EXISTING":
             logger.info("HERMES_ORACLE_SCHEMA_POLICY=REQUIRE_EXISTING set: skipping runtime DDL and verifying schema")
             self._verify_schema()
@@ -2067,11 +2189,7 @@ class OracleMemoryProvider(MemoryProvider):
                 return self._embed_worker
             if self._embed_worker is not None and self._embed_worker.is_alive():
                 return self._embed_worker
-            t = threading.Thread(
-                target=self._embed_worker_loop,
-                daemon=True,
-                name="oracle-embed-backfill",
-            )
+            t = _spawn_thread(self._embed_worker_loop, name="oracle-embed-backfill")
             self._embed_worker = t
             t.start()
             return t
@@ -2130,11 +2248,7 @@ class OracleMemoryProvider(MemoryProvider):
         with self._write_lock:
             if self._write_worker is not None and self._write_worker.is_alive():
                 return
-            self._write_worker = threading.Thread(
-                target=self._write_worker_loop,
-                daemon=True,
-                name="oracle-write-worker",
-            )
+            self._write_worker = _spawn_thread(self._write_worker_loop, name="oracle-write-worker")
             self._write_worker.start()
 
     def _write_worker_loop(self) -> None:
@@ -2364,7 +2478,7 @@ class OracleMemoryProvider(MemoryProvider):
         """  # nosec B608
         with self._acquire_checked() as conn:
             try:
-                conn.call_timeout = _SEARCH_TIMEOUT_MS
+                conn.call_timeout = self._search_ms
             except Exception:
                 pass
             with conn.cursor() as cur:
@@ -2398,7 +2512,7 @@ class OracleMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.info("embed backfill startup scan skipped: %s", e)
 
-        t = threading.Thread(target=_run, daemon=True, name="oracle-backfill-scan")
+        t = _spawn_thread(_run, name="oracle-backfill-scan")
         self._backfill_scan_thread = t
         t.start()
 
@@ -2831,7 +2945,7 @@ class OracleMemoryProvider(MemoryProvider):
         """  # nosec B608 - table name validated at init; all values are bound
         out: list[dict[str, Any]] = []
         with self._acquire_checked() as conn:
-            conn.call_timeout = _SEARCH_TIMEOUT_MS
+            conn.call_timeout = self._search_ms
             with conn.cursor() as cur:
                 cur.arraysize = max(_FETCH_ARRAYSIZE, binds["lim"] + 1)
                 cur.prefetchrows = cur.arraysize
@@ -3092,7 +3206,7 @@ class OracleMemoryProvider(MemoryProvider):
         tags: Any = None, tag_match: str = "all",
     ) -> list:
         if timeout_s is None:
-            timeout_s = _SEARCH_TIMEOUT_SECS  # read at call time (initialize() refreshes it)
+            timeout_s = self._search_secs
         merged: dict = {}
         if self._onnx_in_cooldown():
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")
@@ -3285,6 +3399,9 @@ class OracleMemoryProvider(MemoryProvider):
 
         try:
             now = datetime.now(timezone.utc)
+            recency_floor = self._tune("recency_floor")
+            recency_scale_days = self._tune("recency_scale_days")
+            telemetry_weight = self._tune("telemetry_weight")
             for r in rows:
                 if not isinstance(r, dict):
                     continue
@@ -3320,8 +3437,8 @@ class OracleMemoryProvider(MemoryProvider):
                             dt = dt.replace(tzinfo=timezone.utc)
                         age_seconds = max(0.0, (now - dt).total_seconds())
                         age_days = age_seconds / 86400.0
-                        recency_mult = _WEIGHT_RECENCY_FLOOR + (1.0 - _WEIGHT_RECENCY_FLOOR) * math.exp(
-                            -age_days / _WEIGHT_RECENCY_SCALE_DAYS
+                        recency_mult = recency_floor + (1.0 - recency_floor) * math.exp(
+                            -age_days / recency_scale_days
                         )
 
                 # 2. Role multiplier
@@ -3330,7 +3447,7 @@ class OracleMemoryProvider(MemoryProvider):
                 # 3. Telemetry multiplier
                 telemetry_mult = 1.0
                 if any(stripped_content.startswith(p) or stripped_content.lower().startswith(p.lower()) for p in _TELEMETRY_PREFIXES):
-                    telemetry_mult = _WEIGHT_TELEMETRY
+                    telemetry_mult = telemetry_weight
 
                 # 4. Short content multiplier (< 25 chars)
                 short_mult = 1.0
@@ -3355,7 +3472,7 @@ class OracleMemoryProvider(MemoryProvider):
         skill can occupy every result slot purely on chunk multiplicity and crowd out
         unrelated facts. Rows with no conv_ref (facts, turns) are never capped.
         """
-        limit = _MAX_CHUNKS_PER_SOURCE if max_per_source is None else max_per_source
+        limit = self._tune("max_chunks_per_source") if max_per_source is None else max_per_source
         if not limit or limit <= 0:
             return rows
         counts: dict[str, int] = {}
@@ -3457,8 +3574,9 @@ class OracleMemoryProvider(MemoryProvider):
         # per-source diversification all run AFTER this cut, so a narrow window lets
         # whichever corpus happens to be densest in embedding space monopolise results
         # (the v1.0.9.6 starvation bug was the extreme case of this).
-        fetch_k = max(top_k * 2, _MIN_CANDIDATE_POOL) if mode == "hybrid" else max(top_k, _MIN_CANDIDATE_POOL)
-        query_timeout_s = float(timeout) if timeout is not None else _SEARCH_TIMEOUT_SECS
+        pool_size = self._tune("min_candidate_pool")
+        fetch_k = max(top_k * 2, pool_size) if mode == "hybrid" else max(top_k, pool_size)
+        query_timeout_s = float(timeout) if timeout is not None else self._search_secs
         query_timeout_ms = int(query_timeout_s * 1000)
         with self._acquire_checked() as conn:
             try:
@@ -3545,7 +3663,7 @@ class OracleMemoryProvider(MemoryProvider):
         """Best-effort DBMS_VECTOR.RERANK; identity if the call is unavailable."""
         if not rows:
             return rows
-        if not _RERANK_ENABLED:
+        if not self._tune("rerank_enabled"):
             return rows
         docs = []
         for r in rows[: min(_RERANK_MAX_DOCS, len(rows))]:
@@ -3634,7 +3752,7 @@ class OracleMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
             self._prefetch_done = False
             self._prefetch_count = 0
-            pf_thread = threading.Thread(target=_run, daemon=True, name="oracle-prefetch")
+            pf_thread = _spawn_thread(_run, name="oracle-prefetch")
             self._prefetch_thread = pf_thread
         # Start the thread created under the lock, never re-read the attribute:
         # a concurrent call may already have replaced it (double start()).
@@ -3918,11 +4036,8 @@ class OracleMemoryProvider(MemoryProvider):
                 _LIFECYCLE_PENDING[key] = (self, op, roots)
                 return
             _LIFECYCLE_IN_FLIGHT.add(key)
-        thread = threading.Thread(
-            target=self._run_skill_lifecycle,
-            args=(key, skill_name, op, roots),
-            daemon=True,
-            name=f"oracle-lifecycle-{skill_name}",
+        thread = _spawn_thread(
+            self._run_skill_lifecycle, args=(key, skill_name, op, roots), name=f"oracle-lifecycle-{skill_name}"
         )
         started = False
         try:
@@ -4166,11 +4281,11 @@ class OracleMemoryProvider(MemoryProvider):
                 WHERE rn <= :cap
                 ORDER BY idx NULLS FIRST
             """
-            fetch_cap = max(1, _SKILL_FETCH_MAX_CHUNKS) + 2
+            fetch_cap = max(1, self._tune("skill_fetch_max_chunks")) + 2
 
             def _fetch_skill_rows(conn):
                 try:
-                    conn.call_timeout = _SEARCH_TIMEOUT_MS
+                    conn.call_timeout = self._search_ms
                 except Exception:
                     pass
                 with conn.cursor() as cur:
@@ -4289,9 +4404,9 @@ class OracleMemoryProvider(MemoryProvider):
             total_retrieved_chunks = len(body_chunks) + sum(len(c) for c in ref_chunks.values())
             status = "ok"
 
-            if total_retrieved_chunks > _SKILL_FETCH_MAX_CHUNKS:
+            if total_retrieved_chunks > self._tune("skill_fetch_max_chunks"):
                 status = "truncated"
-                body_chunks = body_chunks[:_SKILL_FETCH_MAX_CHUNKS]
+                body_chunks = body_chunks[:self._tune("skill_fetch_max_chunks")]
 
             meta_md = meta_row["metadata"] if meta_row else {}
             category = meta_md.get("category") or (parsed_rows[0]["metadata"].get("category") if parsed_rows else "general")
@@ -4385,7 +4500,7 @@ class OracleMemoryProvider(MemoryProvider):
 
             def _run_list(conn):
                 try:
-                    conn.call_timeout = _SEARCH_TIMEOUT_MS
+                    conn.call_timeout = self._search_ms
                 except Exception:
                     pass
                 with conn.cursor() as cur:
@@ -4491,12 +4606,12 @@ class OracleMemoryProvider(MemoryProvider):
             if is_timeout:
                 logger.warning(
                     "oracle_search query timed out after %ss (%s); clean fallback to empty results",
-                    _SEARCH_TIMEOUT_SECS,
+                    self._search_secs,
                     e,
                 )
                 return json.dumps(
                     {
-                        "result": f"No relevant memories found (oracle_search query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s).",
+                        "result": f"No relevant memories found (oracle_search query timed out after {self._search_secs:.0f}s).",
                         "count": 0,
                         "timed_out": True,
                     }
@@ -5133,12 +5248,7 @@ class OracleMemoryProvider(MemoryProvider):
                 len(busy),
             )
             pool = self._pool
-            threading.Thread(
-                target=self._finish_shutdown_when_idle,
-                args=(busy, pool),
-                daemon=True,
-                name="oracle-shutdown-finish",
-            ).start()
+            _spawn_thread(self._finish_shutdown_when_idle, args=(busy, pool), name="oracle-shutdown-finish").start()
             return
         with self._pool_lock:
             pool, self._pool = self._pool, None
