@@ -307,6 +307,11 @@ def _retire_pool(pool: Any, reason: str) -> None:
 
 
 _RESERVED_SESSION_IDS = frozenset({"skills", "none", "null"})
+# oracle_delete(session_id=...) removes a whole session. A call deletes at most
+# this many rows unless it names a higher max_rows, and never more than the
+# hard maximum: larger purges are an operator job in SQL.
+_PURGE_DEFAULT_MAX_ROWS = 200
+_PURGE_HARD_MAX_ROWS = 10000
 
 _SENSITIVE_DIR_NAMES = frozenset({
     ".ssh", ".gnupg", ".aws", ".oci", ".kube", ".docker", ".azure", ".gcloud",
@@ -1042,6 +1047,17 @@ TOOL_SCHEMAS = [
             "properties": {
                 "memory_id": {"type": "string", "description": "Specific memory ID to delete."},
                 "session_id": {"type": "string", "description": "Session ID to delete all associated memories for thread purge."},
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "With session_id: report how many rows would be deleted and delete nothing.",
+                },
+                "max_rows": {
+                    "type": "integer",
+                    "description": (
+                        f"With session_id: the most rows this call may delete (default {_PURGE_DEFAULT_MAX_ROWS}, "
+                        f"max {_PURGE_HARD_MAX_ROWS}). A session with more rows is left untouched."
+                    ),
+                },
             },
         },
     },
@@ -3989,6 +4005,9 @@ class OracleMemoryProvider(MemoryProvider):
             body = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", body)
             if len(body) > 280:
                 body = body[:277] + "..."
+            # The stored text is data: escaped, it cannot close the boundary
+            # tag or open another one. Cut first, so no entity is cut in half.
+            body = html.escape(body, quote=False)
             mid = html.escape(str(r.get("memory_id") or ""), quote=True)
             target = html.escape(str(r.get("target") or "memory"), quote=True)
             score = html.escape(str(r.get("score") if r.get("score") is not None else 0), quote=True)
@@ -5069,37 +5088,31 @@ class OracleMemoryProvider(MemoryProvider):
                     )
                 if mid and mid.lower().startswith(_SKILL_ID_PREFIX):
                     return tool_error(_SKILL_ROW_READONLY)
+                if sid:
+                    raw_max = args.get("max_rows")
+                    if raw_max is None or raw_max == "":
+                        max_rows = _PURGE_DEFAULT_MAX_ROWS
+                    else:
+                        ok = isinstance(raw_max, int) and not isinstance(raw_max, bool)
+                        if isinstance(raw_max, str) and raw_max.strip().isdigit():
+                            raw_max, ok = int(raw_max.strip()), True
+                        if not ok or not 1 <= raw_max <= _PURGE_HARD_MAX_ROWS:
+                            return tool_error(f"max_rows must be between 1 and {_PURGE_HARD_MAX_ROWS}")
+                        max_rows = raw_max
+                    return self._purge_session(sid, dry_run=_as_bool(args.get("dry_run", False)), max_rows=max_rows)
                 with self._acquire_checked() as conn:
                     with conn.cursor() as cur:
-                        if sid:
-                            # Skill-corpus rows are shared across hosts: never purged by thread.
-                            query = (
-                                f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE session_id = :1"  # nosec B608
-                                " AND (role IS NULL OR role <> 'skill')"
-                            )
-                            cur.execute(query, (sid,))
-                            n = cur.rowcount
-                            conn.commit()
-                            return json.dumps(
-                                {
-                                    "result": "thread_deleted",
-                                    "session_id": sid,
-                                    "deleted_count": n,
-                                }
-                            )
-                        else:
-                            # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
-                            query = (
-                                f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
-                                " AND NVL(role, 'fact') <> 'skill'"
-                            )
-                            cur.execute(
-                                query,
-                                (mid,),
-                            )
-                            n = cur.rowcount
-                            conn.commit()
-                # Only the memory_id branch gets here (the thread purge returned above).
+                        # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
+                        query = (
+                            f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                            " AND NVL(role, 'fact') <> 'skill'"
+                        )
+                        cur.execute(
+                            query,
+                            (mid,),
+                        )
+                        n = cur.rowcount
+                        conn.commit()
                 if not n:
                     if self._is_skill_row(mid):
                         return tool_error(_SKILL_ROW_READONLY)
@@ -5276,6 +5289,39 @@ class OracleMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
+
+    def _purge_session(self, sid: str, *, dry_run: bool, max_rows: int) -> str:
+        """oracle_delete(session_id=...): delete the non-skill rows of one
+        session, at most *max_rows* of them. A session with more rows is left
+        untouched and the count is reported. dry_run only counts."""
+        # Skill-corpus rows are shared across hosts: never purged by thread.
+        where = "session_id = :sid AND (role IS NULL OR role <> 'skill')"
+        binds = {"sid": sid}
+
+        def too_many(n: int) -> str:
+            msg = f"session_id '{sid}' has {n} rows, more than this call may delete ({max_rows}). Nothing was deleted."
+            if n <= _PURGE_HARD_MAX_ROWS:
+                msg += f" To delete them all, repeat with max_rows={n}."
+            else:
+                msg += f" No single call deletes more than {_PURGE_HARD_MAX_ROWS} rows; remove this session in SQL."
+            return tool_error(msg)
+
+        with self._acquire_checked() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT /*+ NO_PARALLEL */ COUNT(*) FROM {self._table} WHERE {where}", binds)  # nosec B608
+                row = cur.fetchone()
+                count = int(row[0]) if row else 0
+                if dry_run:
+                    return json.dumps({"result": "dry_run", "session_id": sid, "would_delete": count})
+                if count > max_rows:
+                    return too_many(count)
+                cur.execute(f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE {where}", binds)  # nosec B608
+                n = cur.rowcount
+                if n > max_rows:  # rows were added after the count
+                    conn.rollback()
+                    return too_many(n)
+                conn.commit()
+        return json.dumps({"result": "thread_deleted", "session_id": sid, "deleted_count": n})
 
     def _chunk_text(self, text: str, max_words: int, overlap: int) -> list:
         """Split one text unit into chunks (UTL_TO_CHUNKS in-DB, local fallback)."""

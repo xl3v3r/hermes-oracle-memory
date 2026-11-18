@@ -1275,8 +1275,8 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(res_ok["session_id"], "thread-456")
         self.assertEqual(res_ok["deleted_count"], 5)
         sql, binds = mock_cur.execute.call_args[0]
-        self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY WHERE session_id = :1", sql)
-        self.assertEqual(binds, ("thread-456",))
+        self.assertIn("DELETE /*+ NO_PARALLEL */ FROM HERMES_AGENT_MEMORY WHERE session_id = :sid", sql)
+        self.assertEqual(binds, {"sid": "thread-456"})
 
     def test_oracle_search_scoped_filters(self):
         provider = oracle_plugin.OracleMemoryProvider()

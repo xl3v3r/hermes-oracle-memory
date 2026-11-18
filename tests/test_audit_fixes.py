@@ -169,11 +169,104 @@ class TestDeleteGuard(unittest.TestCase):
 
     def test_session_purge_spares_skill_rows(self):
         p, cur = _provider(rowcount=3)
+        cur.fetchone.return_value = (3,)
         out = json.loads(p.handle_tool_call("oracle_delete", {"session_id": "thread-1"}))
         self.assertEqual(out["deleted_count"], 3)
-        sql, binds = cur.execute.call_args[0]
-        self.assertIn("role <> 'skill'", sql)
-        self.assertEqual(binds, ("thread-1",))
+        for call in cur.execute.call_args_list:
+            sql, binds = call[0]
+            self.assertIn("role <> 'skill'", sql)
+            self.assertEqual(binds, {"sid": "thread-1"})
+
+
+class TestSessionPurgeLimits(unittest.TestCase):
+    """#16: oracle_delete(session_id=...) removed every row of a session in
+    one call, with no dry run and no limit."""
+
+    def _purge(self, count, args, rowcount=None):
+        p, cur = _provider(rowcount=count if rowcount is None else rowcount)
+        cur.fetchone.return_value = (count,)
+        conn = p._pool.acquire.return_value
+        out = p.handle_tool_call("oracle_delete", dict({"session_id": "thread-1"}, **args))
+        stmts = [c[0][0].split()[0].upper() for c in cur.execute.call_args_list]
+        return out, stmts, conn
+
+    def test_dry_run_counts_and_deletes_nothing(self):
+        out, stmts, conn = self._purge(42, {"dry_run": True})
+        self.assertEqual(json.loads(out), {"result": "dry_run", "session_id": "thread-1", "would_delete": 42})
+        self.assertEqual(stmts, ["SELECT"])
+        conn.commit.assert_not_called()
+
+    def test_dry_run_text_values(self):
+        for raw in ("true", "1", "yes"):
+            out, stmts, _ = self._purge(1, {"dry_run": raw})
+            self.assertEqual(json.loads(out)["result"], "dry_run", raw)
+        out, stmts, _ = self._purge(1, {"dry_run": "false"})
+        self.assertEqual(json.loads(out)["result"], "thread_deleted")
+
+    def test_small_session_is_deleted_in_one_call(self):
+        out, stmts, conn = self._purge(200, {})
+        self.assertEqual(json.loads(out), {"result": "thread_deleted", "session_id": "thread-1", "deleted_count": 200})
+        self.assertEqual(stmts, ["SELECT", "DELETE"])
+        conn.commit.assert_called_once()
+
+    def test_session_over_the_default_limit_is_refused_untouched(self):
+        out, stmts, conn = self._purge(201, {})
+        self.assertIn("201 rows", out)
+        self.assertIn("Nothing was deleted", out)
+        self.assertIn("max_rows=201", out)
+        self.assertEqual(stmts, ["SELECT"])
+        conn.commit.assert_not_called()
+
+    def test_max_rows_allows_a_larger_purge(self):
+        out, stmts, conn = self._purge(1500, {"max_rows": 1500})
+        self.assertEqual(json.loads(out)["deleted_count"], 1500)
+        conn.commit.assert_called_once()
+
+    def test_max_rows_below_the_count_is_refused(self):
+        out, stmts, conn = self._purge(1500, {"max_rows": 1499})
+        self.assertIn("Nothing was deleted", out)
+        self.assertEqual(stmts, ["SELECT"])
+
+    def test_hard_ceiling_cannot_be_raised(self):
+        top = oracle_plugin._PURGE_HARD_MAX_ROWS
+        out, stmts, conn = self._purge(top + 1, {"max_rows": top + 1})
+        self.assertIn("max_rows must be between 1 and", out)
+        self.assertEqual(stmts, [])
+        out, stmts, conn = self._purge(top + 1, {"max_rows": top})
+        self.assertIn("Nothing was deleted", out)
+        self.assertNotIn("max_rows=", out)  # no call can delete that many
+        self.assertEqual(stmts, ["SELECT"])
+
+    def test_bad_max_rows_refused_before_any_statement(self):
+        for bad in (0, -5, "many", 1.5, True):
+            out, stmts, _ = self._purge(1, {"max_rows": bad})
+            self.assertIn("max_rows must be", out, bad)
+            self.assertEqual(stmts, [], bad)
+
+    def test_rows_added_between_count_and_delete_roll_the_delete_back(self):
+        out, stmts, conn = self._purge(200, {}, rowcount=205)
+        self.assertIn("Nothing was deleted", out)
+        self.assertIn("205 rows", out)
+        self.assertEqual(stmts, ["SELECT", "DELETE"])
+        conn.rollback.assert_called_once()
+        conn.commit.assert_not_called()
+
+    def test_empty_session_reports_zero(self):
+        out, stmts, conn = self._purge(0, {})
+        self.assertEqual(json.loads(out)["deleted_count"], 0)
+
+    def test_limits_do_not_apply_to_a_single_memory_id(self):
+        p, cur = _provider(rowcount=1)
+        out = json.loads(p.handle_tool_call("oracle_delete", {"memory_id": "fact_1", "dry_run": True}))
+        # dry_run is a session-purge option; one row by id is deleted as before.
+        self.assertEqual(out, {"result": "deleted", "memory_id": "fact_1"})
+
+    def test_schema_documents_the_options(self):
+        schema = next(s for s in oracle_plugin.TOOL_SCHEMAS if s["name"] == "oracle_delete")
+        props = schema["parameters"]["properties"]
+        self.assertEqual(props["dry_run"]["type"], "boolean")
+        self.assertEqual(props["max_rows"]["type"], "integer")
+        self.assertIn(str(oracle_plugin._PURGE_DEFAULT_MAX_ROWS), props["max_rows"]["description"])
 
 
 class TestSyncSkillsArgs(unittest.TestCase):

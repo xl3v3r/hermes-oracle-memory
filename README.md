@@ -78,7 +78,7 @@ Embeddings are computed 100% in-house:
 | `oracle_add` | store a durable fact (embedded + indexed); optional stable `memory_id` (upsert) and `tags` |
 | `oracle_get` | exact read by `memory_id`(s) and/or `tags` — no embedding, works during an ONNX cooldown |
 | `oracle_update` | replace a fact's text and/or tags by `memory_id` |
-| `oracle_delete` | delete by `memory_id`, or purge one thread by `session_id` (never skill rows or the shared `skills`/`none` ids) |
+| `oracle_delete` | delete by `memory_id`, or purge one thread by `session_id` (never skill rows or the shared `skills`/`none` ids). A purge takes `dry_run` to count first, and deletes at most 200 rows unless `max_rows` allows more (up to 10,000) |
 | `oracle_chunk` | split inline text or a disk file in-database (refuses credential and system paths: env files, key directories and files, wallets, `/etc`) |
 | `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory |
 | `oracle_load_skill` | load or list skills from the shared Oracle skill corpus at runtime |

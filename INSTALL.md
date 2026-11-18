@@ -190,7 +190,7 @@ Every row the run writes carries a session id unique to that run (`verify-<rando
 
 Exit status: `0` every check passed, `1` a check failed, `2` the script could not run (settings missing).
 
-> **Rows left by the script of 1.1.1.5 and older.** That version stored three rows per run under the session id `test-verification-session` and never removed them. They are ordinary facts, so they can be recalled. To remove them, call `oracle_delete(session_id="test-verification-session")` from a Hermes session.
+> **Rows left by the script of 1.1.1.5 and older.** That version stored three rows per run under the session id `test-verification-session` and never removed them. They are ordinary facts, so they can be recalled. To remove them, call `oracle_delete(session_id="test-verification-session")` from a Hermes session. If it reports more than 200 rows, repeat the call with the `max_rows` value it names.
 
 The same check runs under pytest when you opt in. Without `HERMES_ORACLE_LIVE_TESTS=1` it is skipped, whatever credentials are in the environment:
 
@@ -319,7 +319,9 @@ CREATE SEARCH INDEX HERMES_AGENT_MEMORY_TXT_IDX ON HERMES_AGENT_MEMORY (content)
 
 ### Prompt Injection Hardening
 
-Prefetched memories injected into prompt context are isolated inside `<retrieved_memory id="..." target="..." score="...">` XML boundary tags with metadata attribute escaping (`html.escape`) and ASCII control-character stripping (`[\x00-\x08\x0b-\x1f\x7f]`).
+Prefetched memories injected into prompt context are isolated inside `<retrieved_memory id="..." target="..." score="...">` XML boundary tags. The attributes and the body are escaped (`html.escape`), and ASCII control characters (`[\x00-\x08\x0b-\x1f\x7f]`) and line breaks are removed, so stored text cannot close the tag or open another one.
+
+The tag marks where recalled text begins and ends. It does not make that text trustworthy: anything stored in the table can be recalled, so treat recalled text as data, not as instructions.
 
 ### Credential Protection
 
