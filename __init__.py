@@ -4442,436 +4442,468 @@ class OracleMemoryProvider(MemoryProvider):
             )
         if not isinstance(args, dict):
             args = {}
-        try:
-            if tool_name == "oracle_search":
-                try:
-                    search_tags = _normalize_tags(args.get("tags"))
-                except ValueError as ve:
-                    return tool_error(str(ve))
-                try:
-                    rows = self._search(
-                        args.get("query") or "",
-                        top_k=int(args.get("top_k") or 8),
-                        mode=args.get("mode") or "hybrid",
-                        target=args.get("target") or "any",
-                        session_id=args.get("session_id"),
-                        agent_id=args.get("agent_id"),
-                        tags=search_tags or None,
-                        tag_match=str(args.get("tag_match") or "all"),
-                    )
-                    if not rows:
-                        return json.dumps(
-                            {"result": "No relevant memories found.", "count": 0}
-                        )
-                    return json.dumps(_search_tool_payload(rows), default=_json_default)
-                except Exception as e:
-                    is_timeout = _is_timeout_error(e) or "TimeoutError" in str(e)
-                    if is_timeout:
-                        logger.warning(
-                            "oracle_search query timed out after %ss (%s); clean fallback to empty results",
-                            _SEARCH_TIMEOUT_SECS,
-                            e,
-                        )
-                        return json.dumps(
-                            {
-                                "result": f"No relevant memories found (oracle_search query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s).",
-                                "count": 0,
-                                "timed_out": True,
-                            }
-                        )
-                    raise
-            if tool_name == "oracle_add":
-                raw_facts = args.get("facts")
-                target = args.get("target") or "memory"
-                if target not in ("memory", "user"):
-                    target = "memory"
-                facts_to_add: list[str] = []
-
-                def _extract_fact(item: Any) -> str:
-                    if isinstance(item, dict):
-                        val = item.get("fact") or item.get("content") or item.get("text") or ""
-                        return str(val).strip()
-                    return str(item).strip() if item is not None else ""
-
-                if isinstance(raw_facts, str) and raw_facts.strip().startswith("[") and raw_facts.strip().endswith("]"):
-                    try:
-                        parsed = json.loads(raw_facts)
-                        if isinstance(parsed, list):
-                            raw_facts = parsed
-                    except Exception:
-                        pass
-
-                if isinstance(raw_facts, (list, tuple, set)):
-                    facts_to_add = [_extract_fact(f) for f in raw_facts if _extract_fact(f)]
-                elif isinstance(raw_facts, str) and raw_facts.strip():
-                    facts_to_add = [raw_facts.strip()]
-
-                if not facts_to_add:
-                    raw_content = args.get("content")
-                    if isinstance(raw_content, str) and raw_content.strip().startswith("[") and raw_content.strip().endswith("]"):
-                        try:
-                            parsed = json.loads(raw_content)
-                            if isinstance(parsed, list):
-                                raw_content = parsed
-                        except Exception:
-                            pass
-                    if isinstance(raw_content, (list, tuple, set)):
-                        facts_to_add = [_extract_fact(f) for f in raw_content if _extract_fact(f)]
-                    elif isinstance(raw_content, str) and raw_content.strip():
-                        facts_to_add = [raw_content.strip()]
-                    elif raw_content is not None and str(raw_content).strip():
-                        facts_to_add = [str(raw_content).strip()]
-
-                if not facts_to_add:
-                    return tool_error("Missing required parameter: content or facts")
-                if len(facts_to_add) > _ADD_MAX_FACTS:
-                    return tool_error(
-                        f"too many facts in one call ({len(facts_to_add)}; max {_ADD_MAX_FACTS}): split the batch"
-                    )
-                too_long = [i for i, f in enumerate(facts_to_add) if len(f) > _MAX_FACT_CHARS]
-                if too_long:
-                    return tool_error(
-                        f"fact {too_long[0]} is {len(facts_to_add[too_long[0]])} characters (max {_MAX_FACT_CHARS}); "
-                        "store long text with oracle_chunk"
-                    )
-
-                try:
-                    add_tags = _normalize_tags(args.get("tags"))
-                    req_mid = args.get("memory_id")
-                    req_mid = _normalize_memory_id(req_mid) if req_mid not in (None, "") else None
-                except ValueError as ve:
-                    return tool_error(str(ve))
-                add_meta: dict[str, Any] = {"kind": "tool"}
-                if add_tags:
-                    add_meta["tags"] = add_tags
-
-                if req_mid is not None and req_mid.lower().startswith(_SKILL_ID_PREFIX):
-                    return tool_error(
-                        f"memory_id prefix '{_SKILL_ID_PREFIX}' is reserved for the skill corpus "
-                        "(written by oracle_sync_skills)"
-                    )
-                if req_mid is not None:
-                    if len(facts_to_add) != 1:
-                        return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
-                    return json.dumps(
-                        self._upsert_fact(
-                            req_mid,
-                            facts_to_add[0],
-                            target=target,
-                            tags=add_tags if args.get("tags") is not None else None,
-                            metadata=add_meta,
-                        )
-                    )
-
-                if len(facts_to_add) == 1:
-                    mid = f"fact_{uuid.uuid4().hex[:16]}"
-                    self._insert(
-                        memory_id=mid,
-                        session_id=self._session_id,
-                        role="fact",
-                        content=facts_to_add[0],
-                        target=target,
-                        metadata=add_meta,
-                    )
-                    out: dict[str, Any] = {"result": "Fact stored.", "memory_id": mid}
-                    if add_tags:
-                        out["tags"] = add_tags
-                    return json.dumps(out)
-                else:
-                    # One array insert, committed once: either every fact is
-                    # stored (and its id returned) or none is.
-                    mids = [f"fact_{uuid.uuid4().hex[:16]}" for _ in facts_to_add]
-                    self._insert_many([
-                        {
-                            "memory_id": mid,
-                            "session_id": self._session_id,
-                            "role": "fact",
-                            "content": f,
-                            "target": target,
-                            "metadata": add_meta,
-                        }
-                        for mid, f in zip(mids, facts_to_add)
-                    ])
-                    return json.dumps({
-                        "result": f"Batch facts stored ({len(mids)}).",
-                        "memory_ids": mids,
-                        "count": len(mids),
-                    })
-            if tool_name == "oracle_update":
-                mid = str(args.get("memory_id") or "").strip()
-                content = (args.get("content") or "").strip()
-                has_tags = args.get("tags") is not None
-                if not mid or (not content and not has_tags):
-                    return tool_error("memory_id and content (or tags) required")
-                if len(content) > _MAX_FACT_CHARS:
-                    return tool_error(f"content is {len(content)} characters (max {_MAX_FACT_CHARS})")
-                if mid.lower().startswith(_SKILL_ID_PREFIX):
-                    return tool_error(_SKILL_ROW_READONLY)
-                try:
-                    upd_tags = _normalize_tags(args.get("tags")) if has_tags else None
-                except ValueError as ve:
-                    return tool_error(str(ve))
-                n = self._update_row(mid, content or None, tags=upd_tags)
-                if not n:
-                    if self._is_skill_row(mid):
-                        return tool_error(_SKILL_ROW_READONLY)
-                    return tool_error(f"Memory not found: {mid}")
-                upd_out: dict[str, Any] = {"result": "updated", "memory_id": mid}
-                if upd_tags is not None:
-                    upd_out["tags"] = upd_tags
-                return json.dumps(upd_out)
-            if tool_name == "oracle_get":
-                try:
-                    ids: list[str] = []
-                    raw_ids = ([args["memory_id"]] if args.get("memory_id") else []) + _id_list(args.get("memory_ids"))
-                    for raw in raw_ids:
-                        norm_id = _normalize_memory_id(raw)
-                        if norm_id not in ids:
-                            ids.append(norm_id)
-                    if len(ids) > _GET_MAX_LIMIT:
-                        return tool_error(f"too many memory_ids (max {_GET_MAX_LIMIT})")
-                    get_tags = _normalize_tags(args.get("tags"))
-                    # memory_id is unique, so an id lookup never needs more than len(ids) rows.
-                    default_limit = len(ids) if ids else _GET_DEFAULT_LIMIT
-                    eff_limit = max(1, min(int(args.get("limit") or default_limit), _GET_MAX_LIMIT))
-                    rows = self._get_rows(
-                        memory_ids=ids or None,
-                        tags=get_tags or None,
-                        tag_match=str(args.get("tag_match") or "all"),
-                        session_id=args.get("session_id"),
-                        agent_id=args.get("agent_id"),
-                        target=args.get("target"),
-                        limit=eff_limit,
-                    )
-                except ValueError as ve:
-                    return tool_error(str(ve))
-                found = {r["memory_id"] for r in rows}
-                got: dict[str, Any] = {"results": rows, "count": len(rows)}
-                if len(rows) >= eff_limit and (not ids or len(ids) > eff_limit):
-                    # Cut off by `limit`: unreturned ids may exist, so do not call them missing.
-                    got["truncated"] = True
-                else:
-                    missing = [m for m in ids if m not in found]
-                    if missing:
-                        got["missing"] = missing
-                if not rows:
-                    got["result"] = "No matching memories."
-                return json.dumps(got, default=_json_default)
-            if tool_name == "oracle_delete":
-                mid = str(args.get("memory_id") or "").strip()
-                sid = str(args.get("session_id") or "").strip()
-                if not mid and not sid:
-                    return tool_error("memory_id or session_id required")
-                if mid and sid:
-                    return tool_error("pass memory_id OR session_id, not both (session_id purges a whole thread)")
-                if sid and sid.lower() in _RESERVED_SESSION_IDS:
-                    return tool_error(
-                        f"session_id '{sid}' is shared by unrelated rows (skill corpus / rows without a "
-                        "session) and cannot be purged; delete individual rows by memory_id"
-                    )
-                if mid and mid.lower().startswith(_SKILL_ID_PREFIX):
-                    return tool_error(_SKILL_ROW_READONLY)
-                if sid:
-                    raw_max = args.get("max_rows")
-                    if raw_max is None or raw_max == "":
-                        max_rows = _PURGE_DEFAULT_MAX_ROWS
-                    else:
-                        ok = isinstance(raw_max, int) and not isinstance(raw_max, bool)
-                        if isinstance(raw_max, str) and raw_max.strip().isdigit():
-                            raw_max, ok = int(raw_max.strip()), True
-                        if not ok or not 1 <= raw_max <= _PURGE_HARD_MAX_ROWS:
-                            return tool_error(f"max_rows must be between 1 and {_PURGE_HARD_MAX_ROWS}")
-                        max_rows = raw_max
-                    return self._purge_session(sid, dry_run=_as_bool(args.get("dry_run", False)), max_rows=max_rows)
-                with self._acquire_checked() as conn:
-                    with conn.cursor() as cur:
-                        # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
-                        query = (
-                            f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
-                            " AND NVL(role, 'fact') <> 'skill'"
-                        )
-                        cur.execute(
-                            query,
-                            (mid,),
-                        )
-                        n = cur.rowcount
-                        conn.commit()
-                if not n:
-                    if self._is_skill_row(mid):
-                        return tool_error(_SKILL_ROW_READONLY)
-                    return tool_error(f"Memory not found: {mid}")
-                return json.dumps({"result": "deleted", "memory_id": mid})
-            if tool_name == "oracle_chunk":
-                content = (args.get("content") or "").strip()
-                file_path = (args.get("file_path") or args.get("path") or "").strip()
-                if not content and not file_path:
-                    return tool_error("Missing required parameter: content or file_path")
-                try:
-                    max_words, overlap = _chunk_params(args.get("max_words"), args.get("overlap"))
-                except ValueError as ve:
-                    return tool_error(str(ve))
-                if file_path:
-                    try:
-                        p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
-                        why = _sensitive_path_reason(p)
-                        if why:
-                            return tool_error(
-                                f"Refusing to read {file_path} ({why}): chunked files are stored in the "
-                                "shared memory database. Pass non-secret text via 'content' instead."
-                            )
-                        if not p.is_file():
-                            return tool_error(f"File not found: {file_path}")
-                        if p.stat().st_size > _MAX_CHUNK_FILE_BYTES:
-                            return tool_error(
-                                f"File too large to chunk ({p.stat().st_size} bytes; "
-                                f"limit {_MAX_CHUNK_FILE_BYTES})"
-                            )
-                        raw_data = p.read_text(encoding="utf-8", errors="replace")
-                        structured_turns: list[dict[str, str]] = []
-                        try:
-                            parsed_json = json.loads(raw_data)
-
-                            def _add_turn(sender: str, val: str, conv_ref: str = "") -> None:
-                                if val:
-                                    structured_turns.append(
-                                        {"sender": sender, "text": val, "conv_ref": conv_ref}
-                                    )
-
-                            if isinstance(parsed_json, dict) and "conversations" in parsed_json:
-                                for item in parsed_json["conversations"]:
-                                    if isinstance(item, dict):
-                                        val = _extract_turn_text(item)
-                                        sender = item.get("from") or item.get("role") or ""
-                                        _add_turn(sender, val)
-                                    elif isinstance(item, str) and item.strip():
-                                        _add_turn("", item.strip())
-                            elif isinstance(parsed_json, list):
-                                for item in parsed_json:
-                                    if isinstance(item, dict):
-                                        title = item.get("name") or item.get("title") or ""
-                                        summary = item.get("summary") or ""
-                                        if title or summary:
-                                            header_parts = []
-                                            if title:
-                                                header_parts.append(f"Conversation: {title}")
-                                            if summary:
-                                                header_parts.append(f"Summary: {summary}")
-                                            _add_turn("", "\n\n".join(header_parts), title)
-
-                                        if "conversations" in item and isinstance(item["conversations"], list):
-                                            for sub in item["conversations"]:
-                                                if isinstance(sub, dict):
-                                                    val = _extract_turn_text(sub)
-                                                    sender = sub.get("from") or sub.get("role") or ""
-                                                    _add_turn(sender, val, title)
-                                                elif isinstance(sub, str) and sub.strip():
-                                                    _add_turn("", sub.strip(), title)
-                                        elif "chat_messages" in item and isinstance(item["chat_messages"], list):
-                                            for sub in item["chat_messages"]:
-                                                if isinstance(sub, dict):
-                                                    val = _extract_turn_text(sub)
-                                                    sender = sub.get("sender") or sub.get("from") or sub.get("role") or ""
-                                                    _add_turn(sender, val, title)
-                                                elif isinstance(sub, str) and sub.strip():
-                                                    _add_turn("", sub.strip(), title)
-                                        else:
-                                            val = _extract_turn_text(item)
-                                            sender = item.get("from") or item.get("role") or ""
-                                            _add_turn(sender, val, title)
-                                    elif isinstance(item, str) and item.strip():
-                                        _add_turn("", item.strip())
-                        except Exception:
-                            structured_turns = []
-
-                        if structured_turns and not content:
-                            ids = self._chunk_and_store("", max_words, overlap, turns=structured_turns)
-                            return json.dumps(
-                                {"result": "chunked", "count": len(ids), "memory_ids": ids}
-                            )
-
-                        extracted_text = "\n\n".join(t["text"] for t in structured_turns)
-                        file_text = extracted_text if extracted_text else raw_data
-                        if not content:
-                            content = file_text.strip()
-                        else:
-                            content = f"{content}\n\n{file_text.strip()}"
-                    except Exception as e:
-                        return tool_error(f"Failed to read file {file_path}: {e}")
-
-                if not content:
-                    return tool_error("Content is empty")
-                ids = self._chunk_and_store(content, max_words, overlap)
-                return json.dumps(
-                    {"result": "chunked", "count": len(ids), "memory_ids": ids}
-                )
-            if tool_name == "oracle_sync_skills":
-                mode = str(args.get("mode") or "meta").strip().lower()
-                if mode not in ("meta", "full"):
-                    return tool_error("mode must be 'meta' or 'full'")
-                force = _as_bool(args.get("force", False))
-                raw_dirs = args.get("dirs")
-                if isinstance(raw_dirs, str):
-                    # A bare string would otherwise be iterated per character
-                    # ('~/x' -> '/', i.e. a walk of the whole filesystem).
-                    txt = raw_dirs.strip()
-                    try:
-                        raw_dirs = json.loads(txt) if txt.startswith("[") else ([txt] if txt else [])
-                    except ValueError:
-                        return tool_error("dirs: invalid JSON array")
-                dirs: list[str | Path] | None = None
-                if raw_dirs in (None, []):
-                    pass
-                elif not isinstance(raw_dirs, list) or len(raw_dirs) > 20:
-                    return tool_error("dirs must be a list of up to 20 directory paths")
-                else:
-                    dirs = []
-                    for d in raw_dirs:
-                        dp = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
-                        # Refuse broad roots: "/", $HOME and any ancestor of it, system/credential dirs.
-                        if _is_broad_scan_root(dp):
-                            return tool_error(f"refusing to scan {d}: pass a specific skills directory")
-                        if not dp.is_dir():
-                            return tool_error(f"not a directory: {d}")
-                        dirs.append(dp)
-                batch_size = max(1, min(int(args.get("batch_size") or 50), 500))
-                prune = _as_bool(args.get("prune", False))
-                dry_run = _as_bool(args.get("dry_run", False))
-                raw_limit = args.get("prune_limit")
-                try:
-                    prune_limit = 100 if raw_limit in (None, "") else int(raw_limit)
-                except (TypeError, ValueError):
-                    return tool_error("prune_limit must be an integer")
-                if not 1 <= prune_limit <= 500:
-                    return tool_error("prune_limit must be between 1 and 500")
-                res = self.sync_skills(
-                    mode=mode, force=force, dirs=dirs, batch_size=batch_size,
-                    prune=prune, prune_limit=prune_limit, dry_run=dry_run,
-                    replace_foreign=_as_bool(args.get("replace_foreign", False)),
-                )
-                return json.dumps(res)
-            if tool_name == "oracle_load_skill":
-                action = (args.get("action") or "fetch").lower().strip()
-                if action == "list":
-                    filter_str = args.get("filter") or ""
-                    offset = int(args.get("offset") or 0)
-                    return self._load_skill_list(filter_str=filter_str, offset=offset)
-                elif action == "fetch":
-                    skill = args.get("skill") or ""
-                    path = args.get("path") or ""
-                    host = str(args.get("host") or "").strip()
-                    variant = args.get("variant")
-                    if variant is not None:
-                        try:
-                            variant = int(variant)
-                        except (ValueError, TypeError):
-                            variant = None
-                    return self._load_skill_fetch(skill, path=path, variant=variant, host=host)
-                else:
-                    return tool_error(f"Invalid action '{action}' for oracle_load_skill. Expected 'fetch' or 'list'.")
+        handler = self._TOOL_HANDLERS.get(tool_name)
+        if handler is None:
             return tool_error(f"Unknown tool: {tool_name}")
+        try:
+            return getattr(self, handler)(args)
         except Exception as e:
             logger.exception("oracle tool %s failed", tool_name)
             return tool_error(str(e))
+
+    # One method per tool. Each returns the tool's JSON string; an exception
+    # is logged and turned into a tool error by handle_tool_call.
+    _TOOL_HANDLERS = {
+        "oracle_search": "_tool_search",
+        "oracle_add": "_tool_add",
+        "oracle_update": "_tool_update",
+        "oracle_get": "_tool_get",
+        "oracle_delete": "_tool_delete",
+        "oracle_chunk": "_tool_chunk",
+        "oracle_sync_skills": "_tool_sync_skills",
+        "oracle_load_skill": "_tool_load_skill",
+    }
+
+    def _tool_search(self, args: dict[str, Any]) -> str:
+        """oracle_search: Hybrid, vector or text search; a timeout answers with an empty result."""
+        try:
+            search_tags = _normalize_tags(args.get("tags"))
+        except ValueError as ve:
+            return tool_error(str(ve))
+        try:
+            rows = self._search(
+                args.get("query") or "",
+                top_k=int(args.get("top_k") or 8),
+                mode=args.get("mode") or "hybrid",
+                target=args.get("target") or "any",
+                session_id=args.get("session_id"),
+                agent_id=args.get("agent_id"),
+                tags=search_tags or None,
+                tag_match=str(args.get("tag_match") or "all"),
+            )
+            if not rows:
+                return json.dumps(
+                    {"result": "No relevant memories found.", "count": 0}
+                )
+            return json.dumps(_search_tool_payload(rows), default=_json_default)
+        except Exception as e:
+            is_timeout = _is_timeout_error(e) or "TimeoutError" in str(e)
+            if is_timeout:
+                logger.warning(
+                    "oracle_search query timed out after %ss (%s); clean fallback to empty results",
+                    _SEARCH_TIMEOUT_SECS,
+                    e,
+                )
+                return json.dumps(
+                    {
+                        "result": f"No relevant memories found (oracle_search query timed out after {_SEARCH_TIMEOUT_SECS:.0f}s).",
+                        "count": 0,
+                        "timed_out": True,
+                    }
+                )
+            raise
+
+    def _tool_add(self, args: dict[str, Any]) -> str:
+        """oracle_add: Store one fact, a batch of facts, or upsert a row with a caller-chosen memory_id."""
+        raw_facts = args.get("facts")
+        target = args.get("target") or "memory"
+        if target not in ("memory", "user"):
+            target = "memory"
+        facts_to_add: list[str] = []
+
+        def _extract_fact(item: Any) -> str:
+            if isinstance(item, dict):
+                val = item.get("fact") or item.get("content") or item.get("text") or ""
+                return str(val).strip()
+            return str(item).strip() if item is not None else ""
+
+        if isinstance(raw_facts, str) and raw_facts.strip().startswith("[") and raw_facts.strip().endswith("]"):
+            try:
+                parsed = json.loads(raw_facts)
+                if isinstance(parsed, list):
+                    raw_facts = parsed
+            except Exception:
+                pass
+
+        if isinstance(raw_facts, (list, tuple, set)):
+            facts_to_add = [_extract_fact(f) for f in raw_facts if _extract_fact(f)]
+        elif isinstance(raw_facts, str) and raw_facts.strip():
+            facts_to_add = [raw_facts.strip()]
+
+        if not facts_to_add:
+            raw_content = args.get("content")
+            if isinstance(raw_content, str) and raw_content.strip().startswith("[") and raw_content.strip().endswith("]"):
+                try:
+                    parsed = json.loads(raw_content)
+                    if isinstance(parsed, list):
+                        raw_content = parsed
+                except Exception:
+                    pass
+            if isinstance(raw_content, (list, tuple, set)):
+                facts_to_add = [_extract_fact(f) for f in raw_content if _extract_fact(f)]
+            elif isinstance(raw_content, str) and raw_content.strip():
+                facts_to_add = [raw_content.strip()]
+            elif raw_content is not None and str(raw_content).strip():
+                facts_to_add = [str(raw_content).strip()]
+
+        if not facts_to_add:
+            return tool_error("Missing required parameter: content or facts")
+        if len(facts_to_add) > _ADD_MAX_FACTS:
+            return tool_error(
+                f"too many facts in one call ({len(facts_to_add)}; max {_ADD_MAX_FACTS}): split the batch"
+            )
+        too_long = [i for i, f in enumerate(facts_to_add) if len(f) > _MAX_FACT_CHARS]
+        if too_long:
+            return tool_error(
+                f"fact {too_long[0]} is {len(facts_to_add[too_long[0]])} characters (max {_MAX_FACT_CHARS}); "
+                "store long text with oracle_chunk"
+            )
+
+        try:
+            add_tags = _normalize_tags(args.get("tags"))
+            req_mid = args.get("memory_id")
+            req_mid = _normalize_memory_id(req_mid) if req_mid not in (None, "") else None
+        except ValueError as ve:
+            return tool_error(str(ve))
+        add_meta: dict[str, Any] = {"kind": "tool"}
+        if add_tags:
+            add_meta["tags"] = add_tags
+
+        if req_mid is not None and req_mid.lower().startswith(_SKILL_ID_PREFIX):
+            return tool_error(
+                f"memory_id prefix '{_SKILL_ID_PREFIX}' is reserved for the skill corpus "
+                "(written by oracle_sync_skills)"
+            )
+        if req_mid is not None:
+            if len(facts_to_add) != 1:
+                return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
+            return json.dumps(
+                self._upsert_fact(
+                    req_mid,
+                    facts_to_add[0],
+                    target=target,
+                    tags=add_tags if args.get("tags") is not None else None,
+                    metadata=add_meta,
+                )
+            )
+
+        if len(facts_to_add) == 1:
+            mid = f"fact_{uuid.uuid4().hex[:16]}"
+            self._insert(
+                memory_id=mid,
+                session_id=self._session_id,
+                role="fact",
+                content=facts_to_add[0],
+                target=target,
+                metadata=add_meta,
+            )
+            out: dict[str, Any] = {"result": "Fact stored.", "memory_id": mid}
+            if add_tags:
+                out["tags"] = add_tags
+            return json.dumps(out)
+        else:
+            # One array insert, committed once: either every fact is
+            # stored (and its id returned) or none is.
+            mids = [f"fact_{uuid.uuid4().hex[:16]}" for _ in facts_to_add]
+            self._insert_many([
+                {
+                    "memory_id": mid,
+                    "session_id": self._session_id,
+                    "role": "fact",
+                    "content": f,
+                    "target": target,
+                    "metadata": add_meta,
+                }
+                for mid, f in zip(mids, facts_to_add)
+            ])
+            return json.dumps({
+                "result": f"Batch facts stored ({len(mids)}).",
+                "memory_ids": mids,
+                "count": len(mids),
+            })
+
+    def _tool_update(self, args: dict[str, Any]) -> str:
+        """oracle_update: Replace a row's text and/or tags."""
+        mid = str(args.get("memory_id") or "").strip()
+        content = (args.get("content") or "").strip()
+        has_tags = args.get("tags") is not None
+        if not mid or (not content and not has_tags):
+            return tool_error("memory_id and content (or tags) required")
+        if len(content) > _MAX_FACT_CHARS:
+            return tool_error(f"content is {len(content)} characters (max {_MAX_FACT_CHARS})")
+        if mid.lower().startswith(_SKILL_ID_PREFIX):
+            return tool_error(_SKILL_ROW_READONLY)
+        try:
+            upd_tags = _normalize_tags(args.get("tags")) if has_tags else None
+        except ValueError as ve:
+            return tool_error(str(ve))
+        n = self._update_row(mid, content or None, tags=upd_tags)
+        if not n:
+            if self._is_skill_row(mid):
+                return tool_error(_SKILL_ROW_READONLY)
+            return tool_error(f"Memory not found: {mid}")
+        upd_out: dict[str, Any] = {"result": "updated", "memory_id": mid}
+        if upd_tags is not None:
+            upd_out["tags"] = upd_tags
+        return json.dumps(upd_out)
+
+    def _tool_get(self, args: dict[str, Any]) -> str:
+        """oracle_get: Exact read by memory_id(s) and/or tags."""
+        try:
+            ids: list[str] = []
+            raw_ids = ([args["memory_id"]] if args.get("memory_id") else []) + _id_list(args.get("memory_ids"))
+            for raw in raw_ids:
+                norm_id = _normalize_memory_id(raw)
+                if norm_id not in ids:
+                    ids.append(norm_id)
+            if len(ids) > _GET_MAX_LIMIT:
+                return tool_error(f"too many memory_ids (max {_GET_MAX_LIMIT})")
+            get_tags = _normalize_tags(args.get("tags"))
+            # memory_id is unique, so an id lookup never needs more than len(ids) rows.
+            default_limit = len(ids) if ids else _GET_DEFAULT_LIMIT
+            eff_limit = max(1, min(int(args.get("limit") or default_limit), _GET_MAX_LIMIT))
+            rows = self._get_rows(
+                memory_ids=ids or None,
+                tags=get_tags or None,
+                tag_match=str(args.get("tag_match") or "all"),
+                session_id=args.get("session_id"),
+                agent_id=args.get("agent_id"),
+                target=args.get("target"),
+                limit=eff_limit,
+            )
+        except ValueError as ve:
+            return tool_error(str(ve))
+        found = {r["memory_id"] for r in rows}
+        got: dict[str, Any] = {"results": rows, "count": len(rows)}
+        if len(rows) >= eff_limit and (not ids or len(ids) > eff_limit):
+            # Cut off by `limit`: unreturned ids may exist, so do not call them missing.
+            got["truncated"] = True
+        else:
+            missing = [m for m in ids if m not in found]
+            if missing:
+                got["missing"] = missing
+        if not rows:
+            got["result"] = "No matching memories."
+        return json.dumps(got, default=_json_default)
+
+    def _tool_delete(self, args: dict[str, Any]) -> str:
+        """oracle_delete: Delete one row by memory_id, or purge a session (see _purge_session)."""
+        mid = str(args.get("memory_id") or "").strip()
+        sid = str(args.get("session_id") or "").strip()
+        if not mid and not sid:
+            return tool_error("memory_id or session_id required")
+        if mid and sid:
+            return tool_error("pass memory_id OR session_id, not both (session_id purges a whole thread)")
+        if sid and sid.lower() in _RESERVED_SESSION_IDS:
+            return tool_error(
+                f"session_id '{sid}' is shared by unrelated rows (skill corpus / rows without a "
+                "session) and cannot be purged; delete individual rows by memory_id"
+            )
+        if mid and mid.lower().startswith(_SKILL_ID_PREFIX):
+            return tool_error(_SKILL_ROW_READONLY)
+        if sid:
+            raw_max = args.get("max_rows")
+            if raw_max is None or raw_max == "":
+                max_rows = _PURGE_DEFAULT_MAX_ROWS
+            else:
+                ok = isinstance(raw_max, int) and not isinstance(raw_max, bool)
+                if isinstance(raw_max, str) and raw_max.strip().isdigit():
+                    raw_max, ok = int(raw_max.strip()), True
+                if not ok or not 1 <= raw_max <= _PURGE_HARD_MAX_ROWS:
+                    return tool_error(f"max_rows must be between 1 and {_PURGE_HARD_MAX_ROWS}")
+                max_rows = raw_max
+            return self._purge_session(sid, dry_run=_as_bool(args.get("dry_run", False)), max_rows=max_rows)
+        with self._acquire_checked() as conn:
+            with conn.cursor() as cur:
+                # Skill-corpus rows (any id) belong to the skill sync, not the generic tools.
+                query = (
+                    f"DELETE /*+ NO_PARALLEL */ FROM {self._table} WHERE memory_id = :1"  # nosec B608
+                    " AND NVL(role, 'fact') <> 'skill'"
+                )
+                cur.execute(
+                    query,
+                    (mid,),
+                )
+                n = cur.rowcount
+                conn.commit()
+        if not n:
+            if self._is_skill_row(mid):
+                return tool_error(_SKILL_ROW_READONLY)
+            return tool_error(f"Memory not found: {mid}")
+        return json.dumps({"result": "deleted", "memory_id": mid})
+
+    def _tool_chunk(self, args: dict[str, Any]) -> str:
+        """oracle_chunk: Chunk inline text or a file in the database and store the chunks."""
+        content = (args.get("content") or "").strip()
+        file_path = (args.get("file_path") or args.get("path") or "").strip()
+        if not content and not file_path:
+            return tool_error("Missing required parameter: content or file_path")
+        try:
+            max_words, overlap = _chunk_params(args.get("max_words"), args.get("overlap"))
+        except ValueError as ve:
+            return tool_error(str(ve))
+        if file_path:
+            try:
+                p = Path(os.path.expanduser(os.path.expandvars(file_path))).resolve()
+                why = _sensitive_path_reason(p)
+                if why:
+                    return tool_error(
+                        f"Refusing to read {file_path} ({why}): chunked files are stored in the "
+                        "shared memory database. Pass non-secret text via 'content' instead."
+                    )
+                if not p.is_file():
+                    return tool_error(f"File not found: {file_path}")
+                if p.stat().st_size > _MAX_CHUNK_FILE_BYTES:
+                    return tool_error(
+                        f"File too large to chunk ({p.stat().st_size} bytes; "
+                        f"limit {_MAX_CHUNK_FILE_BYTES})"
+                    )
+                raw_data = p.read_text(encoding="utf-8", errors="replace")
+                structured_turns: list[dict[str, str]] = []
+                try:
+                    parsed_json = json.loads(raw_data)
+
+                    def _add_turn(sender: str, val: str, conv_ref: str = "") -> None:
+                        if val:
+                            structured_turns.append(
+                                {"sender": sender, "text": val, "conv_ref": conv_ref}
+                            )
+
+                    if isinstance(parsed_json, dict) and "conversations" in parsed_json:
+                        for item in parsed_json["conversations"]:
+                            if isinstance(item, dict):
+                                val = _extract_turn_text(item)
+                                sender = item.get("from") or item.get("role") or ""
+                                _add_turn(sender, val)
+                            elif isinstance(item, str) and item.strip():
+                                _add_turn("", item.strip())
+                    elif isinstance(parsed_json, list):
+                        for item in parsed_json:
+                            if isinstance(item, dict):
+                                title = item.get("name") or item.get("title") or ""
+                                summary = item.get("summary") or ""
+                                if title or summary:
+                                    header_parts = []
+                                    if title:
+                                        header_parts.append(f"Conversation: {title}")
+                                    if summary:
+                                        header_parts.append(f"Summary: {summary}")
+                                    _add_turn("", "\n\n".join(header_parts), title)
+
+                                if "conversations" in item and isinstance(item["conversations"], list):
+                                    for sub in item["conversations"]:
+                                        if isinstance(sub, dict):
+                                            val = _extract_turn_text(sub)
+                                            sender = sub.get("from") or sub.get("role") or ""
+                                            _add_turn(sender, val, title)
+                                        elif isinstance(sub, str) and sub.strip():
+                                            _add_turn("", sub.strip(), title)
+                                elif "chat_messages" in item and isinstance(item["chat_messages"], list):
+                                    for sub in item["chat_messages"]:
+                                        if isinstance(sub, dict):
+                                            val = _extract_turn_text(sub)
+                                            sender = sub.get("sender") or sub.get("from") or sub.get("role") or ""
+                                            _add_turn(sender, val, title)
+                                        elif isinstance(sub, str) and sub.strip():
+                                            _add_turn("", sub.strip(), title)
+                                else:
+                                    val = _extract_turn_text(item)
+                                    sender = item.get("from") or item.get("role") or ""
+                                    _add_turn(sender, val, title)
+                            elif isinstance(item, str) and item.strip():
+                                _add_turn("", item.strip())
+                except Exception:
+                    structured_turns = []
+
+                if structured_turns and not content:
+                    ids = self._chunk_and_store("", max_words, overlap, turns=structured_turns)
+                    return json.dumps(
+                        {"result": "chunked", "count": len(ids), "memory_ids": ids}
+                    )
+
+                extracted_text = "\n\n".join(t["text"] for t in structured_turns)
+                file_text = extracted_text if extracted_text else raw_data
+                if not content:
+                    content = file_text.strip()
+                else:
+                    content = f"{content}\n\n{file_text.strip()}"
+            except Exception as e:
+                return tool_error(f"Failed to read file {file_path}: {e}")
+
+        if not content:
+            return tool_error("Content is empty")
+        ids = self._chunk_and_store(content, max_words, overlap)
+        return json.dumps(
+            {"result": "chunked", "count": len(ids), "memory_ids": ids}
+        )
+
+    def _tool_sync_skills(self, args: dict[str, Any]) -> str:
+        """oracle_sync_skills: Index this host's skill directories into the skill corpus."""
+        mode = str(args.get("mode") or "meta").strip().lower()
+        if mode not in ("meta", "full"):
+            return tool_error("mode must be 'meta' or 'full'")
+        force = _as_bool(args.get("force", False))
+        raw_dirs = args.get("dirs")
+        if isinstance(raw_dirs, str):
+            # A bare string would otherwise be iterated per character
+            # ('~/x' -> '/', i.e. a walk of the whole filesystem).
+            txt = raw_dirs.strip()
+            try:
+                raw_dirs = json.loads(txt) if txt.startswith("[") else ([txt] if txt else [])
+            except ValueError:
+                return tool_error("dirs: invalid JSON array")
+        dirs: list[str | Path] | None = None
+        if raw_dirs in (None, []):
+            pass
+        elif not isinstance(raw_dirs, list) or len(raw_dirs) > 20:
+            return tool_error("dirs must be a list of up to 20 directory paths")
+        else:
+            dirs = []
+            for d in raw_dirs:
+                dp = Path(os.path.expanduser(os.path.expandvars(str(d)))).resolve()
+                # Refuse broad roots: "/", $HOME and any ancestor of it, system/credential dirs.
+                if _is_broad_scan_root(dp):
+                    return tool_error(f"refusing to scan {d}: pass a specific skills directory")
+                if not dp.is_dir():
+                    return tool_error(f"not a directory: {d}")
+                dirs.append(dp)
+        batch_size = max(1, min(int(args.get("batch_size") or 50), 500))
+        prune = _as_bool(args.get("prune", False))
+        dry_run = _as_bool(args.get("dry_run", False))
+        raw_limit = args.get("prune_limit")
+        try:
+            prune_limit = 100 if raw_limit in (None, "") else int(raw_limit)
+        except (TypeError, ValueError):
+            return tool_error("prune_limit must be an integer")
+        if not 1 <= prune_limit <= 500:
+            return tool_error("prune_limit must be between 1 and 500")
+        res = self.sync_skills(
+            mode=mode, force=force, dirs=dirs, batch_size=batch_size,
+            prune=prune, prune_limit=prune_limit, dry_run=dry_run,
+            replace_foreign=_as_bool(args.get("replace_foreign", False)),
+        )
+        return json.dumps(res)
+
+    def _tool_load_skill(self, args: dict[str, Any]) -> str:
+        """oracle_load_skill: Fetch a skill from the shared corpus, or list the skills in it."""
+        action = (args.get("action") or "fetch").lower().strip()
+        if action == "list":
+            filter_str = args.get("filter") or ""
+            offset = int(args.get("offset") or 0)
+            return self._load_skill_list(filter_str=filter_str, offset=offset)
+        elif action == "fetch":
+            skill = args.get("skill") or ""
+            path = args.get("path") or ""
+            host = str(args.get("host") or "").strip()
+            variant = args.get("variant")
+            if variant is not None:
+                try:
+                    variant = int(variant)
+                except (ValueError, TypeError):
+                    variant = None
+            return self._load_skill_fetch(skill, path=path, variant=variant, host=host)
+        else:
+            return tool_error(f"Invalid action '{action}' for oracle_load_skill. Expected 'fetch' or 'list'.")
 
     def _purge_session(self, sid: str, *, dry_run: bool, max_rows: int) -> str:
         """oracle_delete(session_id=...): delete the non-skill rows of one
