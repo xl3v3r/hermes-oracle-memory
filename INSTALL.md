@@ -180,11 +180,13 @@ The script verifies:
 
 ### 2. Run Test Suite
 
-The unit tests need no database. Run them with `HOME` pointed at a scratch directory so nothing can reach your real `~/.hermes`:
+The unit tests need no database. Run them with `HOME` pointed at a scratch directory and `HERMES_HOME` unset, so nothing can reach your real `~/.hermes`:
 
 ```bash
-HOME="$(mktemp -d)" python -m pytest -q
+env -u HERMES_HOME HOME="$(mktemp -d)" python -m pytest -q
 ```
+
+The suite also drops an inherited `HERMES_HOME` when it starts (the Hermes Desktop shell exports one), so a run without `env -u HERMES_HOME` no longer fails.
 
 > **Warning:** do not run the test suite of v1.1.1.2 or older on a host with an installed plugin. Its drift test copied the checkout over `~/.hermes/plugins/oracle` and every profile copy. From v1.1.1.3 the drift check is read-only and opt-in: `HERMES_ORACLE_DRIFT_DIR=~/.hermes/plugins/oracle python -m pytest -q -k zero_drift`.
 

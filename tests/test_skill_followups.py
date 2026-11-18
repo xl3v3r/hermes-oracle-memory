@@ -188,7 +188,9 @@ class TestLifecycleLookup(unittest.TestCase):
 
 class TestLoopSafeWalk(unittest.TestCase):
     def _looped_root(self, td):
-        root = Path(td) / "skills"
+        # Resolved: discovery reports paths under the resolved root, and the
+        # temp dir is itself a link on macOS (/var -> /private/var).
+        root = Path(td).resolve() / "skills"
         f = _write_skill(root / "a", "inner", "inner")
         _link_in_tmp(root / "a" / "loop", root / "a")
         _link_in_tmp(root / "back", root)

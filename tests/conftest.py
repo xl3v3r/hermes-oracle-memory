@@ -57,14 +57,30 @@ if 'oci' not in sys.modules:
 
 
 # ---------------------------------------------------------------------------
+# An inherited HERMES_HOME is dropped for the whole run. The tests build their
+# homes in the temp dir (patching Path.home or setting HERMES_HOME themselves),
+# and a HERMES_HOME exported by the calling shell (the Hermes Desktop shell
+# does) would override them. The value is kept for the link guard below.
+#
+# pytest imports this file as "conftest" and the tests import it again as
+# "tests.conftest", so the value lives in one shared module, not per copy.
+# ---------------------------------------------------------------------------
+import os as _os
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+_run_state = sys.modules.setdefault("_hom_test_run_state", types.ModuleType("_hom_test_run_state"))
+if not hasattr(_run_state, "inherited_hermes_home"):
+    setattr(_run_state, "inherited_hermes_home", _os.environ.pop("HERMES_HOME", None) or None)
+_INHERITED_HERMES_HOME = getattr(_run_state, "inherited_hermes_home")
+
+
+# ---------------------------------------------------------------------------
 # Runtime link guard: while the suite runs, os.symlink and os.link (and so
 # Path.symlink_to / Path.hardlink_to, which call them) refuse a link whose
 # location or target lies outside the temp dir. No test can link into the
 # installed plugin or the checkout, however the call is spelled.
 # ---------------------------------------------------------------------------
-import os as _os
-import tempfile as _tempfile
-from pathlib import Path as _Path
 
 
 def _real_home():
@@ -78,18 +94,27 @@ def _real_home():
 
 def check_link_paths(target, link, target_relative_to_link=True):
     """Raise AssertionError unless the link's directory and its target both
-    resolve inside tempfile.gettempdir(), and that temp dir neither contains
-    the user's real home nor overlaps its installed plugin dir (HOME may be
-    faked, so the real home comes from the passwd entry)."""
+    resolve inside tempfile.gettempdir(), and that temp dir is a safe one:
+
+    - It does not contain the user's real home. HOME may be faked, so the
+      real home comes from the passwd entry.
+    - It does not overlap an installed plugin dir, in either direction. The
+      installed plugin dirs are ``.hermes/plugins`` under the real home, and
+      ``$HERMES_HOME/plugins`` for the HERMES_HOME the run was started with
+      (conftest drops that variable; ``_INHERITED_HERMES_HOME`` keeps it).
+    - It does not lie inside ``$HERMES_HOME/plugins`` for a HERMES_HOME set
+      during the run. That home is a test's fake, built in the temp dir, so
+      the temp dir may contain it.
+    """
     tmp = _Path(_tempfile.gettempdir()).resolve()
     home = _real_home()
     if home is not None and home.is_relative_to(tmp):
         raise AssertionError(
             f"the temp dir {tmp} contains the home dir {home}; set TMPDIR to a dedicated directory"
         )
-    # The real install, in either direction. A HERMES_HOME inside the temp
-    # dir is a test's fake home, so only a temp dir inside its plugin dir counts.
     checks = [((home / ".hermes" / "plugins").resolve(), True)] if home is not None else []
+    if _INHERITED_HERMES_HOME:
+        checks.append(((_Path(_INHERITED_HERMES_HOME).expanduser() / "plugins").resolve(), True))
     if _os.environ.get("HERMES_HOME"):
         checks.append(((_Path(_os.environ["HERMES_HOME"]) / "plugins").resolve(), False))
     for plugins, both_ways in checks:
