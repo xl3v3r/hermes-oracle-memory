@@ -378,7 +378,7 @@ class TestSources(unittest.TestCase):
         with patch.dict(os.environ, dict(ENV, HERMES_ORACLE_LIVE_TESTS="1"), clear=True), \
                 patch.object(vp, "main", return_value=0) as main:
             result = unittest.TestResult()
-            unittest.defaultTestLoader.loadTestsFromModule(live).run(result)
+            unittest.defaultTestLoader.loadTestsFromName("TestProviderLive.test_verify_provider_live", live).run(result)
         self.assertEqual((result.failures, result.errors, result.skipped), ([], [], []))
         main.assert_called_once()
 
@@ -388,7 +388,7 @@ class TestSources(unittest.TestCase):
         with patch.dict(os.environ, dict(ENV, HERMES_ORACLE_LIVE_TESTS="1"), clear=True), \
                 patch.object(vp, "main", return_value=1):
             result = unittest.TestResult()
-            unittest.defaultTestLoader.loadTestsFromModule(live).run(result)
+            unittest.defaultTestLoader.loadTestsFromName("TestProviderLive.test_verify_provider_live", live).run(result)
         self.assertEqual(len(result.failures), 1)
 
 

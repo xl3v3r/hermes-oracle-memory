@@ -24,10 +24,12 @@ from scripts.sync_skills import (
     format_skill_payload,
     parse_frontmatter,
     parse_skill_file,
-    safe_embed_text,
-    safe_varchar_bytes,
     sync_skills_library,
 )
+
+# The clamps live on the provider (scripts/sync_skills.py had copies of them).
+safe_embed_text = oracle_plugin.OracleMemoryProvider._safe_embed_text
+safe_varchar_bytes = oracle_plugin.OracleMemoryProvider._safe_varchar_bytes
 
 
 class TestSkillSyncClamping(unittest.TestCase):

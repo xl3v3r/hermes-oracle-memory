@@ -1,6 +1,6 @@
 ---
 name: oracle-import
-description: Import conversation archives and documents into Oracle Autonomous AI Database 26ai memory without hitting LLM rate limits.
+description: Use when importing chat archives into Oracle memory.
 version: 1.1.1.5
 author: Hermes Community
 metadata:
@@ -10,86 +10,82 @@ metadata:
 
 # Oracle 26ai Conversation & Document Import
 
-Import conversation history archives (ShareGPT, ChatGPT, Claude exports) and large documents into **Oracle Autonomous AI Database (ADB) 26ai** vector memory without exhausting LLM context windows or triggering upstream API rate limits (such as NVIDIA NIM HTTP 429).
+Import conversation archives (ShareGPT, ChatGPT and Claude exports) and large documents into the Oracle memory table without passing their text through the model.
 
 ## When to Use
 
-- Importing historical conversations (`conversations.json`, `oracle_import.json`, ShareGPT format).
-- Ingesting large text archives, documentation, or log files into Oracle 26ai memory.
-- Bypassing LLM context limits and rate limits during bulk data migration.
-- Troubleshooting Oracle ADB mTLS wallet connections and driver configurations during import.
+- Importing historical conversations (`conversations.json`, ShareGPT files, export `.zip` files).
+- Storing a large text file, document or log in Oracle memory.
+- Any import too large to send as tool arguments.
 
 ## Prerequisites
 
-Ensure ADB credentials and wallet location are configured in `~/.hermes/.env` or active profile environment:
-
-- `OCI_DB_USER` — ADB username (ADB's default account is `ADMIN`)
-- `OCI_DB_PASSWORD` — ADB password
-- `OCI_DB_DSN` — TNS alias or connect descriptor string (e.g. `dbname_low`)
-- `OCI_WALLET_LOCATION` (optional) — Path to the wallet directory containing `cwallet.sso` and `tnsnames.ora`. Auto-detected at `~/.oci/wallet` and `~/.hermes/oracle_wallet`.
-- `OCI_WALLET_PASSWORD` (optional) — Wallet password if encrypted.
-- `python-oracledb` >= 4.0.2 installed in the environment.
+- The Oracle memory provider is installed and configured (`OCI_DB_USER`, `OCI_DB_PASSWORD`, `OCI_DB_DSN`, and a wallet if the database needs one).
+- The embedding model is loaded in the database (the provider cannot store rows without it).
+- For the script: the `OCI_*` settings in the environment, or a file passed with `--env-file`. The script reads no file on its own.
 
 ## How to Run
 
-### Option 1: Ingest via `oracle_chunk` with `file_path` (Hermes Tool)
+### Option 1: one file, from a Hermes session
 
-Hermes agents can invoke `oracle_chunk` with a local `file_path` directly. Instead of streaming multi-megabyte payloads through the LLM prompt, the tool reads the file locally, parses conversation structures if present, and executes in-database chunking with `DBMS_VECTOR.UTL_TO_CHUNKS`:
+Call `oracle_chunk` with `file_path`. The tool reads the file on the Hermes host, recognises conversation JSON, and chunks it in the database:
 
 ```json
-{
-  "file_path": "~/sharedconv/oracle_import.json",
-  "max_words": 1000,
-  "overlap": 10
-}
+{"file_path": "~/exports/conversations.json"}
 ```
 
-### Option 2: Standalone Bulk Ingestion Script
+### Option 2: a large archive, from a terminal
 
-For large archives (e.g. hundreds of conversations or >10 MB), run the standalone migration script included with this skill. It connects directly to Oracle 26ai ADB and inserts memory turns in configurable batches with zero LLM API consumption:
+`scripts/import_conversations_ordered.py` is in the plugin directory (`plugins/oracle` under the Hermes home). It connects to the database directly and uses no model tokens:
 
 ```bash
-# Ingest ShareGPT, Claude, or summary archive
-python3 skills/oracle-import/scripts/import_conversations.py ~/sharedconv/oracle_import.json
+H="${HERMES_HOME:-$HOME/.hermes}"
+cd "$H/plugins/oracle"
+python3 scripts/import_conversations_ordered.py ~/exports/conversations.json --env-file "$H/.env"
 
-# Specify batch size and session ID
-python3 skills/oracle-import/scripts/import_conversations.py ~/sharedconv/conversations.json --batch-size 50 --session-id "archive-2026-06"
+# A zip export, under a session id of your choice
+python3 scripts/import_conversations_ordered.py ~/exports/export.zip --session-id archive-2026 --env-file "$H/.env"
 ```
 
-## Quick Reference
+| Option | Effect |
+|---|---|
+| `--session-id <id>` | Session id for every imported row. Default: `import-ordered-<date>`. |
+| `--max-words <n>` | Chunk size in words (default 80). |
+| `--overlap <n>` | Words shared by neighbouring chunks (default 10). |
+| `--limit-conversations <n>` | Import only the first `n` conversations, to try the import out. |
+| `--env-file <path>` | Read `KEY=VALUE` settings from a file. The environment wins. |
 
-| Format | Structure | Parsing Behavior |
-|---|---|---|
-| **ShareGPT** | `{"conversations": [{"from": "...", "value": "..."}]}` | Turns extracted and prefixed with `[ROLE]` |
-| **Claude Export** | `[{"name": "...", "summary": "...", "chat_messages": [...]}]` | Extracts titles, summaries, and user/assistant messages |
-| **Summary Export** | `{"conversations": [{"from": "system", "value": "..."}]}` | Extracted as system/session memory turns |
-| **Plain Text** | `.txt`, `.md`, logs | Split recursively via `UTL_TO_CHUNKS` |
-| **Truncated JSON** | Abrupt EOF / partial stream | Incremental recovery of complete leading JSON objects |
+## What Is Stored
 
-## Procedure
+- Each message is chunked on its own. Every chunk is a row with role `chunk` and target `memory`, so `oracle_search` and automatic recall return it whoever wrote the message.
+- The speaker is kept in `metadata.sender`. A conversation's title and summary are stored as its first turn. In a summary export (a `conversations` list of `system` entries) every entry is its own document.
+- Each chunk carries `conv_ref`, `turn_index`, `chunk_index` and `turn_id`, so a conversation can be read back in order.
+- All rows of one run share one session id. `oracle_delete(session_id="<id>", dry_run=true)` counts them, and the same call without `dry_run` (and with the `max_rows` it names) removes the import.
 
-1. **Verify Database Connectivity & Wallet**:
-   Ensure wallet files exist in `~/.oci/wallet/` or `~/.hermes/oracle_wallet/` (`cwallet.sso`, `tnsnames.ora`).
-2. **Choose Ingestion Method**:
-   - For single documents or prompt-driven chunking: call `oracle_chunk(file_path=...)`.
-   - For bulk multi-conversation imports (>1MB): run `python3 skills/oracle-import/scripts/import_conversations.py <path>`.
-3. **Verify Recall**:
-   Query Oracle memory using `oracle_search(query="...", top_k=5)` to verify turns and chunks are discoverable.
+## Supported Formats
+
+| Format | Structure |
+|---|---|
+| ShareGPT | `{"conversations": [{"from": "...", "value": "..."}]}`, or a list of such sessions |
+| Claude / ChatGPT export | `[{"name": "...", "summary": "...", "chat_messages": [...]}]` |
+| Zip export | A `.zip` that contains the JSON (the largest `.json` in it is read) |
+| Truncated JSON | The complete leading objects are imported |
+| Plain text (`.txt`, `.md`, logs) | Use `oracle_chunk(file_path=...)` |
 
 ## Pitfalls
 
-- **Secret paths are refused**: `oracle_chunk(file_path=...)` rejects credential and system paths (env files, `auth.json`, SSH/cloud/GPG key directories, `*.pem`/`*.key`, wallets, `/etc`, `/proc`, ...) because chunks land in the shared database. Export or redact first.
-- **NIM HTTP 429 Rate Limits**: Avoid passing file contents directly into chat messages or `oracle_chunk(content=...)`. Always pass `file_path`.
-- **`DPY-6005: Listener refused connection`**: Wallet files missing, unreadable, or TLS certificate mismatch. Check permissions (`chmod 600`) and wallet files.
-- **`DPY-6000: Connection timeout`**: Verify Autonomous Database is in **Available** state in OCI Console and egress on port 1522 is open.
-- **`ORA-01460: unimplemented or unreasonable conversion requested`**: Occurs if large strings (>32KB) are bound to CLOB parameters without `cur.setinputsizes(oracledb.DB_TYPE_CLOB)`. The provider automatically sets CLOB input sizes.
+- **Secret paths are refused.** `oracle_chunk(file_path=...)` rejects credential and system paths (env files, `auth.json`, SSH, cloud and GPG key directories, `*.pem`, `*.key`, wallets, `/etc`, `/proc`), because chunks are stored in the database. Export or redact first.
+- **Pass a path, not the text.** Do not paste file contents into a message or into `oracle_chunk(content=...)`.
+- **An imported archive is recalled like any other memory.** Give the import its own `--session-id` so it can be found and removed as a unit.
+- **`DPY-6005: cannot connect`.** The wallet is missing or unreadable, or the DSN does not match `tnsnames.ora`.
+- **`ORA-40284: model does not exist`.** The embedding model is not loaded in this schema. See INSTALL.md.
 
 ## Verification
 
-Confirm imported items are indexed in Oracle ADB:
-```python
-provider = OracleMemoryProvider()
-provider.initialize(session_id="test")
-results = provider._search(query="ITAHM", top_k=3)
-assert len(results) > 0
+Search for a phrase from the archive:
+
+```text
+oracle_search(query="<a phrase from an imported conversation>", session_id="<the import's session id>")
 ```
+
+The result should include rows with role `chunk` and the `conv_ref` of that conversation.

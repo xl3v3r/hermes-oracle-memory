@@ -109,17 +109,23 @@ hermes config set memory.provider oracle
 
 To achieve **zero external embedding API costs**, configure in-database ONNX inference directly on Oracle ADB 26ai:
 
-1. Export and load `BAAI/bge-base-en-v1.5` into your database:
+1. Install the prerequisite of the setup script. The ONNX pipeline (tokenizer, model, pooling and normalisation in one graph) is built by [onnx2oracle](https://github.com/jasperan/onnx2oracle), a separate project by jasperan. It is not part of this plugin and is needed only for this step:
+   ```bash
+   python -m pip install onnx2oracle
+   ```
+   It brings `onnx`, `onnxruntime`, `onnxruntime-extensions` and `transformers`, so install it in the environment you run the script from, not necessarily the Hermes one. Without it the script stops and says what to install.
+
+2. Export and load `BAAI/bge-base-en-v1.5` into your database:
    ```bash
    python3 scripts/setup_onnx_model.py
    ```
    The helper scripts read `OCI_DB_*` / `OCI_WALLET_*` from the environment. To use the settings from your Hermes env file (Step 4), pass it explicitly: `python3 scripts/setup_onnx_model.py --env-file <path to the env file>`.
 
-   This exports the model with dynamic token slicing (bounded to 512 tokens to avoid `ORA-54401`), stages it via `DATA_PUMP_DIR`, and registers it with `DBMS_VECTOR.LOAD_ONNX_MODEL`.
+   This exports the model with dynamic token slicing (bounded to 512 tokens to avoid `ORA-54401`), stages it via `DATA_PUMP_DIR`, and registers it with `DBMS_VECTOR.LOAD_ONNX_MODEL`. The first run downloads the model from Hugging Face.
 
-2. Specify the ONNX model name in your environment:
+3. Specify the ONNX model name in your environment:
    ```bash
-   echo 'HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5' >> ~/.hermes/.env
+   echo 'HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5' >> "${HERMES_HOME:-$HOME/.hermes}/.env"
    ```
 
 ---
@@ -245,20 +251,25 @@ hermes chat -q "Where is my preferred deployment target?"
 
 ---
 
-## Step 6: Upgrades & Legacy Data Backfill
+## Step 6: Upgrades & Embedding Maintenance
 
-If upgrading from an earlier version (e.g. 1536-dimensional vectors or null embeddings), run the parallel backfill utility:
+`scripts/reembed_embeddings.py` checks and repairs the embeddings in the memory table. It uses the in-database model only; no text leaves the database.
 
 ```bash
-python3 scripts/backfill_embeddings.py --workers 4 --batch-size 32
+python3 scripts/reembed_embeddings.py --mode verify     # read-only: how many rows match the model
+python3 scripts/reembed_embeddings.py --mode nulls      # embed rows that have no embedding or no model stamp
+python3 scripts/reembed_embeddings.py --mode stale      # recompute and rewrite only rows whose vector differs
+python3 scripts/reembed_embeddings.py --mode reembed    # rewrite every row (after changing the model)
 ```
 
 (Export the `OCI_*` settings first, or add `--env-file <path to the env file>`; no script reads the Hermes env file on its own.)
 
-The backfill utility:
-- Multithreads batch processing across database sessions.
-- Automatically tracks checkpoints in `backfills/backfill_progress_768.json`.
-- Refreshes vector indexes and table optimizer statistics upon completion (`DBMS_STATS.GATHER_TABLE_STATS`).
+- The provider embeds rows as it writes them and backfills the rare row it had to store without an embedding, so `--mode nulls` is needed only after an import that bypassed the provider, or after a long model outage.
+- `--workers` sets the number of database sessions (default 3). `--mode nulls` always runs on one.
+- `--checkpoint <file> --resume` makes a long run resumable.
+- `scripts/audit_embeddings.py` is a quick read-only check for cron: one line when everything is on the expected model.
+
+> **Removed in 1.1.2:** `scripts/backfill_embeddings.py`. It required an `OPENROUTER_API_KEY` and sent row text to an external embedding API when the in-database model failed. Use `--mode nulls` above instead.
 
 ---
 

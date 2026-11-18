@@ -207,6 +207,35 @@ class TestReembedEmbeddings(unittest.TestCase):
         self.assertIn("/*+ NO_PARALLEL(m) */", sql)
         self.assertEqual(binds, ["BGE_BASE_EN_V1_5", "row1", "row2"])
 
+    def test_assert_no_px_without_access_to_the_view_does_not_abort(self):
+        # A schema user without SELECT on V$PX_SESSION (anything but an ADB
+        # admin) made every worker abort after its first batch.
+        for err in ('ORA-00942: table or view "SYS"."V_$PX_SESSION" does not exist',
+                    "ORA-01031: insufficient privileges"):
+            reembed_embeddings._PX_CHECK_UNAVAILABLE.clear()
+            cur = MagicMock()
+            cur.execute.side_effect = Exception(err)
+            with self.assertLogs(reembed_embeddings.logger, level="INFO") as logs:
+                reembed_embeddings.assert_no_px(cur)
+                reembed_embeddings.assert_no_px(cur)  # said once, not per batch
+            self.assertEqual(len([m for m in logs.output if "V$PX_SESSION" in m]), 1, err)
+        reembed_embeddings._PX_CHECK_UNAVAILABLE.clear()
+
+    def test_assert_no_px_other_errors_still_abort(self):
+        reembed_embeddings._PX_CHECK_UNAVAILABLE.clear()
+        cur = MagicMock()
+        cur.execute.side_effect = Exception("ORA-03113: end-of-file on communication channel")
+        with self.assertRaisesRegex(Exception, "ORA-03113"):
+            reembed_embeddings.assert_no_px(cur)
+
+    def test_assert_no_px_falls_back_to_the_unscoped_count(self):
+        reembed_embeddings._PX_CHECK_UNAVAILABLE.clear()
+        cur = MagicMock()
+        cur.execute.side_effect = [Exception("ORA-00904: invalid identifier"), None]
+        cur.fetchone.return_value = (2,)
+        with self.assertRaisesRegex(RuntimeError, "2 PX slave"):
+            reembed_embeddings.assert_no_px(cur)
+
     def test_assert_no_px_session_scoped_query(self):
         cur = MagicMock()
         cur.fetchone.return_value = (0,)

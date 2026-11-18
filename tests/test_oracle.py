@@ -1937,14 +1937,12 @@ class TestOraclePlugin(unittest.TestCase):
         mock_pool = MagicMock()
         mock_pool.acquire.return_value.__enter__.return_value = mock_conn
 
-        with patch("scripts.rebuild_index.OracleMemoryProvider") as mock_prov_cls:
-            mock_prov = MagicMock()
-            mock_prov._table = "TEST_TBL"
-            mock_prov._pool = mock_pool
-            mock_prov.is_available.return_value = True
-            mock_prov_cls.return_value = mock_prov
-
+        mock_conn.cursor.return_value = mock_conn.cursor.return_value  # used as a context manager
+        with patch("scripts.rebuild_index.connect", return_value=mock_conn) as connect, \
+                patch.dict(os.environ, {"HERMES_ORACLE_TABLE": "FROM_ENV"}):
             res = rebuild_vector_index(table_name="TEST_TBL", gather_stats=True)
+            connect.assert_called_once()
+            mock_conn.close.assert_called_once()
             self.assertEqual(res["table"], "TEST_TBL")
             self.assertEqual(res["index"], "TEST_TBL_VEC_IDX")
             self.assertEqual(res["status"], "VALID")
@@ -1953,6 +1951,28 @@ class TestOraclePlugin(unittest.TestCase):
             self.assertTrue(any("DROP INDEX" in call for call in exec_calls))
             self.assertTrue(any("CREATE VECTOR INDEX" in call for call in exec_calls))
             self.assertTrue(any("GATHER_TABLE_STATS" in call for call in exec_calls))
+            self.assertIn(oracle_plugin.VECTOR_INDEX_DDL.format(index_name="TEST_TBL_VEC_IDX", table_name="TEST_TBL"),
+                          exec_calls)
+
+    def test_rebuild_index_table_comes_from_the_setting_when_not_given(self):
+        from scripts.rebuild_index import rebuild_vector_index
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchone.return_value = ("X", "VALID", "VECTOR")
+        with patch("scripts.rebuild_index.connect", return_value=conn), \
+                patch.dict(os.environ, {"HERMES_ORACLE_TABLE": "my_table"}):
+            res = rebuild_vector_index(gather_stats=False)
+        self.assertEqual((res["table"], res["index"]), ("MY_TABLE", "MY_TABLE_VEC_IDX"))
+
+    def test_rebuild_index_refuses_names_that_are_not_identifiers(self):
+        from scripts.rebuild_index import rebuild_vector_index
+        with patch("scripts.rebuild_index.connect", side_effect=AssertionError("must not connect")):
+            for kw in ({"table_name": "T; DROP TABLE X"}, {"table_name": "T", "index_name": "I ON T(x) --"},
+                       {"table_name": ""}, {"table_name": "1T"}):
+                if kw.get("table_name") == "":
+                    continue  # empty means "use the setting"
+                with self.assertRaises(ValueError, msg=str(kw)):
+                    rebuild_vector_index(**kw)
 
     def test_vector_search_in_cooldown_raises_runtime_error(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2104,7 +2124,6 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertTrue(scripts_dir.is_dir())
         expected_op_scripts = {
             "audit_embeddings.py",
-            "backfill_embeddings.py",
             "import_conversations_ordered.py",
             "rebuild_index.py",
             "reembed_embeddings.py",

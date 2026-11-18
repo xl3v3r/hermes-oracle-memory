@@ -19,7 +19,6 @@ import argparse
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Any
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -31,43 +30,18 @@ _DEFAULT_SAMPLE = 50
 _DEFAULT_TOL = 0.01
 
 
-def load_env(env_file: str | None = None) -> None:
-    """Load KEY=VALUE settings (OCI_DB_*, OCI_WALLET_*) from *env_file*, only
-    when the user passes --env-file. Otherwise the script reads the process
-    environment alone; values already set there win."""
-    if not env_file:
-        return
-    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+try:  # helpers shared by the scripts (scripts/_common.py)
+    from . import _common as common
+except ImportError:  # run as a script, or imported with this directory on sys.path
+    import _common as common  # type: ignore[no-redef]
+
+load_env = common.load_env
 
 
 def connect() -> Any:
     import oracledb
 
-    wallet_dir = os.environ.get("OCI_WALLET_LOCATION")
-    if not wallet_dir:
-        for candidate in (Path.home() / ".oci" / "wallet", Path.home() / ".hermes" / "oracle_wallet"):
-            if (candidate / "cwallet.sso").exists() or (candidate / "tnsnames.ora").exists():
-                wallet_dir = str(candidate)
-                break
-    kwargs: dict[str, object] = {
-        "user": os.environ["OCI_DB_USER"],
-        "password": os.environ["OCI_DB_PASSWORD"],
-        "dsn": os.environ["OCI_DB_DSN"],
-    }
-    if wallet_dir:
-        kwargs["config_dir"] = wallet_dir
-        kwargs["wallet_location"] = wallet_dir
-        pwd = os.environ.get("OCI_WALLET_PASSWORD")
-        if pwd:
-            kwargs["wallet_password"] = pwd
-    return oracledb.connect(**kwargs)
+    return oracledb.connect(**common.connect_kwargs())
 
 
 def run(args: argparse.Namespace) -> int:

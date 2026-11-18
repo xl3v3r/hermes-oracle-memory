@@ -10,13 +10,9 @@ root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
-scripts_dir = os.path.join(root_dir, "skills", "oracle-import", "scripts")
-if scripts_dir not in sys.path:
-    sys.path.insert(0, scripts_dir)
-
 import tests.conftest
 import __init__ as oracle_plugin
-import import_conversations
+from scripts import import_conversations_ordered as importer
 
 
 class TestOracleChunkAndImport(unittest.TestCase):
@@ -196,56 +192,6 @@ class TestOracleChunkAndImport(unittest.TestCase):
         parsed = json.loads(res)
         self.assertIn("error", parsed)
 
-    def test_import_conversations_parses_oracle_import_json(self):
-        sample = {
-            "conversations": [
-                {
-                    "from": "system",
-                    "value": "Conversation: ITAHM\n\nSummary: Overview\n\nUUID: abc-123",
-                }
-            ]
-        }
-        turns = import_conversations.parse_conversations(sample)
-        self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0]["role"], "session")
-        self.assertEqual(turns[0]["sender"], "system")
-        self.assertIn("Conversation: ITAHM", turns[0]["content"])
-
-    def test_import_conversations_parses_claude_export(self):
-        sample = [
-            {
-                "name": "Title",
-                "summary": "Summary text",
-                "chat_messages": [
-                    {"sender": "human", "text": "Question"},
-                    {
-                        "sender": "assistant",
-                        "text": "",
-                        "content": [
-                            {"type": "thinking", "thinking": "scratchpad"},
-                            {"type": "text", "text": "Answer"},
-                        ],
-                    },
-                ],
-            }
-        ]
-        turns = import_conversations.parse_conversations(sample)
-        self.assertEqual(len(turns), 3)  # summary + question + answer
-        self.assertEqual(turns[0]["role"], "session")
-        self.assertIn("[CONVERSATION]: Title", turns[0]["content"])
-        self.assertEqual(turns[1]["role"], "user")
-        self.assertEqual(turns[2]["role"], "assistant")
-        self.assertEqual(turns[2]["content"], "[ASSISTANT]: Answer")
-
-    def test_import_conversations_safe_truncated_json_decode(self):
-        # A valid object followed by truncated text
-        raw = '[{"name": "Session 1", "summary": "Sum 1"}, {"name": "Session 2", "sum'
-        recovered = import_conversations.parse_json_safely(raw)
-        self.assertEqual(len(recovered), 1)
-        turns = import_conversations.parse_conversations(recovered[0])
-        self.assertEqual(len(turns), 1)
-        self.assertIn("Session 1", turns[0]["content"])
-
     def test_register_with_skill_support(self):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
@@ -267,39 +213,213 @@ class TestOracleChunkAndImport(unittest.TestCase):
         self.assertIsInstance(ctx.provider, oracle_plugin.OracleMemoryProvider)
 
 
-class TestOracleImportScript(unittest.TestCase):
-    def test_find_plugin_root_from_skill_scripts_dir(self):
-        script_path = Path(import_conversations.__file__).resolve()
-        discovered = import_conversations._find_plugin_root(script_path)
-        self.assertTrue((discovered / "plugin.yaml").is_file())
-        self.assertTrue((discovered / "__init__.py").is_file())
-        self.assertEqual(discovered, Path(root_dir).resolve())
+CLAUDE_EXPORT = [
+    {
+        "name": "Relay outage",
+        "summary": "Why the harbor relay dropped connections",
+        "uuid": "c-1",
+        "chat_messages": [
+            {"sender": "human", "text": "Why did the relay drop?", "created_at": "2026-01-02T10:00:00Z", "uuid": "m-1"},
+            {
+                "sender": "assistant",
+                "text": "",
+                "content": [
+                    {"type": "thinking", "thinking": "scratchpad"},
+                    {"type": "text", "text": "The quartz certificate expired."},
+                ],
+                "created_at": "2026-01-02T10:00:05Z",
+                "uuid": "m-2",
+            },
+        ],
+    }
+]
 
-    def test_find_plugin_root_from_scripts_dir(self):
-        scripts_dummy = Path(root_dir).resolve() / "scripts" / "dummy_script.py"
-        discovered = import_conversations._find_plugin_root(scripts_dummy)
-        self.assertEqual(discovered, Path(root_dir).resolve())
 
-    def test_find_plugin_root_fallback(self):
+def _junk_roles():
+    """The roles every search excludes (parsed from the provider's filter)."""
+    import re
+
+    m = re.search(r"NOT IN \(([^)]*)\)", oracle_plugin.OracleMemoryProvider._JUNK)
+    assert m is not None
+    return {r.strip().strip("'") for r in m.group(1).split(",")}
+
+
+class TestConversationImporter(unittest.TestCase):
+    """#20: one importer. Everything it stores can be found by search."""
+
+    def test_there_is_one_importer(self):
+        repo = Path(root_dir)
+        found = sorted(p.relative_to(repo).as_posix() for p in repo.rglob("import_conversations*.py")
+                       if ".git/" not in p.as_posix())
+        self.assertEqual(found, ["scripts/import_conversations_ordered.py"])
+        skill = (repo / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("scripts/import_conversations_ordered.py", skill)
+        self.assertNotIn("skills/oracle-import/scripts", skill)
+
+    def test_claude_export_keeps_order_speakers_and_the_summary(self):
+        convs = importer.parse_conversations(CLAUDE_EXPORT)
+        self.assertEqual(len(convs), 1)
+        turns = convs[0]["turns"]
+        self.assertEqual([t["sender"] for t in turns], ["system", "human", "assistant"])
+        self.assertIn("Relay outage", turns[0]["text"])
+        self.assertIn("Why the harbor relay dropped connections", turns[0]["text"])
+        self.assertEqual(turns[2]["text"], "The quartz certificate expired.")  # thinking block dropped
+        self.assertEqual(convs[0]["conv_ref"], "Relay outage")
+
+    def test_messages_are_ordered_by_time_not_file_position(self):
+        export = [{"name": "t", "chat_messages": [
+            {"sender": "assistant", "text": "second", "created_at": "2026-01-02T10:00:05Z"},
+            {"sender": "human", "text": "first", "created_at": "2026-01-02T10:00:00Z"},
+        ]}]
+        turns = importer.parse_conversations(export)[0]["turns"]
+        self.assertEqual([t["text"] for t in turns if t["sender"] != "system"], ["first", "second"])
+
+    def test_sharegpt(self):
+        convs = importer.parse_conversations({"conversations": [
+            {"from": "human", "value": "Q"}, {"from": "gpt", "value": "A"},
+        ]})
+        self.assertEqual([(t["sender"], t["text"]) for t in convs[0]["turns"]], [("human", "Q"), ("gpt", "A")])
+
+    def test_summary_export_gives_each_entry_its_own_document(self):
+        # {"conversations": [...]} of system entries is a list of summaries,
+        # not one dialogue. One shared conv_ref would let a search return at
+        # most two chunks of the whole import (the per-source cap).
+        convs = importer.parse_conversations({"conversations": [
+            {"from": "system", "value": "Conversation: ITAHM\n\nSummary: Overview\n\nUUID: abc-123"},
+            {"from": "system", "value": "Conversation: Relay\n\nSummary: Outage"},
+            {"from": "system", "value": "An entry without a title line"},
+        ]})
+        self.assertEqual([c["conv_ref"] for c in convs], ["ITAHM", "Relay", "conversation-00002"])
+        self.assertTrue(all(len(c["turns"]) == 1 for c in convs))
+
+    def test_list_of_sharegpt_sessions(self):
+        convs = importer.parse_conversations([
+            {"conversations": [{"from": "human", "value": "Q1"}, {"from": "gpt", "value": "A1"}]},
+            {"title": "Second", "conversations": [{"from": "human", "value": "Q2"}]},
+            "a bare string entry",
+        ])
+        self.assertEqual([c["conv_ref"] for c in convs], ["conv0000", "Second", "conv0002"])
+        self.assertEqual([t["text"] for t in convs[0]["turns"]], ["Q1", "A1"])
+        self.assertEqual([t["sender"] for t in convs[1]["turns"]], ["system", "human"])
+
+    def test_undated_messages_keep_file_order_after_dated_ones(self):
+        export = [{"chat_messages": [
+            {"sender": "human", "text": "undated a"},
+            {"sender": "human", "text": "dated", "created_at": "2026-01-01T00:00:00Z"},
+            {"sender": "human", "text": "undated b"},
+        ]}]
+        self.assertEqual([t["text"] for t in importer.parse_conversations(export)[0]["turns"]],
+                         ["dated", "undated a", "undated b"])
+
+    def test_empty_and_unknown_shapes(self):
+        for data in (None, 5, "text", [], {}, {"chat_messages": []}, [{"chat_messages": [{"sender": "human", "text": " "}]}]):
+            self.assertEqual(importer.parse_conversations(data), [], repr(data))
+
+    def test_session_with_only_a_title_and_summary_is_kept(self):
+        convs = importer.parse_conversations([{"name": "Session 1", "summary": "Sum 1"}])
+        self.assertEqual(len(convs), 1)
+        self.assertIn("Session 1", convs[0]["turns"][0]["text"])
+        self.assertIn("Sum 1", convs[0]["turns"][0]["text"])
+
+    def test_truncated_json_imports_the_complete_leading_objects(self):
+        raw = '[{"name": "Session 1", "summary": "Sum 1"}, {"name": "Session 2", "sum'
+        self.assertEqual(importer.parse_json_safely(raw), [{"name": "Session 1", "summary": "Sum 1"}])
         with tempfile.TemporaryDirectory() as td:
-            dummy_path = Path(td) / "level1" / "level2" / "level3" / "script.py"
-            discovered = import_conversations._find_plugin_root(dummy_path)
-            self.assertEqual(discovered, Path(td))
+            f = Path(td) / "cut.json"
+            f.write_text(raw, encoding="utf-8")
+            convs = importer.load_archive(f)
+        self.assertEqual([c["conv_ref"] for c in convs], ["Session 1"])
 
-    def test_import_conversations_missing_file_returns_error(self):
-        with patch.object(sys, "argv", ["import_conversations.py", "/nonexistent/path/file.json"]):
-            ret = import_conversations.main()
-            self.assertEqual(ret, 1)
+    def test_complete_json_is_parsed_as_one_value(self):
+        self.assertEqual(importer.parse_json_safely('{"a": 1}'), [{"a": 1}])
+        self.assertEqual(importer.parse_json_safely("not json at all"), [])
 
-    def test_import_conversations_provider_load_fallback_nonexistent_init(self):
-        with tempfile.NamedTemporaryFile("w+", suffix=".json") as tf:
-            json.dump({"conversations": [{"from": "user", "value": "test"}]}, tf)
-            tf.flush()
-            with patch.object(sys, "argv", ["import_conversations.py", tf.name]):
-                with patch.object(import_conversations, "plugin_root", Path("/nonexistent/plugin/path")):
-                    with patch.dict(sys.modules, {"hermes_oracle_memory": None, "__init__": None}):
-                        ret = import_conversations.main()
-                        self.assertEqual(ret, 1)
+    def test_zip_archive(self):
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as td:
+            z = Path(td) / "export.zip"
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr("users.json", "[]")
+                zf.writestr("conversations.json", json.dumps(CLAUDE_EXPORT))
+            convs = importer.load_archive(z)
+        self.assertEqual(len(convs), 1)
+
+    def _run_import(self, argv, export=CLAUDE_EXPORT):
+        """Run the importer with a real provider object whose inserts are captured."""
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        stored = []
+
+        def initialize(session_id, **kw):
+            provider._session_id = session_id
+
+        plugin = MagicMock()
+        plugin.OracleMemoryProvider.return_value = provider
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "conversations.json"
+            f.write_text(json.dumps(export), encoding="utf-8")
+            with patch.object(importer.common, "load_plugin", return_value=plugin), \
+                    patch.object(provider, "initialize", side_effect=initialize), \
+                    patch.object(provider, "shutdown") as shutdown, \
+                    patch.object(provider, "_chunk_text", side_effect=lambda text, mw, ov: [text]), \
+                    patch.object(provider, "_insert_many", side_effect=lambda rows: stored.extend(rows) or []):
+                rc = importer.main([str(f), *argv])
+        return rc, stored, shutdown
+
+    def test_every_imported_row_can_be_found_by_search(self):
+        rc, rows, shutdown = self._run_import(["--session-id", "archive-1"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(rows), 3)  # summary, question, answer
+        junk = _junk_roles()
+        self.assertTrue({"turn", "assistant", "session"} <= junk)
+        for row in rows:
+            self.assertNotIn(row["role"], junk, row)
+            self.assertEqual(row["role"], "chunk")
+            self.assertEqual(row["target"], "memory")
+            self.assertEqual(row["session_id"], "archive-1")
+        shutdown.assert_called_once()
+
+    def test_the_assistant_message_is_stored_with_its_speaker_and_position(self):
+        _, rows, _ = self._run_import([])
+        answer = next(r for r in rows if "quartz certificate" in r["content"])
+        self.assertEqual(answer["metadata"]["sender"], "assistant")
+        self.assertEqual(answer["conv_ref"], "Relay outage")
+        self.assertEqual((answer["turn_index"], answer["chunk_index"]), (2, 0))
+        self.assertRegex(answer["session_id"], r"^import-ordered-\d{8}$")
+
+    def test_provider_is_shut_down_when_an_insert_fails(self):
+        provider = oracle_plugin.OracleMemoryProvider()
+        provider._pool = MagicMock()
+        plugin = MagicMock()
+        plugin.OracleMemoryProvider.return_value = provider
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "c.json"
+            f.write_text(json.dumps(CLAUDE_EXPORT), encoding="utf-8")
+            with patch.object(importer.common, "load_plugin", return_value=plugin), \
+                    patch.object(provider, "initialize"), patch.object(provider, "shutdown") as shutdown, \
+                    patch.object(provider, "_chunk_and_store", side_effect=RuntimeError("ORA-00600")):
+                with self.assertRaises(RuntimeError):
+                    importer.run(importer.argparse.Namespace(
+                        file=str(f), env_file=None, limit_conversations=0, session_id="s", max_words=80, overlap=10))
+        shutdown.assert_called_once()
+
+    def test_missing_file_needs_neither_plugin_nor_database(self):
+        with patch.object(importer.common, "load_plugin", side_effect=AssertionError("must not load")):
+            self.assertEqual(importer.main(["/nonexistent/path/file.json"]), 2)
+
+    def test_archive_without_conversations_needs_neither_plugin_nor_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "empty.json"
+            f.write_text("[]", encoding="utf-8")
+            with patch.object(importer.common, "load_plugin", side_effect=AssertionError("must not load")):
+                self.assertEqual(importer.main(["--file", str(f)]), 2)
+
+    def test_the_archive_is_named_once(self):
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            importer.main([])
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            importer.main(["a.json", "--file", "b.json"])
 
 
 if __name__ == "__main__":

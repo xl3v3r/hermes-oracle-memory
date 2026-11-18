@@ -26,9 +26,7 @@ import json
 import os
 import sys
 import time
-import types
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,68 +35,34 @@ _REQUIRED_ENV = ("OCI_DB_USER", "OCI_DB_PASSWORD", "OCI_DB_DSN")
 _SESSION_PREFIX = "verify-"
 
 
+def _common() -> Any:
+    """scripts/_common.py (settings file, host shims, plugin loader), by path."""
+    import importlib.util
+
+    name = "hermes_oracle_scripts_common"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, REPO_ROOT / "scripts" / "_common.py")
+        if spec is None or spec.loader is None:
+            raise ImportError("scripts/_common.py is missing")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module
+
+
 def load_env(env_file: str | None) -> None:
     """Load KEY=VALUE settings from *env_file*, only when --env-file is given.
     Values already in the environment win."""
-    if not env_file:
-        return
-    for line in Path(env_file).expanduser().read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-def _install_host_shims() -> None:
-    """Outside Hermes there is no `agent` or `tools` package; provide the few
-    names the plugin imports."""
-    if "agent" not in sys.modules:
-        try:
-            import agent.memory_provider  # noqa: F401
-            import agent.secret_scope  # noqa: F401
-        except ImportError:
-            agent_mod = types.ModuleType("agent")
-            mp_mod = types.ModuleType("agent.memory_provider")
-
-            class MemoryProvider:
-                pass
-
-            @dataclass
-            class RecallStatus:
-                provider_label: str
-                count: int
-
-            setattr(mp_mod, "MemoryProvider", MemoryProvider)
-            setattr(mp_mod, "RecallStatus", RecallStatus)
-            setattr(mp_mod, "is_trivial_prompt", lambda prompt: False)
-            sec_mod = types.ModuleType("agent.secret_scope")
-            setattr(sec_mod, "get_secret", lambda k, default=None: os.environ.get(k, default))
-            setattr(agent_mod, "memory_provider", mp_mod)
-            setattr(agent_mod, "secret_scope", sec_mod)
-            sys.modules.update({
-                "agent": agent_mod, "agent.memory_provider": mp_mod, "agent.secret_scope": sec_mod,
-            })
-    if "tools" not in sys.modules:
-        try:
-            import tools.registry  # noqa: F401
-        except ImportError:
-            tools_mod = types.ModuleType("tools")
-            reg_mod = types.ModuleType("tools.registry")
-            setattr(reg_mod, "tool_error", lambda msg, *a, **k: json.dumps({"error": str(msg)}))
-            setattr(tools_mod, "registry", reg_mod)
-            sys.modules.update({"tools": tools_mod, "tools.registry": reg_mod})
+    _common().load_env(env_file)
 
 
 def _load_plugin() -> Any:
-    _install_host_shims()
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    import __init__ as plugin
-
-    return plugin
+    return _common().load_plugin()
 
 
 class CheckFailed(Exception):
