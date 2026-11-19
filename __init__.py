@@ -1336,7 +1336,7 @@ TOOL_SCHEMAS = [
         "description": (
             "Load a full skill from the shared Oracle skill corpus (works for skills NOT on local disk). "
             "'fetch' reconstructs the skill document from its chunks (word-accurate, line structure flattened): "
-            "returns text + file manifest. 'list' returns name + description of every ingested skill (2,300+); "
+            "returns text + file manifest. 'list' returns name + description of every ingested skill; "
             "supports substring filter and pagination."
         ),
         "parameters": {
@@ -1704,7 +1704,7 @@ class OracleMemoryProvider(MemoryProvider):
             },
             {
                 "key": "table_name",
-                "description": "Custom table name (for OpenClaw compatibility)",
+                "description": "Memory table name",
                 "secret": False,
                 "required": False,
                 "env_var": "HERMES_ORACLE_TABLE",
@@ -1741,7 +1741,7 @@ class OracleMemoryProvider(MemoryProvider):
             self._fail_closed(derived.error)
             return
 
-        # Load table name dynamically for OpenClaw shared memory compatibility
+        # The table name is a setting; it is validated before it reaches any SQL.
         import re as _re
 
         raw_table = get_secret("HERMES_ORACLE_TABLE")
@@ -3263,7 +3263,6 @@ class OracleMemoryProvider(MemoryProvider):
 
     _JUNK = (
         " AND memory_id NOT LIKE 'test_%'"
-        " AND NVL(session_id, 'x') <> 'diagnostic-session-001'"
         " AND NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session') "
         # lifecycle telemetry only ([skill_usage], [skill_vectorization_*]).
         # MUST NOT match skill_ingest rows — those are the skill index.

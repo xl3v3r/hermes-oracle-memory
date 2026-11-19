@@ -2335,9 +2335,9 @@ class TestOraclePlugin(unittest.TestCase):
     def test_diversify_rows_caps_chunks_per_skill(self):
         provider = oracle_plugin.OracleMemoryProvider()
         rows = [
-            {"memory_id": "s1", "role": "skill", "content": "[skill_ingest] [skill:legal-memo] chunk 0", "score": 0.9, "conv_ref": "legal-memo"},
-            {"memory_id": "s2", "role": "skill", "content": "[skill_ingest] [skill:legal-memo] chunk 1", "score": 0.8, "conv_ref": "legal-memo"},
-            {"memory_id": "s3", "role": "skill", "content": "[skill_ingest] [skill:legal-memo] chunk 2", "score": 0.7, "conv_ref": "legal-memo"},
+            {"memory_id": "s1", "role": "skill", "content": "[skill_ingest] [skill:sample-skill] chunk 0", "score": 0.9, "conv_ref": "sample-skill"},
+            {"memory_id": "s2", "role": "skill", "content": "[skill_ingest] [skill:sample-skill] chunk 1", "score": 0.8, "conv_ref": "sample-skill"},
+            {"memory_id": "s3", "role": "skill", "content": "[skill_ingest] [skill:sample-skill] chunk 2", "score": 0.7, "conv_ref": "sample-skill"},
             {"memory_id": "f1", "role": "fact", "content": "A durable fact about the host", "score": 0.6},
             {"memory_id": "f2", "role": "fact", "content": "Another durable fact about the host", "score": 0.5},
         ]
@@ -2361,7 +2361,7 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertGreaterEqual(oracle_plugin._MAX_CHUNKS_PER_SOURCE, 1)
 
     def test_source_key_parsing(self):
-        self.assertEqual(oracle_plugin._source_key({"conv_ref": "legal-memo", "content": "x"}), "legal-memo")
+        self.assertEqual(oracle_plugin._source_key({"conv_ref": "sample-skill", "content": "x"}), "sample-skill")
         self.assertEqual(oracle_plugin._source_key({"content": "[skill_ingest] [skill:alpha] chunk 1"}), "alpha")
         self.assertEqual(oracle_plugin._source_key({"content": "plain fact text"}), "")
         self.assertEqual(oracle_plugin._source_key("not-a-row"), "")
@@ -2410,13 +2410,7 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("version-1.1.2-blue.svg", install_md)
         self.assertIn("v1.1.2", install_md)
 
-        # 6b. Agent docs carry the version too (they drifted until 1.1.1.4)
-        agents_md = (repo_dir / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn("RELEASE_NOTES_1.1.2.md", agents_md)
-        self.assertIn("(1.1.2)", agents_md)
-        needs_md = (repo_dir / "NEEDS.md").read_text(encoding="utf-8")
-        self.assertIn("**Version in play:** 1.1.2", needs_md)
-        self.assertIn("tag `v1.1.2`", needs_md)
+        # 6b. The second bundled skill carries the version too
         corpus_md = (repo_dir / "skills" / "oracle-skill-corpus" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("version: 1.1.2", corpus_md)
         changelog = (repo_dir / "CHANGELOG.md").read_text(encoding="utf-8")

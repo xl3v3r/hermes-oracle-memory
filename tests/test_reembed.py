@@ -251,7 +251,7 @@ class TestReembedEmbeddings(unittest.TestCase):
             mode="nulls",
             batch_size=100,
             workers=4,
-            total_rows=162_400,
+            total_rows=0,
             table="HERMES_AGENT_MEMORY",
             onnx_model="BGE_BASE_EN_V1_5",
             checkpoint=None,
@@ -263,7 +263,21 @@ class TestReembedEmbeddings(unittest.TestCase):
             reembed_embeddings.run(args)
         self.assertEqual(args.batch_size, 25)
         self.assertEqual(args.workers, 1)
-        self.assertEqual(args.total_rows, 1228)
+        # the row count is the caller's to give; the script does not invent one
+        self.assertEqual(args.total_rows, 0)
+
+    def test_eta_needs_a_row_count(self):
+        self.assertEqual(reembed_embeddings.eta_text(0, 500, 10.0), "eta n/a")
+        self.assertEqual(reembed_embeddings.eta_text(6500, 500, 10.0), "eta 10.0 min")
+        self.assertEqual(reembed_embeddings.eta_text(6500, 500, 0), "eta n/a")
+        self.assertEqual(reembed_embeddings.eta_text(100, 500, 10.0), "eta 0.0 min")
+
+    def test_total_rows_has_no_built_in_count(self):
+        with patch("reembed_embeddings.run", return_value=0) as run, \
+                patch.object(sys, "argv", ["reembed_embeddings.py", "--mode", "verify"]):
+            with self.assertRaises(SystemExit):
+                reembed_embeddings.main()
+        self.assertEqual(run.call_args[0][0].total_rows, 0)
 
 
 if __name__ == "__main__":

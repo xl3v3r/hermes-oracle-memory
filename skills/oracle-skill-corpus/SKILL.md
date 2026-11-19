@@ -10,9 +10,9 @@ metadata:
 
 # Oracle 26ai Shared Skill Corpus
 
-Discover and materialize skills from the fleet-wide shared Oracle 26ai Autonomous Database (`HERMES_AGENT_MEMORY`) skill corpus at runtime.
+Discover and materialize skills from the shared skill corpus in the Oracle memory table at runtime.
 
-The shared corpus contains over 2,300+ skills synchronized across multiple Hermes server profiles and hosts. Any Hermes agent connected to Oracle 26ai can search, inspect, and reconstruct full skills dynamically—even if the skill files do not exist on the local disk.
+The corpus holds the skills that every Hermes host and profile connected to the same database has synchronized. Any agent connected to it can search, inspect, and reconstruct full skills, even if the skill files do not exist on the local disk.
 
 ## Core Rule
 
@@ -22,7 +22,7 @@ The shared corpus contains over 2,300+ skills synchronized across multiple Herme
 ## When to Use
 
 - A user requests a capability or task, and no local skill in `~/.hermes/skills/` or `~/.agents/skills/` matches.
-- Exploring available workflows, domain knowledge, or integrations across the shared fleet library.
+- Exploring available workflows, domain knowledge, or integrations across the shared corpus.
 - Dynamically loading instructions and reference documents for an uninstalled skill.
 - Resolving conflicting skill versions or inspecting cross-host variants.
 

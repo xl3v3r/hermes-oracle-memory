@@ -338,28 +338,6 @@ class TestProviderIntegration(unittest.TestCase):
         self.assertIn("references/subguide.md", last_row["content"])
         self.assertEqual(last_row["metadata"]["reference_file"], "references/subguide.md")
 
-    def test_pro_se_litigation_40_chunks_verification(self):
-        pro_se_path = Path.home() / ".hermes" / "skills" / "legal" / "pro-se-litigation" / "SKILL.md"
-        if not pro_se_path.is_file():
-            self.skipTest(f"pro-se-litigation SKILL.md not found at {pro_se_path}")
-
-        skill = parse_skill_file(pro_se_path)
-        self.assertIsNotNone(skill)
-        self.assertEqual(skill.name, "pro-se-litigation")
-        self.assertTrue(len(skill.references) >= 1)
-        self.assertTrue(any("mississippi-procedure.md" in r[0] for r in skill.references))
-
-        rows = format_skill_payload(skill, mode="full")
-        self.assertEqual(
-            len(rows),
-            40,
-            f"Expected exactly 40 chunks for pro-se-litigation with references/mississippi-procedure.md, got {len(rows)}",
-        )
-        self.assertEqual(rows[0]["memory_id"], "skill:pro-se-litigation:c0")
-        self.assertEqual(rows[-1]["memory_id"], "skill:pro-se-litigation:c39")
-        # Assert reference chunk content
-        self.assertTrue(any("mississippi-procedure.md" in r["content"] for r in rows[24:]))
-
     def test_per_skill_replace_is_own_rows_only_and_transactional(self):
         """Each changed skill: DELETE of this host's rows + INSERT, one commit.
         Other hosts' copies and legacy rows are never in a DELETE."""
@@ -370,7 +348,7 @@ class TestProviderIntegration(unittest.TestCase):
         mock_cur.fetchall.return_value = [
             ("skill:in-db:c0", "in-db", '{"hash": "old_hash"}'),
             ("skill:hostb:in-db:c0", "skill:hostb:in-db", '{"hash": "old_hash", "host": "hostb"}'),
-            ("skill:casemark-unrelated:c0", "casemark-unrelated", '{"hash": "cm_hash"}'),
+            ("skill:other-unrelated:c0", "other-unrelated", '{"hash": "other_hash"}'),
         ]
         mock_conn = MagicMock()
         events = []

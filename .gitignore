@@ -29,4 +29,8 @@ tnsnames.ora
 # Assistant / agent local configs
 .claude/
 CLAUDE.md
+.agents/
+.entire/
+.jules/
+.cursor/
 

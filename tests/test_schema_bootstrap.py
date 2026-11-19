@@ -321,7 +321,6 @@ class TestVectorIndexWording(_Case):
         description = next(line for line in manifest.splitlines() if line.startswith("description:"))
         self.assertNotIn("IVF", description)
         self.assertNotIn("IVF", oracle_plugin.__doc__)
-        self.assertNotIn("IVF", (REPO / "AGENTS.md").read_text(encoding="utf-8"))
         self.assertNotIn("IVF / HNSW", (REPO / "INSTALL.md").read_text(encoding="utf-8"))
 
     def test_prompt_banner_names_no_index_type(self):

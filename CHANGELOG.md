@@ -166,7 +166,7 @@ Follow-ups to the 1.1.1.4 review (#14).
 
 ### Added
 - **Shared-Corpus Read Path (`oracle_load_skill`)**:
-  - Full skill discovery and reconstruction path (`action="fetch"` / `action="list"`) allowing any Hermes host to discover and load any skill across the 2,300+ fleet-wide library dynamically at runtime without local disk installation.
+  - Full skill discovery and reconstruction path (`action="fetch"` / `action="list"`) allowing any Hermes host to discover and load any skill in the shared corpus dynamically at runtime without local disk installation.
   - Word-accurate chunk reassembly reproducing source documents from 80-word, 10-word overlap chunks including bundled reference files.
   - Multi-variant resolution with explicit path and variant disambiguation.
   - Cost guard capped via `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` (default: 400).
@@ -213,7 +213,7 @@ Follow-ups to the 1.1.1.4 review (#14).
   - `test_sql_builders_select_candidates_by_similarity_not_role` — asserts no builder ranks by role before `FETCH FIRST`, and that every branch orders by its similarity key.
   - `test_skill_rows_weighted_below_facts_but_never_starved` — asserts skill weighting sits between fact and turn, that a closer skill chunk wins, and that facts still win at equal relevance.
   - `tests/verify_provider.py` gained a live skill-reachability guard: a skill query must return `[skill_ingest]` rows or verification fails.
-  - `test_skill_bundles` now skips (instead of failing) on hosts where curated bundles / the CaseMark archive were never deployed.
+  - `test_skill_bundles` now skips (instead of failing) on hosts where the curated bundles were never deployed.
 - **Test Script Consolidation (P2)**:
   - Removed the duplicate `scripts/run_tests.py`; `tests/run_tests.py` is the single test runner.
   - Moved `scripts/verify_provider.py` → `tests/verify_provider.py`; `scripts/` now holds operational utilities only.
@@ -244,10 +244,10 @@ Follow-ups to the 1.1.1.4 review (#14).
   - Discovers text reference files (`.md`, `.txt`, `.rst`) under `references/` alongside `SKILL.md`.
   - Sequentially chunks reference files with `conv_ref=skill.name` continuing after body chunks and computes composite SHA-256 hashes.
 - **Local Skills Full Sync & Verification (P1)**:
-  - Fully ingested `~/.hermes/skills`, verifying 40 chunks total for `pro-se-litigation` with `references/mississippi-procedure.md`.
+  - Fully ingested `~/.hermes/skills`, verifying the chunk count of a skill that has a reference file.
   - Added verification checks comparing DB chunk counts against `format_skill_payload(skill, mode='full')`.
 - **Curated Bundle Manifest Symlinks (P1)**:
-  - Created curated symlinks under `~/.hermes/skills/casemark/` for the 150 unique Casemark skills referenced across the 17 manifests in `~/.hermes/skill-bundles/*.yaml`.
+  - Created curated symlinks under `~/.hermes/skills/` for the skills referenced by the manifests in `~/.hermes/skill-bundles/*.yaml`.
 
 ### Added
 - Dedicated unit tests for read path ORA-51815 retry and degradation, vector index DDL, rebuild script execution, reference directory indexing, and batch delete chunking.

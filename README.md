@@ -313,7 +313,7 @@ Maintenance release — fleet-sync hardening (full details in `CHANGELOG.md`):
 ## What's new in v1.1.0
 
 - **Shared Cross-Server Skill Corpus (`oracle_load_skill`)**:
-  - Full skill discovery and reconstruction path (`action="fetch"` / `action="list"`) allowing any Hermes host to discover and load any skill across the 2,300+ fleet-wide library dynamically at runtime, without local disk installation.
+  - Full skill discovery and reconstruction path (`action="fetch"` / `action="list"`) allowing any Hermes host to discover and load any skill in the shared corpus dynamically at runtime, without local disk installation.
   - Word-accurate chunk reassembly reproducing source documents from 80-word, 10-word overlap chunks including bundled reference files.
   - Multi-variant resolution with explicit path and variant disambiguation.
 - **Live Lifecycle Ingestion (`on_skill_lifecycle`)**:
