@@ -960,6 +960,94 @@ _FETCH_ARRAYSIZE = 64
 # (vector hits score 0.7 x similarity), on the fused path and on the
 # cooldown / degraded text-only paths alike.
 _HYBRID_TEXT_WEIGHT = 0.3
+# HERMES_ORACLE_RANKING: how a hybrid search merges its two legs.
+_RANKINGS = ("weighted", "rrf")
+_RRF_K = 60  # the constant of reciprocal-rank fusion (Cormack et al., 2009)
+_TEXT_LEG_TERMS = 8
+# Words the text leg does not search for under ranking "rrf".
+_TEXT_STOP_WORDS = frozenset(
+    "about after all also and any are been but can did does for from get had has have her him his how into its "
+    "just may more most not now one only other our out over see some such than that the their them then there "
+    "these they this those two use very was were what when where which who will with would you your".split()
+)
+
+
+def _parse_ranking(raw: Any) -> str:
+    """HERMES_ORACLE_RANKING: "weighted" (the default) or "rrf". Any other
+    value keeps the default, with a warning."""
+    text = raw.strip().lower() if isinstance(raw, str) else ""
+    if not text or text in _RANKINGS:
+        return text or "weighted"
+    logger.warning("HERMES_ORACLE_RANKING: ignoring %r (known: %s)", text, ", ".join(_RANKINGS))
+    return "weighted"
+
+
+def _longest_terms(tokens: list[str], limit: int) -> list[str]:
+    """Up to *limit* of *tokens* for the text leg: stop words and repeats
+    out, then the longest terms (the earlier one of two equally long), in
+    the order the query had them."""
+    seen: set[str] = set()
+    kept: list[tuple[int, str]] = []
+    for pos, tok in enumerate(tokens):
+        low = tok.lower()
+        if low in _TEXT_STOP_WORDS or low in seen:
+            continue
+        seen.add(low)
+        kept.append((pos, tok))
+    longest = sorted(kept, key=lambda pt: (-len(pt[1]), pt[0]))[:limit]
+    return [tok for _, tok in sorted(longest)]
+
+
+def _fuse_legs(rows: list[dict[str, Any]], ranking: str = "weighted") -> list[dict[str, Any]]:
+    """The rows of the vector leg and of the text leg (a text row has no
+    "dist") as one row per memory_id, scored. The result does not depend on
+    the order the rows arrive in: a UNION ALL guarantees none.
+
+    weighted: 0.7 x similarity + 0.3 x text score (_fetch_rows has weighted
+    the vector row already). rrf: reciprocal-rank fusion, scaled so that the
+    first row of both legs scores 1.0 and the first row of one leg 0.5.
+
+    Returns copies without "dist": vector rows nearest first, then the rows
+    only the text leg found, best first."""
+
+    def newest_first(leg: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Equal keys rank newest first, as the statements order them.
+        return sorted(
+            leg,
+            key=lambda r: r["created_at"].replace(tzinfo=None) if isinstance(r.get("created_at"), datetime) else datetime.min,
+            reverse=True,
+        )
+
+    vec_rows = sorted(newest_first([r for r in rows if r.get("dist") is not None]), key=lambda r: r["dist"])
+    txt_rows = sorted(newest_first([r for r in rows if r.get("dist") is None]), key=lambda r: -r["score"])
+    vec_rank = {r["memory_id"]: i for i, r in enumerate(vec_rows, 1)}
+    txt_rank = {r["memory_id"]: i for i, r in enumerate(txt_rows, 1)}
+    txt_by_id = {r["memory_id"]: r for r in txt_rows}
+
+    def rrf(mid: Any) -> float:
+        total = sum(1.0 / (_RRF_K + rank[mid]) for rank in (vec_rank, txt_rank) if mid in rank)
+        return round(total * (_RRF_K + 1) / 2, 4)
+
+    out: list[dict[str, Any]] = []
+    for r in vec_rows:
+        mid = r["memory_id"]
+        item = {k: v for k, v in r.items() if k != "dist"}
+        if ranking == "rrf":
+            item["score"] = rrf(mid)
+        elif mid in txt_by_id:
+            item["score"] = round(min(1.0, r["score"] + txt_by_id[mid]["score"] * _HYBRID_TEXT_WEIGHT), 4)
+        out.append(item)
+    for r in txt_rows:
+        mid = r["memory_id"]
+        if mid in vec_rank:
+            continue
+        item = {k: v for k, v in r.items() if k != "dist"}
+        item["score"] = rrf(mid) if ranking == "rrf" else round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
+        out.append(item)
+    return out
+
+
+_RANKING = _parse_ranking(_setting("HERMES_ORACLE_RANKING"))
 # Embedding backfill (rows written with a NULL embedding during an ONNX cooldown
 # or a transient error). Failed batches back off exponentially; a row is dropped
 # from the in-memory queue after _BACKFILL_MAX_ATTEMPTS (it keeps its NULL
@@ -1110,6 +1198,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
             "add_similar_min": _ADD_SIMILAR_MIN,
             "capture": _CAPTURE,
             "optional_rules": _OPTIONAL_RULES_ON,
+            "ranking": _RANKING,
         }
     return {
         "skill_fetch_max_chunks": int(_env_number("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", 400, lo=1)),
@@ -1123,6 +1212,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
         "add_similar_min": _env_number("HERMES_ORACLE_ADD_SIMILAR_MIN", 0.9, hi=1.0, allow_zero=True),
         "capture": _parse_capture(_setting("HERMES_ORACLE_CAPTURE")),
         "optional_rules": _parse_optional_rules(_setting("HERMES_ORACLE_OPTIONAL_RULES")),
+        "ranking": _parse_ranking(_setting("HERMES_ORACLE_RANKING")),
     }
 _TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
 
@@ -2924,13 +3014,18 @@ class OracleMemoryProvider(MemoryProvider):
         t.start()
 
     def _contains_query(self, query: str) -> str:
+        """The CONTAINS expression of the text leg, or "" when the query has
+        no usable term: the caller then runs no text leg. Terms are words of
+        more than two characters: the first eight, or under ranking "rrf"
+        the eight longest once stop words are dropped (see _longest_terms)."""
         cleaned = _CONTAINS_CLEAN_RE.sub(" ", query or "")
-        tokens = [t for t in cleaned.split() if len(t) > 2][:8]
-        if not tokens:
-            return "{memory}"
+        tokens = [t for t in cleaned.split() if len(t) > 2]
+        if self._tune("ranking") == "rrf":
+            tokens = _longest_terms(tokens, _TEXT_LEG_TERMS)
+        else:
+            tokens = tokens[:_TEXT_LEG_TERMS]
         # ACCUM ranks a union of terms; AND of every token misses too often.
-        escaped = [f"{{{t}}}" for t in tokens]
-        return " ACCUM ".join(escaped)
+        return " ACCUM ".join(f"{{{t}}}" for t in tokens)
 
     # -- writes / reads ------------------------------------------------------
 
@@ -3533,7 +3628,7 @@ class OracleMemoryProvider(MemoryProvider):
                 raise
 
     _JUNK = (
-        " AND memory_id NOT LIKE 'test_%'"
+        " AND memory_id NOT LIKE 'test\\_%' ESCAPE '\\'"
         " AND NVL(role, 'fact') NOT IN ('turn', 'assistant', 'session') "
         # lifecycle telemetry only ([skill_usage], [skill_vectorization_*]).
         # MUST NOT match skill_ingest rows — those are the skill index.
@@ -3716,23 +3811,31 @@ class OracleMemoryProvider(MemoryProvider):
     ) -> list:
         if timeout_s is None:
             timeout_s = self._search_secs
-        merged: dict = {}
+        ranking = self._tune("ranking")
+
+        def ranked(legs: list) -> list:
+            """One row per id: fused, prefix-boosted, best first. Every path
+            of a hybrid search ends here, so its score means one thing."""
+            fused = _fuse_legs(legs, ranking)
+            for item in fused:
+                if self._is_prefix_match(item.get("content"), query):
+                    item["score"] = round(min(1.0, item["score"] + 0.15), 4)
+            # Not cut to top_k here: weighting and per-source diversification
+            # run in _search_once over the whole candidate list, and the
+            # optional rerank after them.
+            return sorted(fused, key=lambda x: x["score"], reverse=True)
+
+        legs: list = []
         if self._onnx_in_cooldown():
+            if not contains_q:
+                return []
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")
             try:
                 sql, binds = self._build_text_search_sql(
                     contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
                     skill_rows=skill_rows,
                 )
-                for r in self._fetch_rows(cur, sql, binds):
-                    r.pop("dist", None)
-                    # Same weight as a text-only hit of the fused query, so a
-                    # hybrid score means the same thing on every path.
-                    r["score"] = round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
-                    merged[r["memory_id"]] = r
-                for item in merged.values():
-                    if self._is_prefix_match(item.get("content"), query):
-                        item["score"] = round(min(1.0, item["score"] + 0.15), 4)
+                legs = self._fetch_rows(cur, sql, binds)
             except Exception as e:
                 err_str = str(e)
                 is_timeout_err = _is_timeout_error(e)
@@ -3746,33 +3849,30 @@ class OracleMemoryProvider(MemoryProvider):
                         f"oracle_search hybrid text query timed out after {timeout_s:.0f}s: {e}"
                     ) from e
                 raise
-            return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+            return ranked(legs)
 
         if not self._onnx_model:
             raise RuntimeError(
                 "In-database ONNX model is not configured; external fallback is disabled"
             )
-        fused_sql, fused_binds = self._build_hybrid_search_sql(
-            query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
-            skill_rows=skill_rows,
-        )
+        if contains_q:
+            fused_sql, fused_binds = self._build_hybrid_search_sql(
+                query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags,
+                tag_match=tag_match, skill_rows=skill_rows,
+            )
+            max_rows = 2 * fetch_k
+        else:
+            # No usable term for the text leg: the vector leg alone.
+            fused_sql, fused_binds = self._build_vector_search_sql(
+                query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+                skill_rows=skill_rows,
+            )
+            max_rows = fetch_k
 
         degraded_to_text = False
         for attempt in range(_51815_RETRIES):
             try:
-                for r in self._fetch_rows_attempt(cur, fused_sql, fused_binds, attempt, max_rows=2 * fetch_k):
-                    prev = merged.get(r["memory_id"])
-                    if prev:
-                        prev["score"] = round(
-                            min(1.0, prev["score"] + r["score"] * 0.3), 4
-                        )
-                        prev.pop("dist", None)
-                    else:
-                        item = dict(r)
-                        if item.get("dist") is None and "dist" in item:
-                            item["score"] = round(item["score"] * _HYBRID_TEXT_WEIGHT, 4)
-                        item.pop("dist", None)
-                        merged[r["memory_id"]] = item
+                legs = self._fetch_rows_attempt(cur, fused_sql, fused_binds, attempt, max_rows=max_rows)
                 break
             except Exception as e:
                 err_str = str(e)
@@ -3815,9 +3915,7 @@ class OracleMemoryProvider(MemoryProvider):
                                 query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
                                 skill_rows=skill_rows,
                             )
-                            for r in self._fetch_rows_attempt(cur, vec_sql, vec_binds, vec_attempt):
-                                r.pop("dist", None)
-                                merged[r["memory_id"]] = r
+                            legs = self._fetch_rows_attempt(cur, vec_sql, vec_binds, vec_attempt)
                             vec_fallback_done = True
                             break
                         except Exception as vec_err:
@@ -3862,21 +3960,15 @@ class OracleMemoryProvider(MemoryProvider):
                     ) from e
 
         if degraded_to_text:
-            merged.clear()
+            legs = []
+            if not contains_q:
+                return []
             try:
                 sql, binds = self._build_text_search_sql(
                     contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
                     skill_rows=skill_rows,
                 )
-                for r in self._fetch_rows(cur, sql, binds):
-                    r.pop("dist", None)
-                    # Same weight as a text-only hit of the fused query, so a
-                    # hybrid score means the same thing on every path.
-                    r["score"] = round(r["score"] * _HYBRID_TEXT_WEIGHT, 4)
-                    merged[r["memory_id"]] = r
-                for item in merged.values():
-                    if self._is_prefix_match(item.get("content"), query):
-                        item["score"] = round(min(1.0, item["score"] + 0.15), 4)
+                legs = self._fetch_rows(cur, sql, binds)
             except Exception as e:
                 err_str = str(e)
                 is_timeout_err = _is_timeout_error(e)
@@ -3890,17 +3982,9 @@ class OracleMemoryProvider(MemoryProvider):
                         f"oracle_search hybrid degraded text query timed out after {timeout_s:.0f}s: {e}"
                     ) from e
                 logger.warning("Oracle hybrid degraded text search encountered error: %s", e)
-            return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+            return ranked(legs)
 
-        for item in merged.values():
-            item.pop("dist", None)
-            if self._is_prefix_match(item.get("content"), query):
-                item["score"] = round(min(1.0, item["score"] + 0.15), 4)
-
-        # Not cut to top_k here: weighting and per-source diversification run
-        # in _search_once over the whole candidate list, and the optional rerank
-        # after them.
-        return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+        return ranked(legs)
 
     def _apply_weights(self, rows: list[dict[str, Any]], cur: Any = None) -> list[dict[str, Any]]:
         """Apply retrieval weighting to candidate rows based on recency, role, telemetry, and length."""
@@ -4079,6 +4163,8 @@ class OracleMemoryProvider(MemoryProvider):
         mode = (mode or "hybrid").lower()
         tgt = (target or "any").lower()
         contains_q = self._contains_query(query)
+        if mode == "text" and not contains_q:
+            return []  # no usable term: nothing for Oracle Text to look for
         if not self._onnx_model and mode != "text":
             raise RuntimeError(
                 "In-database ONNX model is not configured; external fallback is disabled"

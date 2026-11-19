@@ -41,20 +41,10 @@ class TestOraclePlugin(unittest.TestCase):
     def test_contains_query_edge_cases(self):
         provider = oracle_plugin.OracleMemoryProvider()
 
-        # Test None
-        self.assertEqual(provider._contains_query(None), "{memory}")
-
-        # Test empty string
-        self.assertEqual(provider._contains_query(""), "{memory}")
-
-        # Test whitespace only
-        self.assertEqual(provider._contains_query("   \n\t  "), "{memory}")
-
-        # Test only punctuation
-        self.assertEqual(provider._contains_query("?!.,;:()"), "{memory}")
-
-        # Test only short words
-        self.assertEqual(provider._contains_query("a to is"), "{memory}")
+        # No usable term (None, empty, punctuation, short words): no text leg.
+        # tests/test_fusion.py covers what the callers do with that.
+        for query in (None, "", "   \n\t  ", "?!.,;:()", "a to is"):
+            self.assertEqual(provider._contains_query(query), "", query)
 
         # Test valid query
         self.assertEqual(provider._contains_query("test query"), "{test} ACCUM {query}")
@@ -87,8 +77,8 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._contains_query("within"), "{within}")
         self.assertEqual(provider._contains_query("near"), "{near}")
 
-        # Test short reserved word 'or' falls back to {memory}
-        self.assertEqual(provider._contains_query("or"), "{memory}")
+        # The short reserved word 'or' leaves no term
+        self.assertEqual(provider._contains_query("or"), "")
 
         # Test phrase containing 'or' alongside longer terms
         self.assertEqual(provider._contains_query("gold or silver"), "{gold} ACCUM {silver}")

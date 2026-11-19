@@ -70,6 +70,7 @@ Embeddings are computed inside the database, by the ONNX model that `HERMES_ORAC
 | `HERMES_ORACLE_POOL_IDLE_TIMEOUT` | `300` | Seconds an idle pooled session above the pool minimum stays open |
 | `HERMES_ORACLE_PREFETCH_WAIT` | `3` | Seconds a turn waits for background recall before continuing without it (0.1–7) |
 | `HERMES_ORACLE_SCOPE_MODE` | `off` | `off`, `auto` or `required`: keep each caller's memory apart — see [Per-user scope](#per-user-scope) |
+| `HERMES_ORACLE_RANKING` | `weighted` | How a hybrid search merges its vector leg and its text leg: `weighted` or `rrf` — see [Ranking of a hybrid search](#ranking-of-a-hybrid-search) |
 | `HERMES_ORACLE_MIN_CANDIDATE_POOL` | `50` | Rows each search fetches before ranking (at least this many, whatever `top_k` is) |
 | `HERMES_ORACLE_MAX_CHUNKS_PER_SKILL` | `2` | Most chunks of one skill or imported conversation in a result list; `0` = no cap |
 | `HERMES_ORACLE_RECENCY_FLOOR` | `0.85` | Score multiplier of a very old row (0–1). A new row has 1.0; `1` turns recency weighting off |
@@ -109,6 +110,20 @@ Three groups state one deployment's policy. `HERMES_ORACLE_OPTIONAL_RULES` adds 
 - A rule keeps its number on every host, so a default session has no rules 5, 6, 7 and 19.
 - Up to 1.1.2 every session received rules 1 to 10, including 5, 6 and 7. Set `HERMES_ORACLE_OPTIONAL_RULES=oracle_only,write_ahead` in the profile's `.env` to keep sending them.
 - Rules 16 and 18 use the tag `instruction`: the model follows instructions found in a stored row only when the row carries that tag. Rows that hold standing instructions and were stored before 1.1.2.1 do not carry it until it is added (`oracle_update` with `tags`).
+
+### Ranking of a hybrid search
+
+A hybrid search (the default mode of `oracle_search`, and recall) runs a vector leg and an Oracle Text leg and merges their rows. `HERMES_ORACLE_RANKING` selects how:
+
+| Value | Score of a row | Words the text leg searches for |
+|---|---|---|
+| `weighted` (default) | `0.7 × similarity + 0.3 × text score` | the first eight words of more than two characters |
+| `rrf` | reciprocal-rank fusion: `1 / (60 + rank)` per leg, scaled so that the first row of both legs scores 1.0 and the first row of one leg 0.5 | stop words dropped, then the eight longest words |
+
+- Under `weighted` a row that only the text leg found scores at most 0.3, and a row that only the vector leg found passes it at a similarity of 0.43. An exact identifier (an error code, a host name, a ticket id) therefore ranks below loosely related text. Under `rrf` the best keyword hit ranks with the best semantic hit.
+- Under `rrf` a score states where a row ranked in each leg, not how similar it is.
+- Both values then add 0.15 to a row whose text starts with the query, apply the role, recency and usage weights, and limit how many rows one source contributes.
+- A query without a usable word has no text leg: a hybrid search runs its vector leg alone, and a `text` search returns nothing. Up to 1.1.2 such a query searched for the word `memory`.
 
 ### Per-user scope
 
