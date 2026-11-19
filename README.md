@@ -1,15 +1,11 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
 ![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
-![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
-
-> **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
+![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, background persistence, and a **shared fleet-wide skill corpus**.
 
 ## Install
-
-> **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
 
 ```bash
 hermes plugins install xl3v3r/hermes-oracle-memory --yes-deps --enable
@@ -47,20 +43,21 @@ OCI_DB_DSN="(DESCRIPTION=(...))"        # Oracle Net descriptor or TNS alias
 OCI_WALLET_LOCATION=~/.oci/wallet        # mTLS wallet dir (optional)
 ```
 
-Embeddings are computed 100% in-house:
-
-1. **In-database ONNX** (`HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5`) — strictly in-database kernel execution; external fallback disabled.
+Embeddings are computed inside the database, by the ONNX model that `HERMES_ORACLE_ONNX_MODEL` names (default `BGE_BASE_EN_V1_5`). No text is sent to an embedding service, and there is no fallback provider: while the model is unavailable, rows are stored without an embedding and embedded later.
 
 ### Environment Variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OCI_DB_USER` | `<your-db-user>` | Database user name |
-| `OCI_DB_PASSWORD` | - | Database user password |
-| `OCI_DB_DSN` | - | Connection string / TNS descriptor |
-| `OCI_WALLET_LOCATION` | - | mTLS client wallet directory (`~/.oci/wallet`) |
-| `HERMES_HOST_ID` | System user | Unique host tag for shared-corpus skill entries |
+| `OCI_DB_USER` | - (required) | Database user name |
+| `OCI_DB_PASSWORD` | - (required) | Database user password |
+| `OCI_DB_DSN` | - (required) | Connection string / TNS descriptor |
+| `OCI_WALLET_LOCATION` | - | mTLS client wallet directory. When unset: `TNS_ADMIN`, then `~/.oci/wallet`, then `$HERMES_HOME/oracle_wallet` |
+| `OCI_WALLET_PASSWORD` | - | Password of the wallet, when it has one |
+| `TNS_ADMIN` | - | Wallet / `tnsnames.ora` directory, used when `OCI_WALLET_LOCATION` is unset |
+| `HERMES_HOST_ID` | short host name, lower case | Host tag in shared-corpus skill ids (`skill:{host}:{name}:cN`) |
 | `HERMES_ORACLE_TABLE` | `HERMES_AGENT_MEMORY` | Memory table name |
+| `HERMES_ORACLE_SCHEMA_POLICY` | - | `REQUIRE_EXISTING`: run no DDL at start-up, only check the schema — see [INSTALL.md](INSTALL.md#step-7-security--least-privilege-operation) |
 | `HERMES_ORACLE_ONNX_MODEL` | `BGE_BASE_EN_V1_5` | In-database ONNX model name |
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
@@ -69,6 +66,12 @@ Embeddings are computed 100% in-house:
 | `HERMES_ORACLE_POOL_IDLE_TIMEOUT` | `300` | Seconds an idle pooled session above the pool minimum stays open |
 | `HERMES_ORACLE_PREFETCH_WAIT` | `3` | Seconds a turn waits for background recall before continuing without it (0.1–7) |
 | `HERMES_ORACLE_SCOPE_MODE` | `off` | `off`, `auto` or `required`: keep each caller's memory apart — see [Per-user scope](#per-user-scope) |
+| `HERMES_ORACLE_MIN_CANDIDATE_POOL` | `50` | Rows each search fetches before ranking (at least this many, whatever `top_k` is) |
+| `HERMES_ORACLE_MAX_CHUNKS_PER_SKILL` | `2` | Most chunks of one skill or imported conversation in a result list; `0` = no cap |
+| `HERMES_ORACLE_RECENCY_FLOOR` | `0.85` | Score multiplier of a very old row (0–1). A new row has 1.0; `1` turns recency weighting off |
+| `HERMES_ORACLE_RECENCY_SCALE_DAYS` | `120` | Age in days at which the recency bonus has decayed to about a third |
+| `HERMES_ORACLE_TELEMETRY_WEIGHT` | `0.05` | Score multiplier of skill-usage and vectorization log rows (0–1) |
+| `HERMES_ORACLE_DISABLE_RERANK` | - | `1`, `true` or `yes`: skip the `DBMS_VECTOR.RERANK` step of hybrid search |
 
 ### Per-user scope
 
@@ -236,99 +239,9 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
   ```
   and automatically refreshes optimizer statistics via `DBMS_STATS.GATHER_TABLE_STATS`.
 
-## What's new in v1.1.2
+## Release history
 
-Review fixes — full details in `RELEASE_NOTES_1.1.2.md`:
-
-- **Per-user memory scope (#17)**: `HERMES_ORACLE_SCOPE_MODE=auto|required` keeps each caller's rows apart; off by default. See [Per-user scope](#per-user-scope).
-- **Schema (#18)**: the text index is a plain search index; one left `FAILED` by 1.1.1 to 1.1.1.5 (it rejected every write with `ORA-29861`) is repaired at start-up.
-- **Recall (#16)**: a recalled memory body is escaped, so stored text cannot close the memory block or open another; `oracle_delete(session_id=...)` has a dry run and a row limit.
-- **Skill sync (#21)**: broad scan roots are judged by identity and by system-root ancestry.
-- **Profiles (#24)**: home, settings and background threads follow the profile the provider was initialized for.
-- **Scripts (#20, #26)**: one conversation importer; `setup_onnx_model.py` works on a database that is not ADB.
-- **Packaging (#25)**: the wheel carries `scripts/`.
-- **Tests (#19, #22)**: the unit suite cannot reach a database; `verify_provider.py` removes its own rows; CI bootstraps an empty schema in a real database.
-
-## What's new in v1.1.1.5
-
-Follow-up release for #14 — full details in the `[1.1.1.5]` section of `CHANGELOG.md`:
-
-- **Foreign skill copies**: ownership is judged against the profile's own skill dirs, so a sync over a `--dirs` subset updates the copies it stored from the other dirs (a `--dirs` run outside the defaults never takes over a live default skill); `replace_foreign` / `--replace-foreign` replaces a copy left from another profile or a removed root, and the sync result carries a hint when it skipped one.
-- **Lifecycle lookup**: a link into `.archive/` is no longer a live skill; the lookup walks any depth and ends on link loops, like the bulk sync.
-- **Backfill**: no re-check or re-queue once shutdown has begun; a write whose per-row counts the driver cannot report is re-checked instead of dropped.
-- **Test suite**: a runtime guard refuses any link outside the temp dir; the source scan also catches aliased and shell links.
-
-## What's new in v1.1.1.4
-
-Robustness release with per-host skill identity — full details in the `[1.1.1.4]` section of `CHANGELOG.md`:
-
-- **Per-host skill copies**: skill rows are `skill:{host}:{name}:cN`; a host only replaces or deletes its own copy, pruning is opt-in, and a dry-run-first migration (with a reverse step) relabels existing rows.
-- **Lifecycle hook off the caller's thread**: one writer per skill, coalesced events, profile-aware skill roots.
-- **No lost writes during an ONNX cooldown**: facts are stored at once and embedded later by a backfill with backoff.
-- **Pool and transaction safety**: old pools are retired, shutdown never closes a pool under a busy worker, inserts never retry inside a broken transaction, `ORA-00060` no longer starts the cooldown.
-- **Faster, consistent recall**: CLOBs in one round trip, sized fetches, ranking before the `top_k` cut, strict timeout classification.
-- **Tool limits**: batch and output caps, read-only skill rows for the generic tools, case-insensitive tags, memory mirror handles replace/remove.
-- **Hygiene**: helper scripts read an env file only with `--env-file`; SPDX license `BUSL-1.1`.
-
-## What's new in v1.1.1.3
-
-Reliability + capability release (details preserved in `CHANGELOG.md`):
-
-- **No more false "embedding model is unavailable"**: broken pooled sessions (`ORA-01002`), client timeouts, duplicate ids and other data errors, and Python exceptions no longer start the 60 s ONNX cooldown; poisoned connections are dropped and search retries once.
-- **Skill-lifecycle hook survives provider shutdown** instead of failing every event with `pool not initialized`.
-- **Bounded timeouts**: pool acquire waits at most 20 s (it could hang for minutes), `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now really controls recall (default 30 s), idle sessions are kept 300 s, prefetch waits up to 3 s.
-- **Handoff rows**: stable `memory_id` + `tags` on `oracle_add`, tag filters on `oracle_search`/`oracle_update`, and the new `oracle_get` exact-read tool.
-- **Security and data safety**: `oracle_chunk(file_path=...)` refuses credential and system files (they would land in the shared database); `oracle_delete` can no longer purge the shared skill corpus; `oracle_sync_skills` validates its arguments (a string `dirs` no longer scans `/`).
-- **Skill sync that actually runs**: the skill-lifecycle hook works inside Hermes (it failed silently on an import collision), archived skills are pruned, and a skill update replaces its rows in one transaction, so an interrupted update keeps the old rows instead of dropping the skill on every host.
-- **Clean shutdown and recovery**: timed-out sessions are dropped instead of reused (`ORA-01002`), shutdown waits for skill writers and closes the pool once borrowed connections return, and a failed `initialize()` cleans up after itself.
-- **Safe test suite**: tests no longer touch an installed plugin or `~/.hermes/skills`; CI runs them with a sandboxed `HOME`. Do not run the test suite of v1.1.1.2 or older on a host with a live install.
-
-## What's new in v1.1.1.2
-
-Maintenance release (details preserved in `CHANGELOG.md`):
-
-- **Search-timeout default corrected**: `HERMES_ORACLE_SEARCH_TIMEOUT_MS` now defaults to `13000` (13 s), aligned 1:1 with the read-path clamp `_SEARCH_TIMEOUT_MS` (13.0 s) and the documented timeout budget — the previous `1300` (1.3 s) typo is fixed.
-- **Single timeout read in `initialize()`**: the ingest/search timeout values are now read from the environment once and reused for both the pool fingerprint and the pool construction, so a mid-initialization env change can never split them into two divergent values.
-- **Docs accuracy**: `INSTALL.md`'s ADB connection sample now uses the real TCP/TLS port (`1522`, not `1521`), and the README/INSTALL env tables name the variable the code actually reads (`HERMES_ORACLE_SEARCH_TIMEOUT_MS`, default `13000`).
-
-## What's new in v1.1.1
-
-Sterile distribution release (details preserved in `CHANGELOG.md`) — no provider behavior change:
-
-- **Identifier scrub**: no fleet hostnames, operator/developer usernames, absolute home/build paths, or production OCI region + service descriptors anywhere in the shipped tree — the plugin installs cleanly on any host without leaking its origin.
-- **Clean install scan**: the tree now clears the Hermes install-time security scanner with a `safe` verdict (0 critical, 0 high — previously a `caution` verdict that required a confirmation prompt on every install/update).
-
-## What's new in v1.1.0.1
-
-Maintenance release — fleet-sync hardening (full details in `CHANGELOG.md`):
-
-- **Sync interpreter guard**: `scripts/sync_skills.py` re-executes into a venv that can import `oracledb` (import probe, loop-guarded) instead of dying with `No module named 'oracledb'` when launched from a bare interpreter.
-- **Canonical skill meta-row ID**: meta sync rows now use `skill:{host}:{name}:c0` (matching the full-mode chunk-0 row), eliminating `ORA-00001` duplicates and restoring second-run idempotency.
-- **Write-time budget**: pooled connection `call_timeout` defaults to `max(search, ingest)`; bulk ONNX inserts no longer die at the 13 s search default (`DPY-4024`). Read paths keep the tight 13 s window.
-- **Transient-embedding fallback**: server-side transient embedding errors (`ORA-01013`/`ORA-04031`/…) now degrade to NULL-embedding insert + background backfill instead of a 60 s cooldown + lost row — across all three write ladders (`_insert`, `_insert_many`, `oracle_update`).
-- **Pool fingerprint** now includes the timeout budget, so timeout-config changes rebuild the pool in long-lived processes.
-- **Self-deadlock fix in live sync**: the sync's deletes are committed before the provider's `_insert_many` re-inserts the same rows on a second pool connection — the old order parked the run forever on its own uncommitted row locks.
-
-## What's new in v1.1.0
-
-- **Shared Cross-Server Skill Corpus (`oracle_load_skill`)**:
-  - Full skill discovery and reconstruction path (`action="fetch"` / `action="list"`) allowing any Hermes host to discover and load any skill in the shared corpus dynamically at runtime, without local disk installation.
-  - Word-accurate chunk reassembly reproducing source documents from 80-word, 10-word overlap chunks including bundled reference files.
-  - Multi-variant resolution with explicit path and variant disambiguation.
-- **Live Lifecycle Ingestion (`on_skill_lifecycle`)**:
-  - In-process hook integration syncing skills into Oracle 26ai ADB immediately upon `created`, `edited`, `patched`, `installed`, or `restored` events.
-  - SHA256 hash idempotency preventing redundant DB round-trips when skill contents are unchanged.
-  - Safe retirement on `archived` events when local files are removed.
-- **Zombie-Safe Host-Scoped Pruning (`scripts/sync_skills.py`)**:
-  - Host-scoped pruning keyed on `(skill_name, metadata.path LIKE host_root)` pairs—foreign-host skills are strictly preserved, while locally deleted skills are cleaned up.
-  - Host-tagged `memory_id` and `conv_ref` convention (`skill:{host}:{name}:cN`) preventing accidental sibling host overwrites.
-  - Dead SQL leg 3 removed; one-shot migration utility (`--migrate-host-tags`).
-- **Resilient & Idempotent Initialization**:
-  - Idempotent `initialize()` preventing duplicate connection pools and eliminating `pool not initialized` warnings during multi-context instantiation.
-  - Stale connection detection and automatic re-acquisition for ADB restart recovery.
-  - Provider health diagnostic reporting (`health()`).
-- **Separated Ingest Timeout**:
-  - Autonomous ingestion timeout (`HERMES_ORACLE_INGEST_TIMEOUT`, default 600s) decoupled from query search timeouts (`HERMES_ORACLE_SEARCH_TIMEOUT_MS`, default 13000ms) to avoid batch timeouts during vector materialization.
+The current release is v1.1.2. [CHANGELOG.md](CHANGELOG.md) lists the changes of every release; [RELEASE_NOTES_1.1.2.md](RELEASE_NOTES_1.1.2.md) has the upgrade notes for the current one.
 
 ## Contributing
 

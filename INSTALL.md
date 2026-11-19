@@ -1,9 +1,7 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
 ![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
-![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
-
-> **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
+![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
 This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.2) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
@@ -18,9 +16,6 @@ This guide provides complete instructions for installing, configuring, and verif
 - **Zero External Embedding Costs via In-Database ONNX Inference**:
   - Uses `VECTOR_EMBEDDING` natively inside Oracle Database 26ai with `BGE_BASE_EN_V1_5` (`BAAI/bge-base-en-v1.5`).
   - Embedding computation is executed entirely within the database engine kernel via ONNX runtime, eliminating recurring token costs and external latency from paid third-party embedding APIs.
-- **In-Memory Embedding Deduplication**:
-  - The `_embed_many` batch ingestion pipeline detects and coalesces duplicate texts prior to embedding calls.
-  - Identical turns, prompt fragments, and redundant context entries are embedded exactly once, preventing wasted API token spend.
 - **Accurate Hybrid Retrieval (Oracle Text + Vector)**:
   - Fuses dense vector similarity (`VECTOR_DISTANCE`) with exact lexical full-text scoring (`CONTAINS` / `SCORE`) in a single round-trip.
   - Filters and ranks only top-relevance facts, preventing prompt window bloat and eliminating the token cost of dumping noisy, oversized context blocks into the LLM.
@@ -31,10 +26,8 @@ The provider delivers enterprise-grade integration across Oracle Cloud Infrastru
 
 - **Direct OCI Autonomous AI Database 26ai Vector Capabilities**:
   - Native 768-dimensional `VECTOR(768, FLOAT32)` storage, in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`, and an in-memory HNSW vector index (`ORGANIZATION INMEMORY NEIGHBOR GRAPH`).
-- **Native OCI GenAI Service Fallback**:
-  - Automatic fallback to OCI Generative AI inference (`cohere.embed-v4.0`) via native OCI Instance Principals and API signing when running on OCI Compute or container instances—no static API keys required.
-- **Connection and Signer Caching Across Agent Sessions**:
-  - The OCI GenAI client and `InstancePrincipalsSecurityTokenSigner` security signer are cached and reused across agent sessions, removing client initialization latency and cryptographic token regeneration overhead.
+- **No embedding service outside the database**:
+  - There is no fallback provider. While the in-database model is unavailable, a row is stored without an embedding and embedded later by a background backfill; text search and `oracle_get` keep working.
 
 ---
 
@@ -139,7 +132,7 @@ OCI_WALLET_LOCATION=~/.oci/wallet
 OCI_WALLET_PASSWORD="YourWalletPassword"
 
 # =============================================================================
-# Primary In-Database ONNX Model
+# In-Database ONNX Model
 # =============================================================================
 HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5
 
