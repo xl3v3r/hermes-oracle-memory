@@ -104,6 +104,10 @@ _SCOPED_TOOL_REFUSALS = {
     "oracle_sync_skills": "oracle_sync_skills writes the shared skill corpus from this host's disk and is "
     "not available in a user-scoped session",
 }
+_SYNC_TOOL_NOT_OFFERED = (
+    "oracle_sync_skills is not offered in this profile. Set HERMES_ORACLE_SYNC_SKILLS_TOOL=1 in the "
+    "profile's .env and start a new session, or run scripts/sync_skills.py in the plugin directory."
+)
 # "The object is already there" for bootstrap DDL.
 _DDL_ALREADY_EXISTS = (
     "ORA-00955",  # name is already used by an existing object
@@ -652,6 +656,10 @@ _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # table, skill): events reach whichever provider serves the session, and two
 # instances must never run two writers for one skill at the same time (#6).
 _LIFECYCLE_LOCK = threading.Lock()
+# Names of the skills installed under a Hermes home: {home: (read at, names)}.
+# Shared by the sessions of a profile; any skill event empties it.
+_LOCAL_SKILLS_LOCK = threading.Lock()
+_LOCAL_SKILLS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
 _LIFECYCLE_IN_FLIGHT: set[tuple[str, str, str]] = set()
 _LIFECYCLE_PENDING: dict[tuple[str, str, str], tuple[Any, str, list[Path]]] = {}
 
@@ -998,6 +1006,9 @@ _MAX_CHUNKS_PER_SOURCE = int(_env_number("HERMES_ORACLE_MAX_CHUNKS_PER_SKILL", 2
 # exceed top_k so role weighting and prefix boosting have material to re-rank.
 _MIN_CANDIDATE_POOL = int(_env_number("HERMES_ORACLE_MIN_CANDIDATE_POOL", 50, lo=1))
 _WEIGHT_TELEMETRY = _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, allow_zero=True)
+# oracle_sync_skills scans this host's directories and writes the shared
+# corpus: an operator action. A profile that wants it as a tool asks for it.
+_SYNC_SKILLS_TOOL = _as_bool(_setting("HERMES_ORACLE_SYNC_SKILLS_TOOL"))
 _WEIGHT_SHORT_CHARS = 25
 _WEIGHT_SHORT_FACTOR = 0.9
 
@@ -1014,6 +1025,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
             "max_chunks_per_source": _MAX_CHUNKS_PER_SOURCE,
             "min_candidate_pool": _MIN_CANDIDATE_POOL,
             "telemetry_weight": _WEIGHT_TELEMETRY,
+            "sync_skills_tool": _SYNC_SKILLS_TOOL,
         }
     return {
         "skill_fetch_max_chunks": int(_env_number("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", 400, lo=1)),
@@ -1023,11 +1035,37 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
         "max_chunks_per_source": int(_env_number("HERMES_ORACLE_MAX_CHUNKS_PER_SKILL", 2, allow_zero=True)),
         "min_candidate_pool": int(_env_number("HERMES_ORACLE_MIN_CANDIDATE_POOL", 50, lo=1)),
         "telemetry_weight": _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, allow_zero=True),
+        "sync_skills_tool": _as_bool(_setting("HERMES_ORACLE_SYNC_SKILLS_TOOL")),
     }
 _TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
 
 
 _SKILL_TAG_RE = re.compile(r"^\[skill_ingest\]\s*\[skill:([^\]]+)\]")
+# A skill's meta row (name, description, triggers): chunk 0, or an id from
+# before chunking. Every other skill row is a fragment of the skill's body.
+_SKILL_META_ID_RE = re.compile(r":c0$|^skill:[^:]+$")
+_SKILL_META_COND = "memory_id LIKE '%:c0' OR REGEXP_LIKE(memory_id, '^skill:[^:]+$')"
+_SKILL_META_SQL = f"({_SKILL_META_COND})"
+# Which skill rows a search may return (_row_filters skill_rows=...).
+_SKILL_ROW_FILTERS = {
+    "all": "",
+    "meta": f" AND (NVL(role, 'fact') <> 'skill' OR {_SKILL_META_COND}) ",
+    "meta_only": f" AND role = 'skill' AND {_SKILL_META_SQL} ",
+}
+# Recall shows at most this many memories and this many skills per turn. It
+# asks the search for _RECALL_POOL ranked rows to fill both blocks from;
+# 2 x _RECALL_POOL is within the default candidate pool, so the statement
+# fetches no more rows than a six-row search did.
+_RECALL_MEMORIES = 6
+_RECALL_SKILLS = 3
+_RECALL_POOL = 24
+_RECALL_SKILL_CHARS = 200
+# oracle_load_skill: skills returned by a search, ranked rows read to find
+# them (several hosts may hold a copy of one skill), and names per list page.
+_SKILL_SEARCH_MAX = 8
+_SKILL_SEARCH_POOL = 30
+_SKILL_LIST_PAGE = 50
+_LOCAL_SKILLS_TTL_SECS = 300.0
 
 
 def _source_key(row: Any) -> str:
@@ -1334,16 +1372,21 @@ TOOL_SCHEMAS = [
     {
         "name": "oracle_load_skill",
         "description": (
-            "Load a full skill from the shared Oracle skill corpus (works for skills NOT on local disk). "
+            "Find or load a skill in the shared Oracle skill corpus (works for skills NOT on local disk). "
+            "'search' returns the skills that best match a description of the task (name + description). "
             "'fetch' reconstructs the skill document from its chunks (word-accurate, line structure flattened): "
-            "returns text + file manifest. 'list' returns name + description of every ingested skill; "
-            "supports substring filter and pagination."
+            "returns text + file manifest. 'list' pages through every ingested skill by name, 50 per page, "
+            "with an optional substring filter."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["fetch", "list"], "default": "fetch"},
-                "skill": {"type": "string", "description": "Skill name (exact, from list). Required for action=fetch."},
+                "action": {"type": "string", "enum": ["fetch", "list", "search"], "default": "fetch"},
+                "skill": {
+                    "type": "string",
+                    "description": "Skill name (exact, from search or list). Required for action=fetch.",
+                },
+                "query": {"type": "string", "description": "action=search only: what the skill should do."},
                 "path": {
                     "type": "string",
                     "description": "action=fetch only: source path of one copy, when the skill exists in several (from the variants list).",
@@ -3361,12 +3404,15 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _row_filters(
         self, tgt: str = "any", *, session_id: Any = None, agent_id: Any = None,
-        tags: Any = None, tag_match: str = "all",
+        tags: Any = None, tag_match: str = "all", skill_rows: str = "all",
     ) -> tuple[str, dict]:
         """The predicates every search leg shares, as SQL (each starting with
         " AND") and its binds: junk rows out, then the target, session, agent
-        and tag filters the caller asked for."""
-        sql = self._JUNK
+        and tag filters the caller asked for. *skill_rows*: "all", "meta"
+        (no skill body chunks) or "meta_only" (skill meta rows and nothing else)."""
+        if skill_rows not in _SKILL_ROW_FILTERS:
+            raise ValueError(f"skill_rows must be one of {sorted(_SKILL_ROW_FILTERS)}")
+        sql = self._JUNK + _SKILL_ROW_FILTERS[skill_rows]
         binds: dict[str, Any] = {}
         if self._scope_id is not None:
             sql += f" AND {_SCOPE_READ} "
@@ -3441,7 +3487,7 @@ class OracleMemoryProvider(MemoryProvider):
     def _execute_hybrid_search(
         self, cur: Any, query: str, contains_q: str, fetch_k: int, tgt: str = "any", *,
         session_id: Any = None, agent_id: Any = None, timeout_s: float | None = None,
-        tags: Any = None, tag_match: str = "all",
+        tags: Any = None, tag_match: str = "all", skill_rows: str = "all",
     ) -> list:
         if timeout_s is None:
             timeout_s = self._search_secs
@@ -3450,7 +3496,8 @@ class OracleMemoryProvider(MemoryProvider):
             logger.info("ONNX model is in cooldown; executing text search for hybrid query")
             try:
                 sql, binds = self._build_text_search_sql(
-                    contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                    contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+                    skill_rows=skill_rows,
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
@@ -3481,7 +3528,8 @@ class OracleMemoryProvider(MemoryProvider):
                 "In-database ONNX model is not configured; external fallback is disabled"
             )
         fused_sql, fused_binds = self._build_hybrid_search_sql(
-            query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+            query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+            skill_rows=skill_rows,
         )
 
         degraded_to_text = False
@@ -3539,7 +3587,8 @@ class OracleMemoryProvider(MemoryProvider):
                     for vec_attempt in range(_51815_RETRIES):
                         try:
                             vec_sql, vec_binds = self._build_vector_search_sql(
-                                query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                                query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+                                skill_rows=skill_rows,
                             )
                             for r in self._fetch_rows_attempt(cur, vec_sql, vec_binds, vec_attempt):
                                 r.pop("dist", None)
@@ -3591,7 +3640,8 @@ class OracleMemoryProvider(MemoryProvider):
             merged.clear()
             try:
                 sql, binds = self._build_text_search_sql(
-                    contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                    contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+                    skill_rows=skill_rows,
                 )
                 for r in self._fetch_rows(cur, sql, binds):
                     r.pop("dist", None)
@@ -3796,6 +3846,7 @@ class OracleMemoryProvider(MemoryProvider):
         timeout: float | None = None,
         tags: Any = None,
         tag_match: str = "all",
+        skill_rows: str = "all",
     ) -> list:
         if not self._pool or not query:
             return []
@@ -3825,7 +3876,8 @@ class OracleMemoryProvider(MemoryProvider):
                 if mode == "text":
                     try:
                         sql, binds = self._build_text_search_sql(
-                            contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                            contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+                            skill_rows=skill_rows,
                         )
                         rows = self._fetch_rows(cur, sql, binds)
                         for r in rows:
@@ -3854,7 +3906,8 @@ class OracleMemoryProvider(MemoryProvider):
                         )
                     try:
                         sql, binds = self._build_vector_search_sql(
-                            query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match
+                            query, fetch_k, tgt, session_id=session_id, agent_id=agent_id, tags=tags, tag_match=tag_match,
+                            skill_rows=skill_rows,
                         )
                         for attempt in range(_51815_RETRIES):
                             try:
@@ -3890,7 +3943,7 @@ class OracleMemoryProvider(MemoryProvider):
                 else:
                     rows = self._execute_hybrid_search(
                         cur, query, contains_q, fetch_k, tgt, session_id=session_id, agent_id=agent_id,
-                        tags=tags, tag_match=tag_match, timeout_s=query_timeout_s,
+                        tags=tags, tag_match=tag_match, timeout_s=query_timeout_s, skill_rows=skill_rows,
                     )
                 rows = self._apply_weights(rows, cur)
                 if mode == "hybrid" and rerank and len(rows) > 1:
@@ -3938,27 +3991,97 @@ class OracleMemoryProvider(MemoryProvider):
             logger.debug("DBMS_VECTOR.RERANK skipped: %s", e)
             return rows
 
-    def _format_prefetch(self, rows: list) -> str:
-        if not rows:
-            return ""
-        lines = []
-        for r in rows[:8]:
+    def _local_skill_names(self) -> frozenset[str]:
+        """Names of the skills installed in this provider's profile (its
+        skills dir and ~/.agents/skills). Hermes lists those in its own skill
+        index, so recall does not repeat them. Read from disk at most once per
+        _LOCAL_SKILLS_TTL_SECS; a skill event forces a new read."""
+        home = self._hermes_home or _hermes_home_path()
+        key = str(home or "")
+        now = time.monotonic()
+        with _LOCAL_SKILLS_LOCK:
+            cached = _LOCAL_SKILLS_CACHE.get(key)
+            if cached is not None and now - cached[0] < _LOCAL_SKILLS_TTL_SECS:
+                return cached[1]
+        try:
+            sync = _sync_skills_module()
+            names = frozenset(sync.local_skill_names(sync.default_skill_roots(home)))
+        except Exception as e:
+            logger.debug("oracle recall: cannot list local skills: %s", e)
+            return frozenset()
+        with _LOCAL_SKILLS_LOCK:
+            _LOCAL_SKILLS_CACHE[key] = (now, names)
+        return names
+
+    def _recall_rows(self, rows: list) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split ranked search rows into what recall shows: up to
+        _RECALL_MEMORIES memory rows, and up to _RECALL_SKILLS skills as
+        {"name", "description", "score"}. A skill is taken from its meta row
+        only, once per name, and not at all when it is installed locally."""
+        memories: list[dict[str, Any]] = []
+        skills: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        local: frozenset[str] | None = None
+        for r in rows or []:
             if not isinstance(r, dict):
                 continue
-            body = (r.get("content") or "").replace("\n", " ").strip()
-            body = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", body)
-            if len(body) > 280:
-                body = body[:277] + "..."
-            # The stored text is data: escaped, it cannot close the boundary
-            # tag or open another one. Cut first, so no entity is cut in half.
-            body = html.escape(body, quote=False)
-            mid = html.escape(str(self._show_id(r.get("memory_id")) or ""), quote=True)
-            target = html.escape(str(r.get("target") or "memory"), quote=True)
-            score = html.escape(str(r.get("score") if r.get("score") is not None else 0), quote=True)
+            if str(r.get("role") or "").lower() != "skill":
+                if len(memories) < _RECALL_MEMORIES:
+                    memories.append(r)
+                continue
+            if len(skills) >= _RECALL_SKILLS or not _SKILL_META_ID_RE.search(str(r.get("memory_id") or "")):
+                continue
+            content = str(r.get("content") or "")
+            name = _source_key(r)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if local is None:
+                local = self._local_skill_names()
+            if name in local:
+                continue
+            skills.append({
+                "name": name,
+                "description": _extract_skill_description(content, name),
+                "score": r.get("score"),
+            })
+        return memories, skills
+
+    @staticmethod
+    def _recall_text(value: Any, limit: int) -> str:
+        """Stored text as one line of at most *limit* characters, escaped so it
+        cannot close its boundary tag or open another one. Cut before
+        escaping, so no entity is cut in half."""
+        body = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(value or "").replace("\n", " ").strip())
+        if len(body) > limit:
+            body = body[: limit - 3] + "..."
+        return html.escape(body, quote=False)
+
+    def _render_recall(self, memories: list[dict[str, Any]], skills: list[dict[str, Any]]) -> str:
+        def attr(value: Any) -> str:
+            return html.escape(str(value), quote=True)
+
+        def score(row: dict[str, Any]) -> str:
+            return attr(row.get("score") if row.get("score") is not None else 0)
+
+        lines = []
+        for r in memories:
             lines.append(
-                f'<retrieved_memory id="{mid}" target="{target}" score="{score}">{body}</retrieved_memory>'
+                f'<retrieved_memory id="{attr(self._show_id(r.get("memory_id")) or "")}" '
+                f'target="{attr(r.get("target") or "memory")}" score="{score(r)}">'
+                f'{self._recall_text(r.get("content"), 280)}</retrieved_memory>'
             )
-        return "## Oracle 26ai Memory\n" + "\n".join(lines)
+        if skills:
+            lines.append("### Skills in the shared corpus that may apply (load one with oracle_load_skill)")
+        for sk in skills:
+            lines.append(
+                f'<retrieved_skill name="{attr(sk["name"])}" score="{score(sk)}">'
+                f'{self._recall_text(sk.get("description"), _RECALL_SKILL_CHARS)}</retrieved_skill>'
+            )
+        return "## Oracle 26ai Memory\n" + "\n".join(lines) if lines else ""
+
+    def _format_prefetch(self, rows: list) -> str:
+        return self._render_recall(*self._recall_rows(rows))
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         self._start_prefetch(query)
@@ -3969,15 +4092,17 @@ class OracleMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                rows = self._search(query, top_k=6, mode="hybrid", rerank=False)
-                body = self._format_prefetch(rows)
+                rows = self._search(query, top_k=_RECALL_POOL, mode="hybrid", rerank=False, skill_rows="meta")
+                memories, skills = self._recall_rows(rows)
+                body = self._render_recall(memories, skills)
+                shown = len(memories) + len(skills)
             except Exception as e:
                 logger.debug("oracle prefetch failed: %s", e)
-                rows, body = [], ""
+                body, shown = "", 0
             with self._lock:
                 if self._prefetch_query == query:
                     self._prefetch_result = body
-                    self._prefetch_count = len(rows)
+                    self._prefetch_count = shown
                     self._prefetch_done = True
 
         with self._lock:
@@ -4199,6 +4324,8 @@ class OracleMemoryProvider(MemoryProvider):
         **kwargs: Any,
     ) -> None:
         """Observer hook recording skill usage/load and handling live lifecycle ingestion into Oracle 26ai ADB memory."""
+        with _LOCAL_SKILLS_LOCK:  # the set of installed skills may have changed
+            _LOCAL_SKILLS_CACHE.clear()
         if self._user_scoped():
             # Skill telemetry and corpus writes belong to the operator's sessions.
             return
@@ -4713,13 +4840,42 @@ class OracleMemoryProvider(MemoryProvider):
             logger.exception("oracle_load_skill fetch failed: %s", e)
             return tool_error(f"Failed to fetch skill '{skill_name}': {e}")
 
+    def _load_skill_search(self, query: Any) -> str:
+        """oracle_load_skill(action="search"): the skills whose meta row (name,
+        description, triggers) best matches *query*, one entry per skill name."""
+        query = query.strip() if isinstance(query, str) else ""
+        if not query:
+            return tool_error("oracle_load_skill search needs 'query': a few words on what the skill should do")
+        try:
+            rows = self._search(
+                query, top_k=_SKILL_SEARCH_POOL, mode="hybrid", rerank=False, skill_rows="meta_only"
+            )
+        except Exception as e:
+            logger.warning("oracle_load_skill search failed: %s", e)
+            return tool_error(f"Failed to search skills: {e}")
+        skills: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for r in rows:
+            name = _source_key(r)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            skills.append({
+                "name": name,
+                "description": _extract_skill_description(str(r.get("content") or ""), name),
+                "score": r.get("score"),
+            })
+            if len(skills) >= _SKILL_SEARCH_MAX:
+                break
+        return json.dumps({"count": len(skills), "skills": skills}, default=_json_default)
+
     def _load_skill_list(self, filter_str: str = "", offset: int = 0) -> str:
         """List skills from the shared Oracle skill corpus with substring filtering and pagination."""
         if not self._pool:
             return tool_error(f"Oracle memory not initialized: {self._init_error or self.unavailable_reason()}")
 
         offset = max(0, int(offset or 0))
-        page_size = 500
+        page_size = _SKILL_LIST_PAGE
 
         try:
             # One row per skill name (paging is over distinct names, so a page
@@ -4745,7 +4901,7 @@ class OracleMemoryProvider(MemoryProvider):
                            ROW_NUMBER() OVER (PARTITION BY json_value(metadata, '$.skill_name') ORDER BY memory_id) AS rn
                     FROM {self._table}
                     WHERE role = 'skill'
-                      AND (memory_id LIKE '%:c0' OR regexp_like(memory_id, '^skill:[^:]+$'))
+                      AND {_SKILL_META_SQL}
                       AND json_value(metadata, '$.skill_name') IS NOT NULL
                       {where_filter}
                 )
@@ -4801,14 +4957,25 @@ class OracleMemoryProvider(MemoryProvider):
             logger.exception("oracle_load_skill list failed: %s", e)
             return tool_error(f"Failed to list skills: {e}")
 
+    def _sync_tool_offered(self) -> bool:
+        """oracle_sync_skills is an operator action with the largest schema of
+        the tool set, so a session gets it only where the profile sets
+        HERMES_ORACLE_SYNC_SKILLS_TOOL. Before initialize() the setting is not
+        read yet, and that is when Hermes builds its tool routing from these
+        schemas: every tool is listed then."""
+        return self._tuning is None or bool(self._tuning.get("sync_skills_tool"))
+
     def get_tool_schemas(self) -> list[dict[str, Any]]:
+        offered = [
+            s for s in TOOL_SCHEMAS if s.get("name") != "oracle_sync_skills" or self._sync_tool_offered()
+        ]
         if not self._user_scoped():
-            return list(TOOL_SCHEMAS)
+            return offered
         # A user-scoped session gets no tool that reads this host's disk.
         import copy
 
         out = []
-        for schema in TOOL_SCHEMAS:
+        for schema in offered:
             name = schema.get("name")
             if name in _SCOPED_TOOL_REFUSALS:
                 continue
@@ -4857,6 +5024,8 @@ class OracleMemoryProvider(MemoryProvider):
         refusal = self._caller_refusal(kwargs)
         if not refusal and self._user_scoped():
             refusal = _SCOPED_TOOL_REFUSALS.get(tool_name, "")
+        if not refusal and tool_name == "oracle_sync_skills" and not self._sync_tool_offered():
+            refusal = _SYNC_TOOL_NOT_OFFERED
         if refusal:
             return tool_error(refusal)
         try:
@@ -5301,8 +5470,10 @@ class OracleMemoryProvider(MemoryProvider):
         return json.dumps(res)
 
     def _tool_load_skill(self, args: dict[str, Any]) -> str:
-        """oracle_load_skill: Fetch a skill from the shared corpus, or list the skills in it."""
-        action = (args.get("action") or "fetch").lower().strip()
+        """oracle_load_skill: search the shared corpus, fetch a skill from it, or list its skills."""
+        action = str(args.get("action") or "fetch").lower().strip()
+        if action == "search":
+            return self._load_skill_search(args.get("query"))
         if action == "list":
             filter_str = args.get("filter") or ""
             offset = int(args.get("offset") or 0)
@@ -5319,7 +5490,7 @@ class OracleMemoryProvider(MemoryProvider):
                     variant = None
             return self._load_skill_fetch(skill, path=path, variant=variant, host=host)
         else:
-            return tool_error(f"Invalid action '{action}' for oracle_load_skill. Expected 'fetch' or 'list'.")
+            return tool_error(f"Invalid action '{action}' for oracle_load_skill. Expected 'fetch', 'list' or 'search'.")
 
     def _purge_session(self, sid: str, *, dry_run: bool, max_rows: int) -> str:
         """oracle_delete(session_id=...): delete the non-skill rows of one

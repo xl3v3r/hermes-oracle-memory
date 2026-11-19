@@ -60,6 +60,7 @@ Embeddings are computed inside the database, by the ONNX model that `HERMES_ORAC
 | `HERMES_ORACLE_SCHEMA_POLICY` | - | `REQUIRE_EXISTING`: run no DDL at start-up, only check the schema — see [INSTALL.md](INSTALL.md#step-7-security--least-privilege-operation) |
 | `HERMES_ORACLE_ONNX_MODEL` | `BGE_BASE_EN_V1_5` | In-database ONNX model name |
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
+| `HERMES_ORACLE_SYNC_SKILLS_TOOL` | - | `1`, `true`, `yes` or `on`: offer the `oracle_sync_skills` tool to this profile's sessions (never to a user-scoped session) |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
 | `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `30000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
 | `HERMES_ORACLE_POOL_WAIT_TIMEOUT_MS` | `20000` | Max wait for a pooled connection before the call fails with `DPY-4005` (never blocks forever) |
@@ -114,8 +115,8 @@ Limits: scoping separates the users of a frontend. It does not separate agents o
 | `oracle_update` | replace a fact's text and/or tags by `memory_id` |
 | `oracle_delete` | delete by `memory_id`, or purge one thread by `session_id` (never skill rows or the shared `skills`/`none` ids). A purge takes `dry_run` to count first, and deletes at most 200 rows unless `max_rows` allows more (up to 10,000) |
 | `oracle_chunk` | split inline text or a disk file in-database (refuses credential and system paths: env files, key directories and files, wallets, `/etc`) |
-| `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory |
-| `oracle_load_skill` | load or list skills from the shared Oracle skill corpus at runtime |
+| `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory. Offered only when the profile sets `HERMES_ORACLE_SYNC_SKILLS_TOOL=1`; `scripts/sync_skills.py` does the same from a shell |
+| `oracle_load_skill` | search, list or load skills from the shared Oracle skill corpus at runtime |
 
 ### Handoffs between agents and sessions
 
@@ -156,9 +157,24 @@ Per ingested skill `S`:
 
 ### Using `oracle_load_skill`
 
-#### Listing / Discovering Skills (`action="list"`)
+#### Finding Skills (`action="search"`)
 
-Search the catalog by substring or paginate:
+Describe the task:
+
+```json
+{
+  "action": "search",
+  "query": "validate a US postal address"
+}
+```
+
+Returns `{count, skills: [{name, description, score}]}`: up to eight skills, best match first, one entry per skill name. The search reads only each skill's meta row (name, description, triggers).
+
+Automatic recall uses the same rows. A turn's recalled context lists up to six memories and, under their own heading, up to three skills as `<retrieved_skill name="..." score="...">description</retrieved_skill>`. Skill body chunks are not recalled, and a skill installed in the profile (its `skills/` directory or `~/.agents/skills`) is not listed, since Hermes already shows it in its skill index.
+
+#### Listing Skills (`action="list"`)
+
+Filter the catalog by substring, or page through it (50 names per page):
 
 ```json
 {
@@ -194,7 +210,7 @@ In a shared multi-server table, deletions are host-scoped:
   python3 scripts/sync_skills.py --prune --prune-limit 500
   python3 scripts/sync_skills.py --prune-host /path/to/local/skills/   # only skills under this dir
   ```
-  The `oracle_sync_skills` tool takes the same options (`prune`, `prune_limit`, `dry_run`, `replace_foreign`).
+  The `oracle_sync_skills` tool takes the same options (`prune`, `prune_limit`, `dry_run`, `replace_foreign`). A session has the tool only when the profile sets `HERMES_ORACLE_SYNC_SKILLS_TOOL=1`.
 - Each changed skill is replaced in one transaction (delete of this host's rows + insert), so a failed write keeps the previous copy.
 
 ### Live Lifecycle Syncing

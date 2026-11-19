@@ -48,14 +48,16 @@ class TestFormatPrefetch(unittest.TestCase):
         expected = '## Oracle 26ai Memory\n<retrieved_memory id="" target="memory" score="0">Line 1 Line 2  Line 3</retrieved_memory>'
         self.assertEqual(provider._format_prefetch(rows), expected)
 
-    def test_limits_to_8_rows(self):
+    def test_limits_to_6_memories(self):
+        # Six is what the recall search asked for before 1.1.2.1 too; the
+        # formatter's own limit used to be eight.
         provider = oracle_plugin.OracleMemoryProvider()
         rows = [{"content": f"Memory {i}"} for i in range(10)]
         result = provider._format_prefetch(rows)
         lines = result.split("\n")
-        self.assertEqual(len(lines), 9)
-        self.assertIn('<retrieved_memory id="" target="memory" score="0">Memory 7</retrieved_memory>', result)
-        self.assertNotIn("Memory 8", result)
+        self.assertEqual(len(lines), 7)
+        self.assertIn('<retrieved_memory id="" target="memory" score="0">Memory 5</retrieved_memory>', result)
+        self.assertNotIn("Memory 6", result)
 
     def test_empty_content(self):
         provider = oracle_plugin.OracleMemoryProvider()
