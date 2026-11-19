@@ -167,7 +167,7 @@ class TestLicensorName(unittest.TestCase):
         }
         out = {}
         for f, rx in patterns.items():
-            m = re.search(rx, _read(f) or "", re.M)
+            m = re.search(rx, _read(f) or "", re.MULTILINE)
             self.assertIsNotNone(m, f"{f}: no licensor line")
             out[f] = m.group(1)
         return out

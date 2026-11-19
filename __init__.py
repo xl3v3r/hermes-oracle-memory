@@ -1045,6 +1045,8 @@ _ADD_SIMILAR_MIN = _env_number("HERMES_ORACLE_ADD_SIMILAR_MIN", 0.9, hi=1.0, all
 _ADD_SIMILAR_MAX = 3
 _ADD_SIMILAR_TIMEOUT_MS = 3000
 _ADD_SIMILAR_CHARS = 200
+# An id oracle_add generates for a fact it stores without a caller-chosen id.
+_GENERATED_FACT_ID_RE = re.compile(r"fact_[0-9a-f]{16}")
 _WEIGHT_SHORT_CHARS = 25
 _WEIGHT_SHORT_FACTOR = 0.9
 
@@ -3174,11 +3176,10 @@ class OracleMemoryProvider(MemoryProvider):
 
     def _similar_rows(self, content: str, *, exclude_ids: tuple[str, ...] = ()) -> list[dict[str, Any]]:
         """Stored rows that say nearly what *content* says, nearest first: up
-        to _ADD_SIMILAR_MAX rows whose vector similarity is at or above the
-        add_similar_min setting, as {"memory_id", "score", "content" (cut),
-        "target"}, plus "tags" when the row has any and "identical": True when
-        its whole text equals *content*. Skill rows and rows no search returns
-        are left out; a user-scoped session sees its own rows only.
+        to _ADD_SIMILAR_MAX search rows (see _fetch_rows) whose vector
+        similarity, added as "similarity", is at or above the add_similar_min
+        setting. Skill rows and rows no search returns are left out; a
+        user-scoped session sees its own rows only.
 
         Advisory: any failure gives [] and the caller writes as usual."""
         floor = float(self._tune("add_similar_min") or 0)
@@ -3204,23 +3205,56 @@ class OracleMemoryProvider(MemoryProvider):
         for r in rows:
             if r.get("dist") is None:
                 continue
-            score = round(max(0.0, min(1.0, 1.0 - r["dist"])), 4)
-            if score < floor:
-                continue
+            similarity = round(max(0.0, min(1.0, 1.0 - r["dist"])), 4)
+            if similarity >= floor:
+                out.append({**r, "similarity": similarity})
+        return out
+
+    def _similar_reply(self, rows: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+        """_similar_rows as oracle_add reports them: {"memory_id", "score",
+        "content" (cut), "target"}, plus "tags" when the row has any and
+        "identical": True when its whole text equals *text*."""
+        out: list[dict[str, Any]] = []
+        for r in rows:
             stored = str(r.get("content") or "").strip()
-            shown = stored if len(stored) <= _ADD_SIMILAR_CHARS else stored[:_ADD_SIMILAR_CHARS] + "..."
             item: dict[str, Any] = {
                 "memory_id": self._show_id(r.get("memory_id")),
-                "score": score,
-                "content": shown,
+                "score": r.get("similarity"),
+                "content": stored if len(stored) <= _ADD_SIMILAR_CHARS else stored[:_ADD_SIMILAR_CHARS] + "...",
                 "target": r.get("target") or "memory",
             }
             if r.get("tags"):
                 item["tags"] = r["tags"]
-            if stored == text:
+            if stored == text.strip():
                 item["identical"] = True
             out.append(item)
         return out
+
+    def _stored_copy(
+        self, rows: list[dict[str, Any]], text: str, target: str, tags: list[str]
+    ) -> dict[str, Any] | None:
+        """The row among *rows* that a new fact would be a copy of, or None.
+
+        A copy is a row oracle_add itself created (a generated fact_ id) that
+        has the same text, target and tags and was written by this session
+        and agent: the new row would differ from it in its id and time only,
+        so leaving it unwritten loses nothing. Every other match is reported
+        and written. In particular a row under a caller-chosen id (a handoff,
+        a write-ahead staging row) or a mirror of a built-in memory entry is
+        never a copy: such rows are deleted on their own schedule."""
+        session = self._session_id or "none"  # what _insert_binds writes
+        for r in rows:
+            if (
+                _GENERATED_FACT_ID_RE.fullmatch(str(r.get("memory_id") or ""))
+                and (r.get("role") or "fact") == "fact"
+                and str(r.get("content") or "").strip() == text.strip()
+                and (r.get("target") or "memory") == target
+                and sorted(r.get("tags") or []) == sorted(tags)
+                and r.get("session_id") == session
+                and r.get("agent_id") == self._agent_id
+            ):
+                return r
+        return None
 
     def _upsert_fact(
         self,
@@ -5222,7 +5256,9 @@ class OracleMemoryProvider(MemoryProvider):
                 return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
             # A caller-chosen id is always written; rows under other ids that
             # say the same are reported with it.
-            similar = self._similar_rows(facts_to_add[0], exclude_ids=tuple(self._lookup_ids(req_mid)))
+            similar = self._similar_reply(
+                self._similar_rows(facts_to_add[0], exclude_ids=tuple(self._lookup_ids(req_mid))), facts_to_add[0]
+            )
             out = self._upsert_fact(
                 req_mid,
                 facts_to_add[0],
@@ -5235,20 +5271,18 @@ class OracleMemoryProvider(MemoryProvider):
             return json.dumps(out)
 
         if len(facts_to_add) == 1:
-            similar = self._similar_rows(facts_to_add[0])
-            for row in similar:
-                # The same text, for the same target, already carrying every
-                # tag asked for: a second row would add nothing.
-                if (
-                    row.get("identical")
-                    and row.get("target") == target
-                    and set(add_tags) <= set(row.get("tags") or [])
-                ):
-                    return json.dumps({
-                        "result": "An identical fact is already stored; nothing was added.",
-                        "memory_id": row["memory_id"],
-                        "duplicate": True,
-                    })
+            near = self._similar_rows(facts_to_add[0])
+            copy = self._stored_copy(near, facts_to_add[0], target, add_tags)
+            if copy is not None:
+                return json.dumps({
+                    "result": (
+                        "This fact is already stored, by this session, with the same target and tags; "
+                        "nothing was added."
+                    ),
+                    "memory_id": self._show_id(copy.get("memory_id")),
+                    "duplicate": True,
+                })
+            similar = self._similar_reply(near, facts_to_add[0])
             mid = f"fact_{uuid.uuid4().hex[:16]}"
             self._insert(
                 memory_id=mid,

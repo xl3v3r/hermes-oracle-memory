@@ -129,7 +129,9 @@ Before it stores a single fact, `oracle_add` looks for stored rows that say near
 ```
 
 - The new fact is stored all the same; the caller decides whether to update the older row or delete one of the two.
-- A fact whose text is identical to one of the listed rows, with the same `target` and with tags that row already carries, is not stored again. The reply is `{"duplicate": true, "memory_id": "<the stored row>"}`. Only the listed rows are compared, so an identical row that is not among the three nearest does not stop the write.
+- One case is not stored: the fact would be a copy of a row that `oracle_add` already created in this session. That means the same text, the same `target`, the same tags, the same session and agent, and a stored row with a generated `fact_…` id. The reply is `{"duplicate": true, "memory_id": "<the stored row>"}`. The row that was not written would have differed in its id and time only.
+- Every other match is stored and listed, with `"identical": true` when the text is the same: a row from another session, a row with other tags, a row under a caller-chosen id (a handoff, a staging row), a mirror of a built-in memory entry. Those rows can be deleted on their own, so they never stand in for the new fact.
+- Only the listed rows are compared, so a copy that is not among the three nearest does not stop the write.
 - A call with a `memory_id` always writes that row, and lists similar rows stored under other ids.
 - A batch (`facts` with more than one entry) is stored without the lookup.
 - Skill rows are not compared. A user-scoped session is compared with its own rows only.
