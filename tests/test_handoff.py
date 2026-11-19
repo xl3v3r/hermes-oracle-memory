@@ -321,7 +321,7 @@ class TestSearchTags(unittest.TestCase):
         self.assertIn("tags", by_name["oracle_search"]["parameters"]["properties"])
         self.assertEqual(by_name["oracle_update"]["parameters"]["required"], ["memory_id"])
         self.assertIn("oracle_get", by_name)
-        self.assertIn("10. HANDOFFS", oracle_plugin._PROMPT_BODY)
+        self.assertIn("10. HANDOFFS", oracle_plugin._prompt_body())
 
 
 if __name__ == "__main__":

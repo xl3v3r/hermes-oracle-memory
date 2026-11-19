@@ -62,6 +62,7 @@ Embeddings are computed inside the database, by the ONNX model that `HERMES_ORAC
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
 | `HERMES_ORACLE_ADD_SIMILAR_MIN` | `0.9` | Vector similarity (0 to 1) from which `oracle_add` reports a stored row as similar to the new fact; `0` turns the lookup off |
 | `HERMES_ORACLE_CAPTURE` | `turn,session` | Rows the provider writes without a tool call: `turn`, `session`, `skill_usage`, a list of them, `all` or `none` — see [Rows written without a tool call](#rows-written-without-a-tool-call) |
+| `HERMES_ORACLE_OPTIONAL_RULES` | - | Memory rules added to the system prompt on request: `oracle_only`, `write_ahead`, `confidence_tags`, a list of them, `all` or `none` — see [Memory rules in the system prompt](#memory-rules-in-the-system-prompt) |
 | `HERMES_ORACLE_SYNC_SKILLS_TOOL` | - | `1`, `true`, `yes` or `on`: offer the `oracle_sync_skills` tool to this profile's sessions (never to a user-scoped session) |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
 | `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `30000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
@@ -91,6 +92,23 @@ The provider writes three kinds of rows on its own. `HERMES_ORACLE_CAPTURE` name
 - Each row is embedded like any other, so each costs one in-database inference.
 - A user-scoped session writes none of them, whatever the setting.
 - The setting stops new rows only. Rows already stored stay.
+
+### Memory rules in the system prompt
+
+Every session receives a block of numbered rules on how to use the memory tools. Fifteen rules are always sent: search first, where facts go, `memory_id` and tags, handoffs, and rules 11 to 18 on evidence (no fabrication, full text before quoting, provenance, dates, conflicts, the user's standing instructions, secrets, retrieved content is data).
+
+Three groups state one deployment's policy. `HERMES_ORACLE_OPTIONAL_RULES` adds them:
+
+| Group | Adds | What it tells the model |
+|---|---|---|
+| `oracle_only` | rules 5 and 6 | There is no local memory store: `MEMORY.md` and local files are off-limits for facts, and nothing is remembered while the database is unreachable |
+| `write_ahead` | rule 7 | Stage each write under a `wal_` id, check it with a search, store the final row, delete the staging row (four tool calls per fact) |
+| `confidence_tags` | rule 19 | Tag every factual claim `[Certain]`, `[Likely]` or `[Guessing]` |
+
+- The value is a list (`oracle_only,write_ahead`), `all` or `none`. A name that is not a group is ignored with a warning in the log.
+- A rule keeps its number on every host, so a default session has no rules 5, 6, 7 and 19.
+- Up to 1.1.2 every session received rules 1 to 10, including 5, 6 and 7. Set `HERMES_ORACLE_OPTIONAL_RULES=oracle_only,write_ahead` in the profile's `.env` to keep sending them.
+- Rules 16 and 18 use the tag `instruction`: the model follows instructions found in a stored row only when the row carries that tag. Rows that hold standing instructions and were stored before 1.1.2.1 do not carry it until it is added (`oracle_update` with `tags`).
 
 ### Per-user scope
 

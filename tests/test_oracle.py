@@ -900,16 +900,15 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("2. ORACLE-FIRST FACT SINK", block)
         self.assertIn("3. MEMORY_ID LIFECYCLE", block)
         self.assertIn("4. STORAGE TIERS", block)
-        self.assertIn("5. ORACLE-ONLY STORE", block)
-        self.assertIn("6. ORACLE UNAVAILABILITY", block)
-        self.assertIn("7. INTERNAL WRITE-AHEAD", block)
         self.assertIn("8. SESSION SCOPING", block)
         self.assertIn("9. VALIDATION BEFORE WRITE", block)
+        # Rules 5-7 and 19 are a deployment's policy: tests/test_prompt_rules.py.
+        self.assertNotIn("5. ORACLE-ONLY STORE", block)
 
         provider_down = oracle_plugin.OracleMemoryProvider()
         provider_down._pool = None
         down_block = provider_down.system_prompt_block()
-        self.assertIn("No memory store is available. Local memory is prohibited.", down_block)
+        self.assertIn("Unavailable (", down_block)
 
     def test_tool_schemas_oracle_first(self):
         schemas = {s["name"]: s for s in oracle_plugin.TOOL_SCHEMAS}
