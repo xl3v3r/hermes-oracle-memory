@@ -61,6 +61,7 @@ Embeddings are computed inside the database, by the ONNX model that `HERMES_ORAC
 | `HERMES_ORACLE_ONNX_MODEL` | `BGE_BASE_EN_V1_5` | In-database ONNX model name |
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
 | `HERMES_ORACLE_ADD_SIMILAR_MIN` | `0.9` | Vector similarity (0 to 1) from which `oracle_add` reports a stored row as similar to the new fact; `0` turns the lookup off |
+| `HERMES_ORACLE_CAPTURE` | `turn,session` | Rows the provider writes without a tool call: `turn`, `session`, `skill_usage`, a list of them, `all` or `none` — see [Rows written without a tool call](#rows-written-without-a-tool-call) |
 | `HERMES_ORACLE_SYNC_SKILLS_TOOL` | - | `1`, `true`, `yes` or `on`: offer the `oracle_sync_skills` tool to this profile's sessions (never to a user-scoped session) |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
 | `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `30000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
@@ -74,6 +75,22 @@ Embeddings are computed inside the database, by the ONNX model that `HERMES_ORAC
 | `HERMES_ORACLE_RECENCY_SCALE_DAYS` | `120` | Age in days at which the recency bonus has decayed to about a third |
 | `HERMES_ORACLE_TELEMETRY_WEIGHT` | `0.05` | Score multiplier of skill-usage and vectorization log rows (0–1) |
 | `HERMES_ORACLE_DISABLE_RERANK` | - | `1`, `true` or `yes`: skip the `DBMS_VECTOR.RERANK` step of hybrid search |
+
+### Rows written without a tool call
+
+The provider writes three kinds of rows on its own. `HERMES_ORACLE_CAPTURE` names the kinds a profile wants:
+
+| Kind | Written | Default |
+|---|---|---|
+| `turn` | after each turn: up to 1,500 characters of the user's message and of the reply (`role='turn'`) | on |
+| `session` | when a session ends: the start of its last four user messages (`role='session'`) | on |
+| `skill_usage` | each time a skill is used or loaded: a `[skill_usage]` line | off |
+
+- The value is a list (`turn,session`), `all` or `none`. A name that is not a kind is ignored with a warning in the log.
+- No search and no recall returns these rows. `oracle_get` reads them by `memory_id`, `session_id` or tag.
+- Each row is embedded like any other, so each costs one in-database inference.
+- A user-scoped session writes none of them, whatever the setting.
+- The setting stops new rows only. Rows already stored stay.
 
 ### Per-user scope
 

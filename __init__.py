@@ -1037,6 +1037,36 @@ _WEIGHT_TELEMETRY = _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, 
 # oracle_sync_skills scans this host's directories and writes the shared
 # corpus: an operator action. A profile that wants it as a tool asks for it.
 _SYNC_SKILLS_TOOL = _as_bool(_setting("HERMES_ORACLE_SYNC_SKILLS_TOOL"))
+# The rows the provider writes on its own, without a tool call: one per turn,
+# one per ended session, one per skill use. No search returns them (_JUNK);
+# oracle_get reads them by id, session or tag.
+_CAPTURE_KINDS = ("turn", "session", "skill_usage")
+_CAPTURE_DEFAULT = frozenset({"turn", "session"})
+
+
+def _parse_capture(raw: Any) -> frozenset[str]:
+    """HERMES_ORACLE_CAPTURE as a set of _CAPTURE_KINDS. Unset is the default
+    (turn and session rows); "all" is every kind; "none", "off" or "0" is
+    nothing; otherwise a list of kinds. A name that is not a kind is ignored
+    with a warning, so a mistyped value captures less, never more."""
+    text = raw.strip().lower() if isinstance(raw, str) else ""
+    if not text:
+        return _CAPTURE_DEFAULT
+    if text == "all":
+        return frozenset(_CAPTURE_KINDS)
+    if text in ("none", "off", "0", "false", "no"):
+        return frozenset()
+    names = [n.replace("-", "_") for n in re.split(r"[\s,]+", text) if n]
+    unknown = [n for n in names if n not in _CAPTURE_KINDS]
+    if unknown:
+        logger.warning(
+            "HERMES_ORACLE_CAPTURE: ignoring %s (known: %s, all, none)",
+            ", ".join(unknown), ", ".join(_CAPTURE_KINDS),
+        )
+    return frozenset(n for n in names if n in _CAPTURE_KINDS)
+
+
+_CAPTURE = _parse_capture(_setting("HERMES_ORACLE_CAPTURE"))
 # oracle_add of one fact first looks for stored rows that say nearly the same
 # thing: vector similarity (1 - cosine distance) at or above this floor. 0
 # turns the lookup off. It is one extra query per call, with its own short
@@ -1065,6 +1095,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
             "telemetry_weight": _WEIGHT_TELEMETRY,
             "sync_skills_tool": _SYNC_SKILLS_TOOL,
             "add_similar_min": _ADD_SIMILAR_MIN,
+            "capture": _CAPTURE,
         }
     return {
         "skill_fetch_max_chunks": int(_env_number("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", 400, lo=1)),
@@ -1076,6 +1107,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
         "telemetry_weight": _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, allow_zero=True),
         "sync_skills_tool": _as_bool(_setting("HERMES_ORACLE_SYNC_SKILLS_TOOL")),
         "add_similar_min": _env_number("HERMES_ORACLE_ADD_SIMILAR_MIN", 0.9, hi=1.0, allow_zero=True),
+        "capture": _parse_capture(_setting("HERMES_ORACLE_CAPTURE")),
     }
 _TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
 
@@ -4293,6 +4325,8 @@ class OracleMemoryProvider(MemoryProvider):
     ) -> None:
         if not self._pool or self._agent_context not in ("primary", ""):
             return
+        if "turn" not in self._tune("capture"):
+            return
         if self._user_scoped():
             # Hermes names no caller on this hook, and a provider can be shared
             # by two callers of one session id: never store a turn for a user.
@@ -4376,7 +4410,7 @@ class OracleMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if not self._pool or not isinstance(messages, list) or not messages:
             return
-        if self._user_scoped():  # see sync_turn
+        if "session" not in self._tune("capture") or self._user_scoped():  # see sync_turn
             return
         try:
             user_bits = [
@@ -4471,6 +4505,8 @@ class OracleMemoryProvider(MemoryProvider):
         )
 
         if action in ("used", "loaded"):
+            if "skill_usage" not in self._tune("capture"):
+                return
             try:
                 if not skill_name:
                     return
