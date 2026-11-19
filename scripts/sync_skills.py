@@ -462,11 +462,12 @@ def hermes_home() -> Path:
     return _load_common().hermes_home()
 
 
-def default_skill_roots() -> list[Path]:
+def default_skill_roots(home: Path | None = None) -> list[Path]:
     """Skill roots scanned by default, by the bulk sync and the lifecycle hook
-    alike: the active profile's skills dir and the shared ~/.agents/skills."""
+    alike: the skills dir of the profile (*home*, else the active one) and the
+    shared ~/.agents/skills."""
     out: list[Path] = []
-    for d in (hermes_home() / "skills", Path.home() / ".agents" / "skills"):
+    for d in ((home or hermes_home()) / "skills", Path.home() / ".agents" / "skills"):
         if d not in out:
             out.append(d)
     return out
@@ -621,45 +622,61 @@ def walk_skill_tree(base: str | Path) -> Iterator[tuple[str, list[str], list[str
         yield cur, dirnames, filenames
 
 
-def discover_skills(dirs: list[str | Path] | None = None) -> list[SkillInfo]:
-    """Scan directories for SKILL.md files and return parsed SkillInfo objects."""
-    search_dirs = resolve_skill_roots(dirs)
-
-    skills_by_name: dict[str, SkillInfo] = {}
+def iter_skill_files(dirs: Sequence[str | Path] | None = None) -> Iterator[Path]:
+    """Each live SKILL.md under the scan roots, once per resolved file."""
     seen_canonical_paths: set[Path] = set()
-    ignored_subdirs = IGNORED_SUBDIRS
-
-    for base_dir in search_dirs:
+    for base_dir in resolve_skill_roots(dirs):
         for root, _dirnames, filenames in walk_skill_tree(base_dir):
             for fname in filenames:
-                if fname.lower() == "skill.md":
-                    fpath = Path(root) / fname
-                    try:
-                        canonical = fpath.resolve()
-                    except Exception:
-                        canonical = fpath
+                if fname.lower() != "skill.md":
+                    continue
+                fpath = Path(root) / fname
+                try:
+                    canonical = fpath.resolve()
+                except Exception:
+                    canonical = fpath
 
-                    if canonical in seen_canonical_paths:
+                if canonical in seen_canonical_paths:
+                    continue
+                seen_canonical_paths.add(canonical)
+
+                # Only filter if path component is an explicitly ignored directory (like .archive, .git)
+                # or if a subdirectory relative to base_dir is hidden
+                if any(part in IGNORED_SUBDIRS for part in canonical.parts):
+                    continue
+                try:
+                    rel_parts = canonical.relative_to(base_dir).parts[:-1]
+                    if any(p.startswith(".") for p in rel_parts):
                         continue
-                    seen_canonical_paths.add(canonical)
+                except ValueError:
+                    pass
+                yield fpath
 
-                    # Only filter if path component is an explicitly ignored directory (like .archive, .git)
-                    # or if a subdirectory relative to base_dir is hidden
-                    if any(part in ignored_subdirs for part in canonical.parts):
-                        continue
-                    try:
-                        rel_parts = canonical.relative_to(base_dir).parts[:-1]
-                        if any(p.startswith(".") for p in rel_parts):
-                            continue
-                    except ValueError:
-                        pass
 
-                    skill_info = parse_skill_file(fpath)
-                    if skill_info and skill_info.name:
-                        if skill_info.name not in skills_by_name:
-                            skills_by_name[skill_info.name] = skill_info
+def discover_skills(dirs: list[str | Path] | None = None) -> list[SkillInfo]:
+    """Scan directories for SKILL.md files and return parsed SkillInfo objects."""
+    skills_by_name: dict[str, SkillInfo] = {}
+    for fpath in iter_skill_files(dirs):
+        skill_info = parse_skill_file(fpath)
+        if skill_info and skill_info.name:
+            if skill_info.name not in skills_by_name:
+                skills_by_name[skill_info.name] = skill_info
 
     return [skills_by_name[k] for k in sorted(skills_by_name.keys())]
+
+
+def local_skill_names(dirs: Sequence[str | Path] | None = None) -> set[str]:
+    """Names of the live skills under the scan roots, as discover_skills()
+    names them. Reads each SKILL.md's frontmatter only: no references, no
+    hashing."""
+    names: set[str] = set()
+    for fpath in iter_skill_files(dirs):
+        try:
+            fm, _ = parse_frontmatter(fpath.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        names.add(str(fm.get("name") or "").strip() or fpath.parent.name)
+    return names
 
 
 def chunk_markdown_text(text: str, max_words: int = 80, overlap: int = 10) -> list[str]:

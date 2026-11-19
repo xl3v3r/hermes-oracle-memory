@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-oracle-memory"
-version = "1.1.2"
+version = "1.1.3"
 description = "Oracle AI Database 26ai memory provider plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "BUSL-1.1"
 license-files = ["LICENSE"]
 authors = [
-    {name = "Taylor Ripley (xl3v3r)"}
+    {name = "Taylor Ripley"}
 ]
 dependencies = [
     "oracledb>=4.0.2",

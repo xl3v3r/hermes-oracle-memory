@@ -32,6 +32,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install test dependencies
         run: python -m pip install "oracledb==26.1.0" "pytest==9.2.0"
+      # tests/test_sterile.py is part of this run: it fails when a dev-tool file
+      # or a site-specific term is tracked again.
       - name: Unit tests (no database; HOME sandboxed so nothing can touch a real ~/.hermes)
         run: |
           export HOME="$RUNNER_TEMP/home"

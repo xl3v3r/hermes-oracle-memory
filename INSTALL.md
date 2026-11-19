@@ -1,11 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
-![License](https://img.shields.io/badge/license-BSL--1.1-orange.svg)
+![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)
+![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
-> **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
-
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.2) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.3) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 
@@ -18,9 +16,6 @@ This guide provides complete instructions for installing, configuring, and verif
 - **Zero External Embedding Costs via In-Database ONNX Inference**:
   - Uses `VECTOR_EMBEDDING` natively inside Oracle Database 26ai with `BGE_BASE_EN_V1_5` (`BAAI/bge-base-en-v1.5`).
   - Embedding computation is executed entirely within the database engine kernel via ONNX runtime, eliminating recurring token costs and external latency from paid third-party embedding APIs.
-- **In-Memory Embedding Deduplication**:
-  - The `_embed_many` batch ingestion pipeline detects and coalesces duplicate texts prior to embedding calls.
-  - Identical turns, prompt fragments, and redundant context entries are embedded exactly once, preventing wasted API token spend.
 - **Accurate Hybrid Retrieval (Oracle Text + Vector)**:
   - Fuses dense vector similarity (`VECTOR_DISTANCE`) with exact lexical full-text scoring (`CONTAINS` / `SCORE`) in a single round-trip.
   - Filters and ranks only top-relevance facts, preventing prompt window bloat and eliminating the token cost of dumping noisy, oversized context blocks into the LLM.
@@ -31,10 +26,8 @@ The provider delivers enterprise-grade integration across Oracle Cloud Infrastru
 
 - **Direct OCI Autonomous AI Database 26ai Vector Capabilities**:
   - Native 768-dimensional `VECTOR(768, FLOAT32)` storage, in-database chunking via `DBMS_VECTOR.UTL_TO_CHUNKS`, and an in-memory HNSW vector index (`ORGANIZATION INMEMORY NEIGHBOR GRAPH`).
-- **Native OCI GenAI Service Fallback**:
-  - Automatic fallback to OCI Generative AI inference (`cohere.embed-v4.0`) via native OCI Instance Principals and API signing when running on OCI Compute or container instances—no static API keys required.
-- **Connection and Signer Caching Across Agent Sessions**:
-  - The OCI GenAI client and `InstancePrincipalsSecurityTokenSigner` security signer are cached and reused across agent sessions, removing client initialization latency and cryptographic token regeneration overhead.
+- **No embedding service outside the database**:
+  - There is no fallback provider. While the in-database model is unavailable, a row is stored without an embedding and embedded later by a background backfill; text search and `oracle_get` keep working.
 
 ---
 
@@ -55,53 +48,43 @@ Before starting, ensure you have:
 
 ## Step 1: Install the Provider Plugin
 
-You can install `hermes-oracle-memory` either as a plugin directly inside your Hermes home or as an editable Python package.
-
-### Option A: Install into Hermes Plugins Directory (Recommended)
-
-Clone or copy the repository directly into your Hermes plugins directory:
+Install it with the Hermes plugin manager:
 
 ```bash
-# Target directory
-mkdir -p ~/.hermes/plugins
-git clone https://github.com/xl3v3r/hermes-oracle-memory.git ~/.hermes/plugins/oracle
+hermes plugins install xl3v3r/hermes-oracle-memory --yes-deps --enable
 ```
 
-Install required Python dependencies:
+- `--yes-deps` accepts the plugin's Python dependency, `oracledb`. Without it the command asks, and a non-interactive run is refused.
+- `--enable` enables the plugin. Without it the command asks; `hermes plugins enable oracle` does the same later.
 
-```bash
-pip install "oracledb>=4.0.2" oci
+Hermes installs `oracledb` into the environment it loads the plugin from, under `$HERMES_HOME`. That is the only supported way to provide it. A `pip install oracledb` in a shell installs into whichever Python is first on `PATH` (on macOS usually the system or Homebrew one), which the Hermes process does not import from. The symptom is the provider reporting:
+
+```text
+oracledb is not importable in this Hermes process; run `hermes plugins enable oracle` and restart Hermes
 ```
 
-### Option B: Editable Python Package Install
+### From a clone
+
+If you cloned or copied the repository into the plugins directory yourself, enable it through Hermes so that the dependency is provisioned:
 
 ```bash
-git clone https://github.com/xl3v3r/hermes-oracle-memory.git
-cd hermes-oracle-memory
-pip install -e .
+git clone https://github.com/xl3v3r/hermes-oracle-memory.git "${HERMES_HOME:-$HOME/.hermes}/plugins/oracle"
+hermes plugins enable oracle
 ```
 
 ---
 
-## Step 2: Configure Hermes Agent
-
-Enable the `oracle` memory plugin in Hermes Agent configuration.
-
-### Edit `~/.hermes/config.yaml`
-
-Ensure `oracle` is listed under `plugins.enabled`:
-
-```yaml
-plugins:
-  enabled:
-    - oracle
-```
-
-Alternatively, configure via Hermes CLI:
+## Step 2: Select the Provider and Restart
 
 ```bash
+hermes memory setup                        # pick "oracle" from the list
+# or, without the prompt:
 hermes config set memory.provider oracle
 ```
+
+Restart Hermes after installing, enabling or selecting the provider, and restart the gateway if it runs as a service. A running process keeps the environment it started with, so it does not see a dependency that was installed afterwards.
+
+`$HERMES_HOME` is `~/.hermes` unless you use a profile or a service install, which have their own home. Every path below that names `$HERMES_HOME` means the home of the profile the provider runs in.
 
 ---
 
@@ -130,9 +113,9 @@ To achieve **zero external embedding API costs**, configure in-database ONNX inf
 
 ---
 
-## Step 4: Configure Environment & Credentials (`~/.hermes/.env`)
+## Step 4: Configure Environment & Credentials (`$HERMES_HOME/.env`)
 
-Configure your database connection, wallet path, and fallback embedding providers in `~/.hermes/.env`:
+Put the database connection and the wallet path in `$HERMES_HOME/.env` (by default `~/.hermes/.env`):
 
 ```bash
 # =============================================================================
@@ -149,7 +132,7 @@ OCI_WALLET_LOCATION=~/.oci/wallet
 OCI_WALLET_PASSWORD="YourWalletPassword"
 
 # =============================================================================
-# Primary In-Database ONNX Model
+# In-Database ONNX Model
 # =============================================================================
 HERMES_ORACLE_ONNX_MODEL=BGE_BASE_EN_V1_5
 

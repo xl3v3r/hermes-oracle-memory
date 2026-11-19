@@ -41,20 +41,10 @@ class TestOraclePlugin(unittest.TestCase):
     def test_contains_query_edge_cases(self):
         provider = oracle_plugin.OracleMemoryProvider()
 
-        # Test None
-        self.assertEqual(provider._contains_query(None), "{memory}")
-
-        # Test empty string
-        self.assertEqual(provider._contains_query(""), "{memory}")
-
-        # Test whitespace only
-        self.assertEqual(provider._contains_query("   \n\t  "), "{memory}")
-
-        # Test only punctuation
-        self.assertEqual(provider._contains_query("?!.,;:()"), "{memory}")
-
-        # Test only short words
-        self.assertEqual(provider._contains_query("a to is"), "{memory}")
+        # No usable term (None, empty, punctuation, short words): no text leg.
+        # tests/test_fusion.py covers what the callers do with that.
+        for query in (None, "", "   \n\t  ", "?!.,;:()", "a to is"):
+            self.assertEqual(provider._contains_query(query), "", query)
 
         # Test valid query
         self.assertEqual(provider._contains_query("test query"), "{test} ACCUM {query}")
@@ -87,8 +77,8 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertEqual(provider._contains_query("within"), "{within}")
         self.assertEqual(provider._contains_query("near"), "{near}")
 
-        # Test short reserved word 'or' falls back to {memory}
-        self.assertEqual(provider._contains_query("or"), "{memory}")
+        # The short reserved word 'or' leaves no term
+        self.assertEqual(provider._contains_query("or"), "")
 
         # Test phrase containing 'or' alongside longer terms
         self.assertEqual(provider._contains_query("gold or silver"), "{gold} ACCUM {silver}")
@@ -129,7 +119,14 @@ class TestOraclePlugin(unittest.TestCase):
         provider = oracle_plugin.OracleMemoryProvider()
         with patch.dict(sys.modules, {"oracledb": None}):
             reason = provider.unavailable_reason()
-            self.assertEqual(reason, "oracledb is not installed in the Hermes venv")
+            # #23: says what to run. "the Hermes venv" was wrong for plugin
+            # environments, and "pip install" is what led people astray.
+            self.assertEqual(
+                reason,
+                "oracledb is not importable in this Hermes process; "
+                "run `hermes plugins enable oracle` and restart Hermes",
+            )
+            self.assertNotIn("pip", reason)
 
     def test_is_available_no_oracledb(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -881,7 +878,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.1.2")
+        self.assertEqual(oracle_plugin.__version__, "1.1.3")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -893,16 +890,15 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertIn("2. ORACLE-FIRST FACT SINK", block)
         self.assertIn("3. MEMORY_ID LIFECYCLE", block)
         self.assertIn("4. STORAGE TIERS", block)
-        self.assertIn("5. ORACLE-ONLY STORE", block)
-        self.assertIn("6. ORACLE UNAVAILABILITY", block)
-        self.assertIn("7. INTERNAL WRITE-AHEAD", block)
         self.assertIn("8. SESSION SCOPING", block)
         self.assertIn("9. VALIDATION BEFORE WRITE", block)
+        # Rules 5-7 and 19 are a deployment's policy: tests/test_prompt_rules.py.
+        self.assertNotIn("5. ORACLE-ONLY STORE", block)
 
         provider_down = oracle_plugin.OracleMemoryProvider()
         provider_down._pool = None
         down_block = provider_down.system_prompt_block()
-        self.assertIn("No memory store is available. Local memory is prohibited.", down_block)
+        self.assertIn("Unavailable (", down_block)
 
     def test_tool_schemas_oracle_first(self):
         schemas = {s["name"]: s for s in oracle_plugin.TOOL_SCHEMAS}
@@ -2335,9 +2331,9 @@ class TestOraclePlugin(unittest.TestCase):
     def test_diversify_rows_caps_chunks_per_skill(self):
         provider = oracle_plugin.OracleMemoryProvider()
         rows = [
-            {"memory_id": "s1", "role": "skill", "content": "[skill_ingest] [skill:legal-memo] chunk 0", "score": 0.9, "conv_ref": "legal-memo"},
-            {"memory_id": "s2", "role": "skill", "content": "[skill_ingest] [skill:legal-memo] chunk 1", "score": 0.8, "conv_ref": "legal-memo"},
-            {"memory_id": "s3", "role": "skill", "content": "[skill_ingest] [skill:legal-memo] chunk 2", "score": 0.7, "conv_ref": "legal-memo"},
+            {"memory_id": "s1", "role": "skill", "content": "[skill_ingest] [skill:sample-skill] chunk 0", "score": 0.9, "conv_ref": "sample-skill"},
+            {"memory_id": "s2", "role": "skill", "content": "[skill_ingest] [skill:sample-skill] chunk 1", "score": 0.8, "conv_ref": "sample-skill"},
+            {"memory_id": "s3", "role": "skill", "content": "[skill_ingest] [skill:sample-skill] chunk 2", "score": 0.7, "conv_ref": "sample-skill"},
             {"memory_id": "f1", "role": "fact", "content": "A durable fact about the host", "score": 0.6},
             {"memory_id": "f2", "role": "fact", "content": "Another durable fact about the host", "score": 0.5},
         ]
@@ -2361,7 +2357,7 @@ class TestOraclePlugin(unittest.TestCase):
         self.assertGreaterEqual(oracle_plugin._MAX_CHUNKS_PER_SOURCE, 1)
 
     def test_source_key_parsing(self):
-        self.assertEqual(oracle_plugin._source_key({"conv_ref": "legal-memo", "content": "x"}), "legal-memo")
+        self.assertEqual(oracle_plugin._source_key({"conv_ref": "sample-skill", "content": "x"}), "sample-skill")
         self.assertEqual(oracle_plugin._source_key({"content": "[skill_ingest] [skill:alpha] chunk 1"}), "alpha")
         self.assertEqual(oracle_plugin._source_key({"content": "plain fact text"}), "")
         self.assertEqual(oracle_plugin._source_key("not-a-row"), "")
@@ -2379,57 +2375,51 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.1.2")
+        self.assertEqual(oracle_plugin.__version__, "1.1.3")
 
         # 2. VERSION
         version_file = repo_dir / "VERSION"
         self.assertTrue(version_file.is_file())
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.1.2")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.1.3")
 
         # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.2", plugin_yaml)
-        self.assertIn("version-1.1.2-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.1.3", plugin_yaml)
+        self.assertIn("version-1.1.3-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
 
         # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.1.2"', pyproject)
+        self.assertIn('version = "1.1.3"', pyproject)
 
         # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.2", skill_md)
+        self.assertIn("version: 1.1.3", skill_md)
 
         # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.1.2-blue.svg", readme)
-        self.assertIn("v1.1.2", readme)
+        self.assertIn("version-1.1.3-blue.svg", readme)
+        self.assertIn("v1.1.3", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.1.2-blue.svg", install_md)
-        self.assertIn("v1.1.2", install_md)
+        self.assertIn("version-1.1.3-blue.svg", install_md)
+        self.assertIn("v1.1.3", install_md)
 
-        # 6b. Agent docs carry the version too (they drifted until 1.1.1.4)
-        agents_md = (repo_dir / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn("RELEASE_NOTES_1.1.2.md", agents_md)
-        self.assertIn("(1.1.2)", agents_md)
-        needs_md = (repo_dir / "NEEDS.md").read_text(encoding="utf-8")
-        self.assertIn("**Version in play:** 1.1.2", needs_md)
-        self.assertIn("tag `v1.1.2`", needs_md)
+        # 6b. The second bundled skill carries the version too
         corpus_md = (repo_dir / "skills" / "oracle-skill-corpus" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.2", corpus_md)
+        self.assertIn("version: 1.1.3", corpus_md)
         changelog = (repo_dir / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("## [1.1.2]", changelog)
+        self.assertIn("## [1.1.3]", changelog)
 
         # 7. Release notes policy (only current version maintained)
-        self.assertTrue((repo_dir / "RELEASE_NOTES_1.1.2.md").is_file())
-        for old_name in ["RELEASE_NOTES_1.1.1.4.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.2.md", "RELEASE_NOTES_1.1.1.md", "RELEASE_NOTES_1.1.0.1.md", "RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
+        self.assertTrue((repo_dir / "RELEASE_NOTES_1.1.3.md").is_file())
+        for old_name in ["RELEASE_NOTES_1.1.2.md", "RELEASE_NOTES_1.1.1.4.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.md", "RELEASE_NOTES_1.1.0.1.md", "RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
             # read-only: a test must never delete files from the checkout
             self.assertFalse((repo_dir / old_name).exists(), old_name)
 
-        # 8. Git tag v1.1.2 points to master commit if tag file exists
-        tag_file = repo_dir / ".git" / "refs" / "tags" / "v1.1.2"
+        # 8. Git tag v1.1.3 points to master commit if tag file exists
+        tag_file = repo_dir / ".git" / "refs" / "tags" / "v1.1.3"
         if tag_file.is_file():
             master_file = repo_dir / ".git" / "refs" / "heads" / "master"
             if master_file.is_file():
@@ -2448,7 +2438,7 @@ class TestOraclePlugin(unittest.TestCase):
                 self.assertTrue(
                     rev,
                     "install-metadata revision must not be empty")
-                expected = {"v1.1.2"}
+                expected = {"v1.1.3"}
                 installed = Path.home() / ".hermes" / "plugins" / "oracle"
                 if (installed / ".git").is_dir():
                     head = _subprocess_run(
@@ -2457,7 +2447,7 @@ class TestOraclePlugin(unittest.TestCase):
                     if head and len(head) == 40:
                         expected.add(head)
                 tag_git = _subprocess_run(
-                    ["git", "-C", str(repo_dir), "rev-parse", "v1.1.2^{commit}"],
+                    ["git", "-C", str(repo_dir), "rev-parse", "v1.1.3^{commit}"],
                     capture_output=True, text=True).stdout.strip()
                 if tag_git and len(tag_git) == 40:
                     expected.add(tag_git)

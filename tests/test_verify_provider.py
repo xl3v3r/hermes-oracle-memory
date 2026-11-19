@@ -357,7 +357,7 @@ class TestSources(unittest.TestCase):
     def test_no_home_env_file_and_no_site_specific_data(self):
         for name in ("verify_provider.py", "test_provider_live.py"):
             src = (TESTS / name).read_text(encoding="utf-8")
-            for needle in ("Path.home()", "qwen", "HANDOFF", "pro-se", "test-verification-session"):
+            for needle in ("Path.home()", "qwen", "HANDOFF", "test-verification-session"):
                 self.assertNotIn(needle, src, f"{name}: {needle}")
 
     def test_live_test_is_opt_in(self):

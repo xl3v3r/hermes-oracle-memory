@@ -41,7 +41,7 @@ class TestOracleMemoryProvider(unittest.TestCase):
                     return __import__(name, *args, **kwargs)
                 mock_import.side_effect = mock_import_func
 
-                self.assertEqual(provider.unavailable_reason(), "oracledb is not installed in the Hermes venv")
+                self.assertIn("run `hermes plugins enable oracle` and restart Hermes", provider.unavailable_reason())
 
     def test_unavailable_reason_missing_one_secret(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -86,6 +86,12 @@ class TestOracleMemoryProvider(unittest.TestCase):
 
 
 class TestSkillLifecycleHook(unittest.TestCase):
+    def setUp(self):
+        # The usage row is written only where the profile asks for it (#28).
+        capture = patch.object(oracle_plugin, "_CAPTURE", frozenset({"turn", "session", "skill_usage"}))
+        capture.start()
+        self.addCleanup(capture.stop)
+
     def test_register_hooks_on_skill_lifecycle(self):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
@@ -246,6 +252,7 @@ class TestHookSurvivesProviderShutdown(unittest.TestCase):
         p._pool = MagicMock()
         p._initialized = True
         p._session_id = sid
+        p._tuning = dict(oracle_plugin._read_tuning(use_module_values=True), capture=frozenset({"skill_usage"}))
         with oracle_plugin._LIVE_PROVIDERS_LOCK:
             oracle_plugin._LIVE_PROVIDERS.add(p)
         return p

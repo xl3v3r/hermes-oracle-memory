@@ -1,5 +1,5 @@
 name: oracle
-version: 1.1.2
+version: 1.1.3
 description: "Oracle AI Database 26ai — vector search (HNSW), Oracle Text, fused hybrid recall, shared cross-server skill corpus, live lifecycle ingest, zombie-safe sync."
 # Oldest Hermes release with every API this plugin imports
 # (agent.memory_provider.RecallStatus, is_trivial_prompt, agent.secret_scope).
@@ -9,6 +9,5 @@ provides_hooks:
 pip_dependencies:
   - oracledb>=4.0.2
 
-# Badges & Criticality Notice
-# [![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)
-# CRITICALITY NOTICE: Shared-corpus read path (oracle_load_skill), per-host skill identity (skill:<host>:<name>:c<N>), live sync on skill create/update (on_skill_lifecycle, off the caller thread), opt-in host-scoped pruning, idempotent init, separated ingest timeout, bounded pool acquire, handoff rows (memory_id/tags, oracle_get).
+# Version badge
+# [![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)](https://github.com/xl3v3r/hermes-oracle-memory)

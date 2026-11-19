@@ -23,10 +23,10 @@ class TestLoadSkillList(unittest.TestCase):
 
     def test_list_pagination_and_more(self):
         """Verify pagination offset, page size limit, and 'more' flag calculation."""
-        # 501 rows (one per distinct name) -> more is True
+        # 51 rows (one per distinct name) -> more is True
         rows = [
             (f"skill-{i:03d}", "cat", f"[skill_ingest] [skill:skill-{i:03d}] skill-{i:03d} — Description {i}\nWhen to use: always", 1)
-            for i in range(501)
+            for i in range(51)
         ]
         self.mock_cursor.fetchall.return_value = rows
 
@@ -34,14 +34,14 @@ class TestLoadSkillList(unittest.TestCase):
         res = json.loads(raw_res)
 
         self.assertEqual(res["offset"], 100)
-        self.assertEqual(res["count_in_page"], 500)
+        self.assertEqual(res["count_in_page"], 50)
         self.assertTrue(res["more"])
-        self.assertEqual(len(res["skills"]), 500)
+        self.assertEqual(len(res["skills"]), 50)
         self.assertEqual(res["skills"][0]["name"], "skill-000")
         self.assertEqual(res["skills"][0]["description"], "Description 0")
         sql, binds = self.mock_cursor.execute.call_args[0][0], self.mock_cursor.execute.call_args[0][1]
         self.assertEqual(binds["o"], 100)
-        self.assertEqual(binds["limit"], 501)
+        self.assertEqual(binds["limit"], 51)
         # Paging is over distinct names (one row per name), so pages never repeat a name.
         self.assertIn("PARTITION BY json_value(metadata, '$.skill_name')", sql)
         self.assertIn("WHERE rn = 1", sql)

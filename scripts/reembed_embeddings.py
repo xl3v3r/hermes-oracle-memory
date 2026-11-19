@@ -2,7 +2,7 @@
 """Re-embed / verify embeddings in the Oracle 26ai memory table using ONLY the
 in-database ONNX model. No external provider is ever contacted.
 
-Why this exists (measured on the PHX ADB, 2 OCPU, 2026-10):
+Why this exists (figures measured on a 2 OCPU Autonomous Database):
   * Embeddings are computed in the database and nowhere else. (The earlier
     scripts/backfill_embeddings.py sent row text to an external API; it was
     removed in 1.1.2. Use `--mode nulls` here instead.)
@@ -305,6 +305,14 @@ def run_worker(
         conn.close()
 
 
+def eta_text(total_rows: int, scanned: int, rate: float) -> str:
+    """ETA for the progress line. The row count comes from --total-rows; without
+    one (or before the first row) there is nothing to estimate from."""
+    if not total_rows or total_rows <= 0 or not rate or rate <= 0:
+        return "eta n/a"
+    return f"eta {max(0.0, (total_rows - scanned) / rate / 60):.1f} min"
+
+
 def run(args: argparse.Namespace) -> int:
     load_env(getattr(args, "env_file", None))
     table = args.table.strip().upper()
@@ -330,8 +338,6 @@ def run(args: argparse.Namespace) -> int:
         if args.workers != 1:
             logger.info("mode=nulls: enforcing workers=1 for strictly serial execution to prevent Auto-DOP hangs (was %d)", args.workers)
             args.workers = 1
-        if args.total_rows == 162_400:
-            args.total_rows = 1_228
     bounds = partition_bounds(table, args.workers, nulls_only=(args.mode == "nulls"))
     # The partition is a snapshot; rows inserted while the job runs would sort
     # above the last boundary and be skipped. Extend the final range to a
@@ -372,11 +378,10 @@ def run(args: argparse.Namespace) -> int:
         snap = counters.snapshot()
         el = time.time() - t_start
         rate = snap["scanned"] / el if el else 0
-        eta = (args.total_rows - snap["scanned"]) / rate / 60 if rate else 0
         logger.info(
-            "scanned=%d matched=%d mismatched=%d written=%d failed=%d  %.1f rows/s  eta %.1f min",
+            "scanned=%d matched=%d mismatched=%d written=%d failed=%d  %.1f rows/s  %s",
             snap["scanned"], snap["matched"], snap["mismatched"], snap["written"],
-            snap["failed"], rate, eta,
+            snap["failed"], rate, eta_text(args.total_rows, snap["scanned"], rate),
         )
         write_checkpoint()
         if args.limit and snap["scanned"] >= args.limit:
@@ -409,7 +414,8 @@ def main() -> None:
     p.add_argument("--tolerance", type=float, default=_DEFAULT_TOL,
                    help="cosine distance above which a stored vector counts as stale")
     p.add_argument("--limit", type=int, default=None, help="stop after roughly this many rows")
-    p.add_argument("--total-rows", type=int, default=162_400, help="for ETA only")
+    p.add_argument("--total-rows", type=int, default=0,
+                   help="rows the run will scan, for the ETA in the progress line only (default: no ETA)")
     p.add_argument("--hi-sentinel", default="zzzzzzzzzzzzzzzzzzzz",
                    help="upper bound for the final worker so rows inserted mid-run are covered")
     p.add_argument("--pga-max-retries", type=int, default=5,

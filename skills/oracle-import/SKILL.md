@@ -1,7 +1,7 @@
 ---
 name: oracle-import
 description: Use when importing chat archives into Oracle memory.
-version: 1.1.2
+version: 1.1.3
 author: Hermes Community
 metadata:
   hermes:

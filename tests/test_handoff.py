@@ -28,6 +28,13 @@ def _provider(rowcount=1, fetch=None):
     return p, conn, cur
 
 
+def _writes_only(p):
+    """For tests that read the write statements by position: leave out
+    oracle_add's lookup of similar rows (tests/test_add_similar.py covers it)."""
+    p._similar_rows = MagicMock(return_value=[])
+    return p
+
+
 class TestNormalizers(unittest.TestCase):
     def test_tags_list_string_json_and_csv(self):
         n = oracle_plugin._normalize_tags
@@ -84,6 +91,7 @@ class TestAddWithMemoryIdAndTags(unittest.TestCase):
 
     def test_add_with_memory_id_inserts_when_absent(self):
         p, _, cur = _provider(rowcount=0)  # UPDATE finds nothing -> INSERT
+        _writes_only(p)
         out = json.loads(
             p.handle_tool_call(
                 "oracle_add", {"content": "state: X", "memory_id": "handoff:proj:topic", "tags": ["handoff"]}
@@ -98,6 +106,7 @@ class TestAddWithMemoryIdAndTags(unittest.TestCase):
 
     def test_add_with_existing_memory_id_updates_in_place(self):
         p, _, cur = _provider(rowcount=1)
+        _writes_only(p)
         out = json.loads(
             p.handle_tool_call(
                 "oracle_add", {"content": "state: Y", "memory_id": "handoff:proj:topic", "tags": ["handoff", "p"]}
@@ -120,6 +129,7 @@ class TestAddWithMemoryIdAndTags(unittest.TestCase):
 
     def test_add_upsert_race_falls_back_to_update(self):
         p, _, cur = _provider(rowcount=0)
+        _writes_only(p)
         calls = {"n": 0}
 
         def execute(sql, binds=None):
@@ -311,7 +321,7 @@ class TestSearchTags(unittest.TestCase):
         self.assertIn("tags", by_name["oracle_search"]["parameters"]["properties"])
         self.assertEqual(by_name["oracle_update"]["parameters"]["required"], ["memory_id"])
         self.assertIn("oracle_get", by_name)
-        self.assertIn("10. HANDOFFS", oracle_plugin._PROMPT_BODY)
+        self.assertIn("10. HANDOFFS", oracle_plugin._prompt_body())
 
 
 if __name__ == "__main__":
