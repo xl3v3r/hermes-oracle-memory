@@ -4174,7 +4174,10 @@ class OracleMemoryProvider(MemoryProvider):
         return self._render_recall(*self._recall_rows(rows))
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        self._start_prefetch(query)
+        """Nothing to do. Hermes calls this after a completed turn with the
+        message that was just answered. The next turn's prefetch() asks for
+        the next message and runs its own search, so a search started here
+        was only used when the user sent the same message twice in a row."""
 
     def _start_prefetch(self, query: str) -> None:
         if not isinstance(query, str) or not query or not self._pool or is_trivial_prompt(query):
