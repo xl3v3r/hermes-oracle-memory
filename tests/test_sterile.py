@@ -156,6 +156,32 @@ class TestSterileTree(unittest.TestCase):
         self.assertEqual(bad, [])
 
 
+class TestLicensorName(unittest.TestCase):
+    """LICENSE, CLA.md and pyproject.toml name one licensor, the same way."""
+
+    def _names(self):
+        patterns = {
+            "LICENSE": r"^Licensor: (.+)$",
+            "CLA.md": r'"Licensor"\*\* means (.+?) and authorized successors\.',
+            "pyproject.toml": r'^authors = \[\s*\{name = "([^"]+)"\}\s*\]',
+        }
+        out = {}
+        for f, rx in patterns.items():
+            m = re.search(rx, _read(f) or "", re.M)
+            self.assertIsNotNone(m, f"{f}: no licensor line")
+            out[f] = m.group(1)
+        return out
+
+    def test_one_name_in_all_three_files(self):
+        names = self._names()
+        self.assertEqual(len(set(names.values())), 1, names)
+
+    def test_name_is_a_plain_name(self):
+        # No handle or alias after the name.
+        for f, name in self._names().items():
+            self.assertRegex(name, r"^[A-Z][a-z]+(?: [A-Z][a-z]+)+$", f)
+
+
 class TestTheCheckItself(unittest.TestCase):
     """The scan must find a term in the forms it can take in a file."""
 

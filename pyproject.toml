@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "BUSL-1.1"
 license-files = ["LICENSE"]
 authors = [
-    {name = "Taylor Ripley (xl3v3r)"}
+    {name = "Taylor Ripley"}
 ]
 dependencies = [
     "oracledb>=4.0.2",

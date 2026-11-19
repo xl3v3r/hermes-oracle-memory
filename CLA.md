@@ -9,7 +9,7 @@ In order to clarify the intellectual property license granted with contributions
 ### 1. Definitions
 
 * **"You" (or "Contributor")** means the individual or legal entity submitting a Contribution.
-* **"Project Maintainer" / "Licensor"** means Taylor Ripley (xl3v3r) and authorized successors.
+* **"Project Maintainer" / "Licensor"** means Taylor Ripley and authorized successors.
 * **"Contribution"** means any code, documentation, bug fix, feature, pull request, or other material submitted by You for inclusion in **hermes-oracle-memory**.
 
 ---
