@@ -49,7 +49,7 @@ class TestFormatPrefetch(unittest.TestCase):
         self.assertEqual(provider._format_prefetch(rows), expected)
 
     def test_limits_to_6_memories(self):
-        # Six is what the recall search asked for before 1.1.2.1 too; the
+        # Six is what the recall search asked for before 1.1.3 too; the
         # formatter's own limit used to be eight.
         provider = oracle_plugin.OracleMemoryProvider()
         rows = [{"content": f"Memory {i}"} for i in range(10)]

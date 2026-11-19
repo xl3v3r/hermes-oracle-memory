@@ -1,7 +1,7 @@
 ---
 name: oracle-skill-corpus
 description: Use when a needed skill is not installed locally.
-version: 1.1.2
+version: 1.1.3
 author: Hermes Community
 metadata:
   hermes:

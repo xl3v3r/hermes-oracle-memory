@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, background persistence, and a **shared fleet-wide skill corpus**.
@@ -109,7 +109,7 @@ Three groups state one deployment's policy. `HERMES_ORACLE_OPTIONAL_RULES` adds 
 - The value is a list (`oracle_only,write_ahead`), `all` or `none`. A name that is not a group is ignored with a warning in the log.
 - A rule keeps its number on every host, so a default session has no rules 5, 6, 7 and 19.
 - Up to 1.1.2 every session received rules 1 to 10, including 5, 6 and 7. Set `HERMES_ORACLE_OPTIONAL_RULES=oracle_only,write_ahead` in the profile's `.env` to keep sending them.
-- Rules 16 and 18 use the tag `instruction`: the model follows instructions found in a stored row only when the row carries that tag. Rows that hold standing instructions and were stored before 1.1.2.1 do not carry it until it is added (`oracle_update` with `tags`).
+- Rules 16 and 18 use the tag `instruction`: the model follows instructions found in a stored row only when the row carries that tag. Rows that hold standing instructions and were stored before 1.1.3 do not carry it until it is added (`oracle_update` with `tags`).
 
 ### Ranking of a hybrid search
 
@@ -327,7 +327,7 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
 
 ## Release history
 
-The current release is v1.1.2. [CHANGELOG.md](CHANGELOG.md) lists the changes of every release; [RELEASE_NOTES_1.1.2.md](RELEASE_NOTES_1.1.2.md) has the upgrade notes for the current one.
+The current release is v1.1.3. [CHANGELOG.md](CHANGELOG.md) lists the changes of every release; [RELEASE_NOTES_1.1.3.md](RELEASE_NOTES_1.1.3.md) has the upgrade notes for the current one.
 
 ## Contributing
 

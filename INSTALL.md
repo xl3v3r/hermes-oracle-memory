@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.2) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.3) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 

@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.3] - 2026-11-18
+
+Findings of the 1.1.1.5 review that 1.1.2 left open (#23, #28, #29, #30, #31, #33, #34). Not in this release: one connection pool per provider (#28), and from #29 the explicit approximate search, the 1,200-character embedding window and the two indexes.
+
+### Changed
+- **Memory rules in the system prompt (#30, #28)**: rules 5, 6 and 7 (Oracle-only store, unavailability, write-ahead) are sent only where the profile sets `HERMES_ORACLE_OPTIONAL_RULES` (`oracle_only`, `write_ahead`, `confidence_tags`, a list, `all` or `none`). Rules 11 to 18 are new and always sent; rule 19 (confidence tags) is optional. A rule keeps its number on every host. A default session is sent 10,625 characters of rules and tool schemas (1.1.2: 11,545).
+- **Rows written without a tool call (#28)**: new setting `HERMES_ORACLE_CAPTURE` (`turn`, `session`, `skill_usage`, a list, `all` or `none`; default `turn,session`). `[skill_usage]` rows are no longer written unless asked for.
+- **Recall (#31)**: up to six memories and, in a block of their own, up to three skills of the shared corpus. A skill is listed by name and description; its body chunks are no longer recalled. Skills installed in the profile are left out.
+- **`oracle_load_skill` (#31)**: new action `search`; `list` returns 50 names per page (was 500).
+- **`oracle_sync_skills` (#31)**: offered only where the profile sets `HERMES_ORACLE_SYNC_SKILLS_TOOL`, and never to a user-scoped session.
+- **`oracle_add` (#30)**: a single fact is compared with the stored rows first (one vector query, at most 3 seconds). Rows at or above `HERMES_ORACLE_ADD_SIMILAR_MIN` (default `0.9`; `0` turns the lookup off) are listed under `similar` in the reply. A fact that this session already stored with the same text, target and tags is not written again: the reply carries `duplicate: true` and the id of the stored row. A call with a `memory_id` always writes; a batch is stored without the lookup.
+- **`queue_prefetch` (#28)** starts no search. Its result was used only when the next turn repeated the same message.
+
+### Added
+- **`HERMES_ORACLE_RANKING` (#29)**: `weighted` (default, the 1.1.2 ranking) or `rrf`: reciprocal-rank fusion of the two legs of a hybrid search, with the text leg searching for the longest words of the query instead of the first eight.
+- Tests: `test_sterile.py`, `test_docs.py`, `test_skill_routing.py`, `test_add_similar.py`, `test_queue_prefetch.py`, `test_capture.py`, `test_prompt_rules.py`, `test_fusion.py`, `test_reembed.py`.
+
+### Fixed
+- **Hybrid search (#29)**: the merge of the vector rows and the text rows depended on the order in which the database returned them. It no longer does.
+- **Hybrid and text search (#29)**: a query without a usable word searched for the literal word `memory`. It now has no text leg.
+- **Search filter (#29)**: ids such as `testing-1` were hidden together with `test_` ids, because `_` is a wildcard in `LIKE`.
+- **Missing driver (#23)**: the message names the command that fixes it (`hermes plugins enable oracle`, then a restart).
+- `scripts/reembed_embeddings.py` no longer assumes a table size for its progress line.
+
+### Documentation
+- One install path, through the Hermes plugin manager: `hermes plugins install xl3v3r/hermes-oracle-memory --yes-deps --enable` (#23).
+- README and INSTALL corrected against the code; a test compares the table of environment variables with the settings the provider reads (#33).
+
+### Removed
+- Development-tool files and strings specific to one site (#34). A test keeps them out.
+- `LICENSE`, `CLA.md` and `pyproject.toml` name the licensor as "Taylor Ripley".
+
 ## [1.1.2] - 2026-11-18
 
 Fixes from the 1.1.1.5 review (#14, #16 to #22, #24 to #27, #32).
