@@ -41,7 +41,7 @@ class TestOracleMemoryProvider(unittest.TestCase):
                     return __import__(name, *args, **kwargs)
                 mock_import.side_effect = mock_import_func
 
-                self.assertEqual(provider.unavailable_reason(), "oracledb is not installed in the Hermes venv")
+                self.assertIn("run `hermes plugins enable oracle` and restart Hermes", provider.unavailable_reason())
 
     def test_unavailable_reason_missing_one_secret(self):
         provider = oracle_plugin.OracleMemoryProvider()

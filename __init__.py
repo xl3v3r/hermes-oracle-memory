@@ -1669,7 +1669,10 @@ class OracleMemoryProvider(MemoryProvider):
         try:
             import oracledb  # noqa: F401
         except Exception:
-            return "oracledb is not installed in the Hermes venv"
+            return (
+                "oracledb is not importable in this Hermes process; "
+                "run `hermes plugins enable oracle` and restart Hermes"
+            )
         missing = [
             k
             for k in ("OCI_DB_USER", "OCI_DB_PASSWORD", "OCI_DB_DSN")

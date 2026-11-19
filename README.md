@@ -11,22 +11,21 @@ A high-performance external memory provider plugin for [Hermes Agent](https://gi
 
 > **CRITICALITY NOTICE**: Shared-corpus read path (oracle_load_skill), live sync on skill create/update (on_skill_lifecycle ingest), zombie-safe host-scoped pruning, idempotent init, separated ingest timeout.
 
-### Recommended — Hermes plugin manager
-
 ```bash
-hermes plugins install xl3v3r/hermes-oracle-memory
+hermes plugins install xl3v3r/hermes-oracle-memory --yes-deps --enable
 hermes memory setup              # pick "oracle" from the list
 ```
 
-### Manual — clone into the plugins directory
+Then restart Hermes, and the gateway if it runs as a service. A running process does not pick up a newly installed dependency.
+
+`--yes-deps` accepts the plugin's Python dependency (`oracledb`) and `--enable` enables the plugin; leave them out to be asked. Hermes installs the dependency into the environment it loads the plugin from. Do not install it with `pip` yourself: `pip` is whatever is first on your `PATH`, which is usually another Python, and the provider then reports "oracledb is not importable in this Hermes process".
+
+If you cloned the repository into the plugins directory instead (`$HERMES_HOME/plugins/oracle`), run `hermes plugins enable oracle`. It provisions the dependency in the same way. Then select the provider and restart:
 
 ```bash
-git clone https://github.com/xl3v3r/hermes-oracle-memory.git ~/.hermes/plugins/oracle
-pip install "oracledb>=4.0.2"    # `oci` only needed for the OCI GenAI fallback
+hermes plugins enable oracle
 hermes config set memory.provider oracle
 ```
-
-> Restart Hermes (or start a new session) after installing and selecting the provider.
 
 ### Verify
 
@@ -39,7 +38,7 @@ The script stores a few test memories, searches for them in each mode, and delet
 
 ## Configure
 
-Connection secrets go in `~/.hermes/.env` — see the [installation guide](INSTALL.md) for the full walkthrough. Minimum required:
+Connection secrets go in `$HERMES_HOME/.env` (by default `~/.hermes/.env`; a profile or a service install has its own home) — see the [installation guide](INSTALL.md) for the full walkthrough. Minimum required:
 
 ```bash
 OCI_DB_USER="<your-db-user>"

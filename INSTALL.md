@@ -55,53 +55,43 @@ Before starting, ensure you have:
 
 ## Step 1: Install the Provider Plugin
 
-You can install `hermes-oracle-memory` either as a plugin directly inside your Hermes home or as an editable Python package.
-
-### Option A: Install into Hermes Plugins Directory (Recommended)
-
-Clone or copy the repository directly into your Hermes plugins directory:
+Install it with the Hermes plugin manager:
 
 ```bash
-# Target directory
-mkdir -p ~/.hermes/plugins
-git clone https://github.com/xl3v3r/hermes-oracle-memory.git ~/.hermes/plugins/oracle
+hermes plugins install xl3v3r/hermes-oracle-memory --yes-deps --enable
 ```
 
-Install required Python dependencies:
+- `--yes-deps` accepts the plugin's Python dependency, `oracledb`. Without it the command asks, and a non-interactive run is refused.
+- `--enable` enables the plugin. Without it the command asks; `hermes plugins enable oracle` does the same later.
 
-```bash
-pip install "oracledb>=4.0.2" oci
+Hermes installs `oracledb` into the environment it loads the plugin from, under `$HERMES_HOME`. That is the only supported way to provide it. A `pip install oracledb` in a shell installs into whichever Python is first on `PATH` (on macOS usually the system or Homebrew one), which the Hermes process does not import from. The symptom is the provider reporting:
+
+```text
+oracledb is not importable in this Hermes process; run `hermes plugins enable oracle` and restart Hermes
 ```
 
-### Option B: Editable Python Package Install
+### From a clone
+
+If you cloned or copied the repository into the plugins directory yourself, enable it through Hermes so that the dependency is provisioned:
 
 ```bash
-git clone https://github.com/xl3v3r/hermes-oracle-memory.git
-cd hermes-oracle-memory
-pip install -e .
+git clone https://github.com/xl3v3r/hermes-oracle-memory.git "${HERMES_HOME:-$HOME/.hermes}/plugins/oracle"
+hermes plugins enable oracle
 ```
 
 ---
 
-## Step 2: Configure Hermes Agent
-
-Enable the `oracle` memory plugin in Hermes Agent configuration.
-
-### Edit `~/.hermes/config.yaml`
-
-Ensure `oracle` is listed under `plugins.enabled`:
-
-```yaml
-plugins:
-  enabled:
-    - oracle
-```
-
-Alternatively, configure via Hermes CLI:
+## Step 2: Select the Provider and Restart
 
 ```bash
+hermes memory setup                        # pick "oracle" from the list
+# or, without the prompt:
 hermes config set memory.provider oracle
 ```
+
+Restart Hermes after installing, enabling or selecting the provider, and restart the gateway if it runs as a service. A running process keeps the environment it started with, so it does not see a dependency that was installed afterwards.
+
+`$HERMES_HOME` is `~/.hermes` unless you use a profile or a service install, which have their own home. Every path below that names `$HERMES_HOME` means the home of the profile the provider runs in.
 
 ---
 
@@ -130,9 +120,9 @@ To achieve **zero external embedding API costs**, configure in-database ONNX inf
 
 ---
 
-## Step 4: Configure Environment & Credentials (`~/.hermes/.env`)
+## Step 4: Configure Environment & Credentials (`$HERMES_HOME/.env`)
 
-Configure your database connection, wallet path, and fallback embedding providers in `~/.hermes/.env`:
+Put the database connection and the wallet path in `$HERMES_HOME/.env` (by default `~/.hermes/.env`):
 
 ```bash
 # =============================================================================

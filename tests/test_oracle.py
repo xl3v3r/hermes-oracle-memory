@@ -129,7 +129,14 @@ class TestOraclePlugin(unittest.TestCase):
         provider = oracle_plugin.OracleMemoryProvider()
         with patch.dict(sys.modules, {"oracledb": None}):
             reason = provider.unavailable_reason()
-            self.assertEqual(reason, "oracledb is not installed in the Hermes venv")
+            # #23: says what to run. "the Hermes venv" was wrong for plugin
+            # environments, and "pip install" is what led people astray.
+            self.assertEqual(
+                reason,
+                "oracledb is not importable in this Hermes process; "
+                "run `hermes plugins enable oracle` and restart Hermes",
+            )
+            self.assertNotIn("pip", reason)
 
     def test_is_available_no_oracledb(self):
         provider = oracle_plugin.OracleMemoryProvider()
