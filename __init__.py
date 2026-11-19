@@ -887,6 +887,34 @@ def _chunk_params(max_words: Any, overlap: Any) -> tuple[int, int]:
     return mw, ov
 
 
+def _fact_list(value: Any, *, scalar: bool = False) -> list[str]:
+    """The facts in an oracle_add `facts` or `content` argument: one string, a
+    list of strings or of {"fact" | "content" | "text": ...} objects, or such a
+    list as JSON text. Empty items are dropped. *scalar*: a value of any other
+    type is one fact, as its text."""
+
+    def one(item: Any) -> str:
+        if isinstance(item, dict):
+            item = item.get("fact") or item.get("content") or item.get("text") or ""
+        return str(item).strip() if item is not None else ""
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                value = parsed
+    if isinstance(value, (list, tuple, set)):
+        return [f for f in map(one, value) if f]
+    if isinstance(value, str) or (scalar and value is not None):
+        text = str(value).strip()
+        return [text] if text else []
+    return []
+
+
 def _metadata_tags(value: Any) -> list[str]:
     """Tags projected as JSON_QUERY(metadata, '$.tags') text (or a list)."""
     if value is None:
@@ -1009,6 +1037,14 @@ _WEIGHT_TELEMETRY = _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, 
 # oracle_sync_skills scans this host's directories and writes the shared
 # corpus: an operator action. A profile that wants it as a tool asks for it.
 _SYNC_SKILLS_TOOL = _as_bool(_setting("HERMES_ORACLE_SYNC_SKILLS_TOOL"))
+# oracle_add of one fact first looks for stored rows that say nearly the same
+# thing: vector similarity (1 - cosine distance) at or above this floor. 0
+# turns the lookup off. It is one extra query per call, with its own short
+# timeout, and the write never waits on it for longer than that.
+_ADD_SIMILAR_MIN = _env_number("HERMES_ORACLE_ADD_SIMILAR_MIN", 0.9, hi=1.0, allow_zero=True)
+_ADD_SIMILAR_MAX = 3
+_ADD_SIMILAR_TIMEOUT_MS = 3000
+_ADD_SIMILAR_CHARS = 200
 _WEIGHT_SHORT_CHARS = 25
 _WEIGHT_SHORT_FACTOR = 0.9
 
@@ -1026,6 +1062,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
             "min_candidate_pool": _MIN_CANDIDATE_POOL,
             "telemetry_weight": _WEIGHT_TELEMETRY,
             "sync_skills_tool": _SYNC_SKILLS_TOOL,
+            "add_similar_min": _ADD_SIMILAR_MIN,
         }
     return {
         "skill_fetch_max_chunks": int(_env_number("HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS", 400, lo=1)),
@@ -1036,6 +1073,7 @@ def _read_tuning(use_module_values: bool = False) -> dict[str, Any]:
         "min_candidate_pool": int(_env_number("HERMES_ORACLE_MIN_CANDIDATE_POOL", 50, lo=1)),
         "telemetry_weight": _env_number("HERMES_ORACLE_TELEMETRY_WEIGHT", 0.05, hi=1.0, allow_zero=True),
         "sync_skills_tool": _as_bool(_setting("HERMES_ORACLE_SYNC_SKILLS_TOOL")),
+        "add_similar_min": _env_number("HERMES_ORACLE_ADD_SIMILAR_MIN", 0.9, hi=1.0, allow_zero=True),
     }
 _TELEMETRY_PREFIXES = ("[skill_usage]", "[skill_vectorization")
 
@@ -1186,7 +1224,9 @@ TOOL_SCHEMAS = [
             "decisions, environment details, or batch knowledge. Do NOT use local 1600-char memory for facts "
             "that belong in Oracle. Accepts a single fact string, list of facts, or 'facts' array. "
             "Pass memory_id (e.g. handoff:<project>:<topic>) to write a stable, addressable row: an existing "
-            "row with that id is updated in place (upsert). Pass tags to group rows for oracle_get."
+            "row with that id is updated in place (upsert). Pass tags to group rows for oracle_get. "
+            "For a single fact the reply lists near-duplicates already stored under 'similar': "
+            "update or delete one of them rather than keeping both."
         ),
         "parameters": {
             "type": "object",
@@ -3131,6 +3171,56 @@ class OracleMemoryProvider(MemoryProvider):
             return bool(row and row[0])
         except Exception:
             return False
+
+    def _similar_rows(self, content: str, *, exclude_ids: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        """Stored rows that say nearly what *content* says, nearest first: up
+        to _ADD_SIMILAR_MAX rows whose vector similarity is at or above the
+        add_similar_min setting, as {"memory_id", "score", "content" (cut),
+        "target"}, plus "tags" when the row has any and "identical": True when
+        its whole text equals *content*. Skill rows and rows no search returns
+        are left out; a user-scoped session sees its own rows only.
+
+        Advisory: any failure gives [] and the caller writes as usual."""
+        floor = float(self._tune("add_similar_min") or 0)
+        text = (content or "").strip()
+        if floor <= 0 or not text or not self._pool or self._onnx_in_cooldown():
+            return []
+        try:
+            where, binds = self._row_filters("any")
+            where += " AND NVL(role, 'fact') <> 'skill' "
+            if exclude_ids:
+                names = [f"x{i}" for i in range(len(exclude_ids))]
+                where += f" AND memory_id NOT IN ({', '.join(':' + n for n in names)}) "
+                binds.update(zip(names, exclude_ids))
+            binds.update({"qv": self._safe_embed_text(text), "k": _ADD_SIMILAR_MAX})
+            with self._acquire_checked() as conn:
+                conn.call_timeout = min(self._search_ms, _ADD_SIMILAR_TIMEOUT_MS)
+                with conn.cursor() as cur:
+                    rows = self._fetch_rows(cur, self._vector_leg_sql(where), binds)
+        except Exception as e:
+            logger.debug("oracle_add: lookup of similar rows failed: %s", e)
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if r.get("dist") is None:
+                continue
+            score = round(max(0.0, min(1.0, 1.0 - r["dist"])), 4)
+            if score < floor:
+                continue
+            stored = str(r.get("content") or "").strip()
+            shown = stored if len(stored) <= _ADD_SIMILAR_CHARS else stored[:_ADD_SIMILAR_CHARS] + "..."
+            item: dict[str, Any] = {
+                "memory_id": self._show_id(r.get("memory_id")),
+                "score": score,
+                "content": shown,
+                "target": r.get("target") or "memory",
+            }
+            if r.get("tags"):
+                item["tags"] = r["tags"]
+            if stored == text:
+                item["identical"] = True
+            out.append(item)
+        return out
 
     def _upsert_fact(
         self,
@@ -5092,43 +5182,8 @@ class OracleMemoryProvider(MemoryProvider):
         target = args.get("target") or "memory"
         if target not in ("memory", "user"):
             target = "memory"
-        facts_to_add: list[str] = []
-
-        def _extract_fact(item: Any) -> str:
-            if isinstance(item, dict):
-                val = item.get("fact") or item.get("content") or item.get("text") or ""
-                return str(val).strip()
-            return str(item).strip() if item is not None else ""
-
-        if isinstance(raw_facts, str) and raw_facts.strip().startswith("[") and raw_facts.strip().endswith("]"):
-            try:
-                parsed = json.loads(raw_facts)
-                if isinstance(parsed, list):
-                    raw_facts = parsed
-            except Exception:
-                pass
-
-        if isinstance(raw_facts, (list, tuple, set)):
-            facts_to_add = [_extract_fact(f) for f in raw_facts if _extract_fact(f)]
-        elif isinstance(raw_facts, str) and raw_facts.strip():
-            facts_to_add = [raw_facts.strip()]
-
-        if not facts_to_add:
-            raw_content = args.get("content")
-            if isinstance(raw_content, str) and raw_content.strip().startswith("[") and raw_content.strip().endswith("]"):
-                try:
-                    parsed = json.loads(raw_content)
-                    if isinstance(parsed, list):
-                        raw_content = parsed
-                except Exception:
-                    pass
-            if isinstance(raw_content, (list, tuple, set)):
-                facts_to_add = [_extract_fact(f) for f in raw_content if _extract_fact(f)]
-            elif isinstance(raw_content, str) and raw_content.strip():
-                facts_to_add = [raw_content.strip()]
-            elif raw_content is not None and str(raw_content).strip():
-                facts_to_add = [str(raw_content).strip()]
-
+        # `facts` first; `content` takes the same shapes and is the fallback.
+        facts_to_add = _fact_list(raw_facts) or _fact_list(args.get("content"), scalar=True)
         if not facts_to_add:
             return tool_error("Missing required parameter: content or facts")
         if len(facts_to_add) > _ADD_MAX_FACTS:
@@ -5162,17 +5217,35 @@ class OracleMemoryProvider(MemoryProvider):
         if req_mid is not None:
             if len(facts_to_add) != 1:
                 return tool_error(f"memory_id can only be used with a single fact (got {len(facts_to_add)})")
-            return json.dumps(
-                self._upsert_fact(
-                    req_mid,
-                    facts_to_add[0],
-                    target=target,
-                    tags=add_tags if args.get("tags") is not None else None,
-                    metadata=add_meta,
-                )
+            # A caller-chosen id is always written; rows under other ids that
+            # say the same are reported with it.
+            similar = self._similar_rows(facts_to_add[0], exclude_ids=tuple(self._lookup_ids(req_mid)))
+            out = self._upsert_fact(
+                req_mid,
+                facts_to_add[0],
+                target=target,
+                tags=add_tags if args.get("tags") is not None else None,
+                metadata=add_meta,
             )
+            if similar:
+                out["similar"] = similar
+            return json.dumps(out)
 
         if len(facts_to_add) == 1:
+            similar = self._similar_rows(facts_to_add[0])
+            for row in similar:
+                # The same text, for the same target, already carrying every
+                # tag asked for: a second row would add nothing.
+                if (
+                    row.get("identical")
+                    and row.get("target") == target
+                    and set(add_tags) <= set(row.get("tags") or [])
+                ):
+                    return json.dumps({
+                        "result": "An identical fact is already stored; nothing was added.",
+                        "memory_id": row["memory_id"],
+                        "duplicate": True,
+                    })
             mid = f"fact_{uuid.uuid4().hex[:16]}"
             self._insert(
                 memory_id=mid,
@@ -5182,9 +5255,11 @@ class OracleMemoryProvider(MemoryProvider):
                 target=target,
                 metadata=add_meta,
             )
-            out: dict[str, Any] = {"result": "Fact stored.", "memory_id": mid}
+            out = {"result": "Fact stored.", "memory_id": mid}
             if add_tags:
                 out["tags"] = add_tags
+            if similar:
+                out["similar"] = similar
             return json.dumps(out)
         else:
             # One array insert, committed once: either every fact is
@@ -5201,11 +5276,14 @@ class OracleMemoryProvider(MemoryProvider):
                 }
                 for mid, f in zip(mids, facts_to_add)
             ])
-            return json.dumps({
+            out = {
                 "result": f"Batch facts stored ({len(mids)}).",
                 "memory_ids": mids,
                 "count": len(mids),
-            })
+            }
+            if add_tags:
+                out["tags"] = add_tags
+            return json.dumps(out)
 
     def _tool_update(self, args: dict[str, Any]) -> str:
         """oracle_update: Replace a row's text and/or tags."""

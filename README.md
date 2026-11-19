@@ -60,6 +60,7 @@ Embeddings are computed inside the database, by the ONNX model that `HERMES_ORAC
 | `HERMES_ORACLE_SCHEMA_POLICY` | - | `REQUIRE_EXISTING`: run no DDL at start-up, only check the schema — see [INSTALL.md](INSTALL.md#step-7-security--least-privilege-operation) |
 | `HERMES_ORACLE_ONNX_MODEL` | `BGE_BASE_EN_V1_5` | In-database ONNX model name |
 | `HERMES_ORACLE_SKILL_FETCH_MAX_CHUNKS` | `400` | Safety cap for chunk reassembly during `oracle_load_skill(fetch)` |
+| `HERMES_ORACLE_ADD_SIMILAR_MIN` | `0.9` | Vector similarity (0 to 1) from which `oracle_add` reports a stored row as similar to the new fact; `0` turns the lookup off |
 | `HERMES_ORACLE_SYNC_SKILLS_TOOL` | - | `1`, `true`, `yes` or `on`: offer the `oracle_sync_skills` tool to this profile's sessions (never to a user-scoped session) |
 | `HERMES_ORACLE_INGEST_TIMEOUT` | `600` | Timeout in seconds for batch skill syncing and ingestion operations |
 | `HERMES_ORACLE_SEARCH_TIMEOUT_MS` | `30000` | Timeout in milliseconds for interactive recall queries (read-path fail-fast clamp) |
@@ -117,6 +118,23 @@ Limits: scoping separates the users of a frontend. It does not separate agents o
 | `oracle_chunk` | split inline text or a disk file in-database (refuses credential and system paths: env files, key directories and files, wallets, `/etc`) |
 | `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory. Offered only when the profile sets `HERMES_ORACLE_SYNC_SKILLS_TOOL=1`; `scripts/sync_skills.py` does the same from a shell |
 | `oracle_load_skill` | search, list or load skills from the shared Oracle skill corpus at runtime |
+
+### Duplicates on `oracle_add`
+
+Before it stores a single fact, `oracle_add` looks for stored rows that say nearly the same thing (one vector query, at most 3 seconds). The reply lists up to three of them:
+
+```json
+{"result": "Fact stored.", "memory_id": "fact_9f2c41d07a3b55e1",
+ "similar": [{"memory_id": "fact_1b7e", "score": 0.94, "content": "The billing export runs every night", "target": "memory"}]}
+```
+
+- The new fact is stored all the same; the caller decides whether to update the older row or delete one of the two.
+- A fact whose text is identical to one of the listed rows, with the same `target` and with tags that row already carries, is not stored again. The reply is `{"duplicate": true, "memory_id": "<the stored row>"}`. Only the listed rows are compared, so an identical row that is not among the three nearest does not stop the write.
+- A call with a `memory_id` always writes that row, and lists similar rows stored under other ids.
+- A batch (`facts` with more than one entry) is stored without the lookup.
+- Skill rows are not compared. A user-scoped session is compared with its own rows only.
+- If the lookup fails or times out, the fact is stored and the reply has no `similar` entry.
+- `HERMES_ORACLE_ADD_SIMILAR_MIN` sets the similarity from which a row is listed (default `0.9`); `0` turns the lookup off.
 
 ### Handoffs between agents and sessions
 
