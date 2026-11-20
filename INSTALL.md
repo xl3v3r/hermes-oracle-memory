@@ -1,9 +1,9 @@
 # Hermes Agent Oracle 26ai Memory Provider — Installation Guide
 
-![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.301-blue.svg)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
-This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.3) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
+This guide provides complete instructions for installing, configuring, and verifying the `hermes-oracle-memory` plugin (v1.1.301) for [Hermes Agent](https://github.com/nousresearch/hermes-agent), leveraging Oracle Autonomous AI Database (ADB) 26ai.
 
 ---
 
@@ -253,6 +253,39 @@ python3 scripts/reembed_embeddings.py --mode reembed    # rewrite every row (aft
 - `scripts/audit_embeddings.py` is a quick read-only check for cron: one line when everything is on the expected model.
 
 > **Removed in 1.1.2:** `scripts/backfill_embeddings.py`. It required an `OPENROUTER_API_KEY` and sent row text to an external embedding API when the in-database model failed. Use `--mode nulls` above instead.
+
+---
+
+## Tools and the memory toolset
+
+Hermes surfaces a memory provider's tools only while the `memory` toolset is
+enabled for the platform. An `oracle_only` deployment disables `memory` on
+purpose, to drop the built-in `MEMORY.md` tool — and before v1.1.301 that also
+removed every `oracle_*` tool and the memory rules (#38). Since v1.1.301 the
+eight `oracle_*` tools are also registered under the plugin's own `oracle`
+toolset, which resolves separately and is on by default, so they stay available
+either way.
+
+- **Why the tools vanish**: `hermes tools disable memory` removes the
+  provider-tool surface and the rules block. The `oracle` toolset copy survives.
+- **The `memory` relationship**: `hermes tools enable memory` restores the
+  built-in path; with it on, the `oracle` toolset copy is redundant but harmless.
+- **Default-on**: the `oracle` toolset is on for a platform until an operator
+  saves a toolset list without it.
+- **To disable**: `hermes tools disable oracle` (add `--platform <p>` for
+  another platform). `hermes tools enable oracle` turns it back on.
+
+Under `HERMES_ORACLE_OPTIONAL_RULES=oracle_only` the plugin also enforces the
+policy directly: a `pre_tool_call` hook refuses the built-in `memory` tool and
+`write_file` / `patch` writes to `MEMORY.md` and `USER.md`, and a `pre_llm_call`
+hook injects the memory rules on the first turn when the block was withheld.
+
+Operator diagnostics for a blank tool surface:
+
+```bash
+python3 scripts/doctor.py --env-file <path to the env file>
+hermes tools list --platform cli          # shows whether memory / oracle are on
+```
 
 ---
 

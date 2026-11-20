@@ -878,7 +878,7 @@ class TestOraclePlugin(unittest.TestCase):
     # -- Oracle-first behavior and _low pool tests --------------------------------
 
     def test_version(self):
-        self.assertEqual(oracle_plugin.__version__, "1.1.3")
+        self.assertEqual(oracle_plugin.__version__, "1.1.301")
 
     def test_system_prompt_block_oracle_first_rules(self):
         provider = oracle_plugin.OracleMemoryProvider()
@@ -2375,51 +2375,53 @@ class TestOraclePlugin(unittest.TestCase):
         repo_dir = Path(__file__).resolve().parent.parent
 
         # 1. __init__.py
-        self.assertEqual(oracle_plugin.__version__, "1.1.3")
+        self.assertEqual(oracle_plugin.__version__, "1.1.301")
 
         # 2. VERSION
         version_file = repo_dir / "VERSION"
         self.assertTrue(version_file.is_file())
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.1.3")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "1.1.301")
 
         # 3. plugin.yaml
         plugin_yaml = (repo_dir / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.3", plugin_yaml)
-        self.assertIn("version-1.1.3-blue.svg", plugin_yaml)
+        self.assertIn("version: 1.1.301", plugin_yaml)
+        self.assertIn("version-1.1.301-blue.svg", plugin_yaml)
         self.assertIn("provides_hooks:", plugin_yaml)
         self.assertIn("- on_skill_lifecycle", plugin_yaml)
+        self.assertIn("- pre_llm_call", plugin_yaml)
+        self.assertIn("- pre_tool_call", plugin_yaml)
 
         # 4. pyproject.toml
         pyproject = (repo_dir / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.1.3"', pyproject)
+        self.assertIn('version = "1.1.301"', pyproject)
 
         # 5. skills/oracle-import/SKILL.md
         skill_md = (repo_dir / "skills" / "oracle-import" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.3", skill_md)
+        self.assertIn("version: 1.1.301", skill_md)
 
         # 6. README.md & INSTALL.md
         readme = (repo_dir / "README.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.1.3-blue.svg", readme)
-        self.assertIn("v1.1.3", readme)
+        self.assertIn("version-1.1.301-blue.svg", readme)
+        self.assertIn("v1.1.301", readme)
 
         install_md = (repo_dir / "INSTALL.md").read_text(encoding="utf-8")
-        self.assertIn("version-1.1.3-blue.svg", install_md)
-        self.assertIn("v1.1.3", install_md)
+        self.assertIn("version-1.1.301-blue.svg", install_md)
+        self.assertIn("v1.1.301", install_md)
 
         # 6b. The second bundled skill carries the version too
         corpus_md = (repo_dir / "skills" / "oracle-skill-corpus" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("version: 1.1.3", corpus_md)
+        self.assertIn("version: 1.1.301", corpus_md)
         changelog = (repo_dir / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("## [1.1.3]", changelog)
+        self.assertIn("## [1.1.301]", changelog)
 
         # 7. Release notes policy (only current version maintained)
-        self.assertTrue((repo_dir / "RELEASE_NOTES_1.1.3.md").is_file())
-        for old_name in ["RELEASE_NOTES_1.1.2.md", "RELEASE_NOTES_1.1.1.4.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.md", "RELEASE_NOTES_1.1.0.1.md", "RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
+        self.assertTrue((repo_dir / "RELEASE_NOTES_1.1.301.md").is_file())
+        for old_name in ["RELEASE_NOTES_1.1.3.md", "RELEASE_NOTES_1.1.2.md", "RELEASE_NOTES_1.1.1.4.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.3.md", "RELEASE_NOTES_1.1.1.md", "RELEASE_NOTES_1.1.0.1.md", "RELEASE_NOTES_1.0.9.6.md", "RELEASE_NOTES_1.0.9.5.md", "RELEASE_NOTES_1.0.9.4.2.md"]:
             # read-only: a test must never delete files from the checkout
             self.assertFalse((repo_dir / old_name).exists(), old_name)
 
-        # 8. Git tag v1.1.3 points to master commit if tag file exists
-        tag_file = repo_dir / ".git" / "refs" / "tags" / "v1.1.3"
+        # 8. Git tag v1.1.301 points to master commit if tag file exists
+        tag_file = repo_dir / ".git" / "refs" / "tags" / "v1.1.301"
         if tag_file.is_file():
             master_file = repo_dir / ".git" / "refs" / "heads" / "master"
             if master_file.is_file():
@@ -2438,7 +2440,7 @@ class TestOraclePlugin(unittest.TestCase):
                 self.assertTrue(
                     rev,
                     "install-metadata revision must not be empty")
-                expected = {"v1.1.3"}
+                expected = {"v1.1.301"}
                 installed = Path.home() / ".hermes" / "plugins" / "oracle"
                 if (installed / ".git").is_dir():
                     head = _subprocess_run(
@@ -2447,7 +2449,7 @@ class TestOraclePlugin(unittest.TestCase):
                     if head and len(head) == 40:
                         expected.add(head)
                 tag_git = _subprocess_run(
-                    ["git", "-C", str(repo_dir), "rev-parse", "v1.1.3^{commit}"],
+                    ["git", "-C", str(repo_dir), "rev-parse", "v1.1.301^{commit}"],
                     capture_output=True, text=True).stdout.strip()
                 if tag_git and len(tag_git) == 40:
                     expected.add(tag_git)
