@@ -1,6 +1,6 @@
 # Hermes Agent — Oracle 26ai Memory Provider
 
-![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.301-blue.svg)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-orange.svg)
 
 A high-performance external memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent), backed by **Oracle Autonomous AI Database 26ai**. It gives the agent durable, cross-session memory with fused **vector + full-text hybrid recall**, in-database ONNX embeddings, background persistence, and a **shared fleet-wide skill corpus**.
@@ -169,6 +169,33 @@ Limits: scoping separates the users of a frontend. It does not separate agents o
 | `oracle_sync_skills` | scan, parse, and index skill libraries into vector memory. Offered only when the profile sets `HERMES_ORACLE_SYNC_SKILLS_TOOL=1`; `scripts/sync_skills.py` does the same from a shell |
 | `oracle_load_skill` | search, list or load skills from the shared Oracle skill corpus at runtime |
 
+### Tools and the memory toolset
+
+Hermes surfaces a memory provider's tools only while the `memory` toolset is
+enabled for the platform. An `oracle_only` deployment disables `memory` on
+purpose, to drop the built-in `MEMORY.md` tool — and before v1.1.301 that also
+removed every `oracle_*` tool and the memory rules (#38). Since v1.1.301 the
+eight `oracle_*` tools are also registered under the plugin's own `oracle`
+toolset, which resolves separately and is on by default, so they stay available
+either way.
+
+- **Why the tools vanish**: turn off `memory` with `hermes tools disable memory`
+  and the provider-tool surface (and the rules block) disappear with it. The
+  `oracle` toolset copy survives that.
+- **The `memory` relationship**: `hermes tools enable memory` restores the
+  built-in path; with it on, the `oracle` toolset copy is redundant but harmless.
+- **Default-on**: the `oracle` toolset is on for a platform until an operator
+  saves a toolset list without it.
+- **To disable**: `hermes tools disable oracle` (add `--platform <p>` for
+  another platform). `hermes tools enable oracle` turns it back on.
+
+Under `HERMES_ORACLE_OPTIONAL_RULES=oracle_only` the plugin also enforces the
+policy directly: a `pre_tool_call` hook refuses the built-in `memory` tool and
+`write_file` / `patch` writes to `MEMORY.md` and `USER.md`, and a `pre_llm_call`
+hook injects the memory rules on the first turn when the block was withheld.
+See [RELEASE_NOTES_1.1.301.md](RELEASE_NOTES_1.1.301.md) and
+[POSTMORTEM.md](POSTMORTEM.md).
+
 ### Duplicates on `oracle_add`
 
 Before it stores a single fact, `oracle_add` looks for stored rows that say nearly the same thing (one vector query, at most 3 seconds). The reply lists up to three of them:
@@ -327,7 +354,7 @@ ORA-51815: INMEMORY NEIGHBOR GRAPH HNSW vector index snapshot is too old.
 
 ## Release history
 
-The current release is v1.1.3. [CHANGELOG.md](CHANGELOG.md) lists the changes of every release; [RELEASE_NOTES_1.1.3.md](RELEASE_NOTES_1.1.3.md) has the upgrade notes for the current one.
+The current release is v1.1.301. [CHANGELOG.md](CHANGELOG.md) lists the changes of every release; [RELEASE_NOTES_1.1.301.md](RELEASE_NOTES_1.1.301.md) has the upgrade notes for the current one.
 
 ## Contributing
 

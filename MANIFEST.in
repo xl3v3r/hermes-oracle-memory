@@ -4,6 +4,7 @@ include README.md
 include INSTALL.md
 include CHANGELOG.md
 include RELEASE_NOTES_*.md
+include POSTMORTEM.md
 include LICENSE
 include CLA.md
 recursive-include skills *.md

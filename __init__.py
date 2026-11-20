@@ -26,7 +26,7 @@ import uuid
 from collections import OrderedDict, deque
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
@@ -38,7 +38,7 @@ except ImportError:  # older Hermes
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.3"
+__version__ = "1.1.301"
 
 VECTOR_INDEX_DDL = (
     "CREATE VECTOR INDEX {index_name} ON {table_name} (embedding) ORGANIZATION INMEMORY NEIGHBOR GRAPH"
@@ -413,6 +413,63 @@ import weakref as _weakref
 _LIVE_PROVIDERS: "_weakref.WeakSet[Any]" = _weakref.WeakSet()
 _LIVE_PROVIDERS_LOCK = threading.Lock()
 _LIVE_SEQ = itertools.count(1)
+
+# Toolset + hook registration is process-wide, while Hermes can call register()
+# again on later loads (status probes, profile switches). The registry rejects
+# duplicate tool names, so guard the whole block: the first load in a process
+# owns the registrations (#38).
+_TOOLSET_REGISTERED = False
+# The provider instance that owns the registry copy of the oracle_* tools:
+# the handler routes through it when no live provider serves the caller's
+# session. The claim gate (#147659) refuses callers of other profiles.
+_REGISTRY_PROVIDER = None  # type: ignore[assignment]  # set by register()
+
+
+def _reset_registration_state() -> None:
+    """Reset the process-wide registration flags so tests can re-run register()
+    in isolation (Hermes itself never calls this)."""
+    global _TOOLSET_REGISTERED, _REGISTRY_PROVIDER
+    _TOOLSET_REGISTERED = False
+    _REGISTRY_PROVIDER = None
+
+
+def _make_registry_tool_handler(name: str) -> Callable[..., str]:
+    """A registry handler for tool *name*: routes to the live provider serving
+    the caller's session (per-session scope checks still run), else to the
+    registering provider, else a clear not-available error (#38)."""
+
+    def _handler(args: Any, *, session_id: Any = None, task_id: Any = None, user_task: Any = None) -> str:
+        if not isinstance(args, dict):
+            args = {}
+        provider = _live_provider_of_session(session_id)
+        if provider is None and _REGISTRY_PROVIDER is not None:
+            provider = _REGISTRY_PROVIDER._live_provider_for(session_id) or _REGISTRY_PROVIDER
+        if provider is None:
+            return json.dumps(
+                {
+                    "error": (
+                        "Oracle memory is not available in this session. "
+                        "The memory provider is not active (memory.provider is not set to 'oracle') "
+                        "or no session has initialized it in this process."
+                    )
+                }
+            )
+        return provider.handle_tool_call(name, args)
+
+    _handler.__name__ = f"_registry_tool_{name}"
+    _handler.__doc__ = f"Registry entry point for {name} when the memory toolset is gated off (#38)."
+    return _handler
+
+
+def _registry_tool_check_fn() -> bool:
+    """Registry availability check for the oracle toolset: True while the
+    driver and the three OCI_DB_* settings resolve in THIS process (secret
+    scope or os.environ). No database connection is opened here."""
+    provider = _REGISTRY_PROVIDER
+    if provider is None:
+        return False
+    return provider.is_available()
+
 
 
 def _live_provider_of_session(session_id: Any, exclude: Any = None) -> Any:
@@ -1738,6 +1795,28 @@ def _prompt_body(optional: frozenset[str] = frozenset()) -> str:
     return "# Oracle 26ai Memory Rules (Hermes Agent)\n\n" + preamble + "\n\n" + "\n\n".join(
         f"{n}. {rules[n]}" for n in sorted(rules)
     )
+
+
+def _memory_block_withheld(platform: str) -> bool:
+    """Whether Hermes withheld the provider's system-prompt block for
+    *platform* because the 'memory' toolset is gated off. Mirrors
+    agent/system_prompt.py's gate for the block (memory_provider_tools_enabled)
+    using the same platform-toolset resolution the agent uses; any failure
+    answers False (the block is present) so the pre_llm_call hook never
+    duplicates it."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = load_config()
+        platform_toolsets = config.get("platform_toolsets") or {}
+        resolve_platform = "cli" if platform == "desktop" else platform
+        if platform_toolsets.get(resolve_platform) is None:
+            return False  # no saved list: the default toolset includes memory
+        enabled = _get_platform_tools(config, resolve_platform, include_default_mcp_servers=True)
+        return "memory" not in enabled
+    except Exception:
+        return False
 
 
 def _json_default(o: Any) -> Any:
@@ -4619,6 +4698,78 @@ class OracleMemoryProvider(MemoryProvider):
                     return p
         return max(live, key=lambda p: getattr(p, "_live_seq", 0))
 
+    def pre_llm_call(self, *args: Any, **kwargs: Any) -> dict[str, str] | None:
+        """Inject the Oracle memory rules when Hermes withheld the provider's
+        system-prompt block (the memory toolset is gated off for this platform,
+        which also suppresses system_prompt_block — #38). Only the first turn
+        of a session carries the digest; later turns keep the rules through
+        their own context. Nothing is injected when the block is present."""
+        data = args[0] if args and isinstance(args[0], dict) else {}
+        platform = kwargs.get("platform") or data.get("platform") or ""
+        if not isinstance(platform, str) or not platform:
+            platform = "cli"
+        if kwargs.get("is_first_turn", data.get("is_first_turn", False)) is not True:
+            return None
+        if not _memory_block_withheld(platform):
+            return None
+        try:
+            rules = _prompt_body(self._tune("optional_rules"))
+        except Exception:
+            rules = ""
+        if not rules:
+            return None
+        return {
+            "context": (
+                f"{rules}\n\n"
+                "(These Oracle 26ai memory rules are sent here because the 'memory' "
+                "toolset is disabled for this platform; the oracle_* tools are "
+                "still available through the plugin's own 'oracle' toolset.)"
+            )
+        }
+
+    def pre_tool_call(self, *args: Any, **kwargs: Any) -> dict[str, str] | None:
+        """Enforce the oracle_only policy: refuse the built-in memory tool and
+        direct edits to MEMORY.md / USER.md through write_file or patch. This
+        runs only when HERMES_ORACLE_OPTIONAL_RULES enables oracle_only."""
+        optional = self._tune("optional_rules")
+        if "oracle_only" not in optional:
+            return None
+        data = args[0] if args and isinstance(args[0], dict) else {}
+        tool_name = kwargs.get("tool_name") or data.get("tool_name") or ""
+        tool_args = kwargs.get("args") or data.get("args") or {}
+        if not isinstance(tool_name, str) or not isinstance(tool_args, dict):
+            return None
+        if tool_name == "memory":
+            return {
+                "action": "block",
+                "message": (
+                    "The built-in memory tool is blocked in this profile: HERMES_ORACLE_OPTIONAL_RULES "
+                    "includes oracle_only. All lasting memory lives in Oracle 26ai; use the oracle_* tools."
+                ),
+            }
+        if tool_name in ("write_file", "patch"):
+            path = str(tool_args.get("path") or tool_args.get("file") or "")
+            if path and self._is_local_memory_path(path):
+                return {
+                    "action": "block",
+                    "message": (
+                        "This profile runs oracle_only: MEMORY.md and USER.md are off-limits for facts. "
+                        "All lasting memory lives in Oracle 26ai; use the oracle_* tools."
+                    ),
+                }
+        return None
+
+    def _is_local_memory_path(self, path: str) -> bool:
+        home = self._hermes_home or _hermes_home_path()
+        if home is None:
+            return False
+        try:
+            p = Path(os.path.expanduser(os.path.expandvars(path))).resolve()
+            mem_dir = (home / "memories").resolve()
+            return p.parent == mem_dir and p.name in ("MEMORY.md", "USER.md")
+        except Exception:
+            return False
+
     def on_skill_lifecycle(self, *args: Any, **kwargs: Any) -> None:
         """Global hook entry point. Hermes binds this hook to whichever provider
         instance loaded LAST; once that instance's agent shuts down its pool is
@@ -6076,6 +6227,7 @@ _safe_varchar_bytes = OracleMemoryProvider._safe_varchar_bytes
 
 
 def register(ctx) -> None:
+    global _TOOLSET_REGISTERED, _REGISTRY_PROVIDER
     provider = OracleMemoryProvider()
     ctx.register_memory_provider(provider)
     if hasattr(ctx, "register_hook"):
@@ -6083,6 +6235,39 @@ def register(ctx) -> None:
             ctx.register_hook("on_skill_lifecycle", provider.on_skill_lifecycle)
         except Exception as exc:
             logger.debug("Failed to register on_skill_lifecycle hook: %s", exc)
+        try:
+            ctx.register_hook("pre_llm_call", provider.pre_llm_call)
+        except Exception as exc:
+            logger.debug("Failed to register pre_llm_call hook: %s", exc)
+        try:
+            ctx.register_hook("pre_tool_call", provider.pre_tool_call)
+        except Exception as exc:
+            logger.debug("Failed to register pre_tool_call hook: %s", exc)
+    # Registry copy of the eight oracle_* tools under the plugin's own
+    # toolset (#38): Hermes only surfaces memory-provider tools while the
+    # 'memory' toolset is enabled, which an oracle_only deployment turns off
+    # (to remove the built-in MEMORY.md tool). A plugin toolset resolves
+    # separately from 'memory', so the tools stay available either way.
+    # Registered once per process: the plugin's register() can run again on
+    # later loads (status probes), and the registry rejects duplicate names.
+    if hasattr(ctx, "register_tool") and not _TOOLSET_REGISTERED:
+        for schema in TOOL_SCHEMAS:
+            name = schema.get("name")
+            if not isinstance(name, str):
+                continue
+            try:
+                ctx.register_tool(
+                    name=name,
+                    toolset="oracle",
+                    schema=schema,
+                    handler=_make_registry_tool_handler(name),
+                    check_fn=_registry_tool_check_fn,
+                    description="Oracle 26ai memory tool (oracle toolset, independent of the 'memory' toolset).",
+                )
+            except Exception as exc:
+                logger.debug("Failed to register registry tool %s: %s", name, exc)
+        _REGISTRY_PROVIDER = provider
+        _TOOLSET_REGISTERED = True
     if hasattr(ctx, "register_skill"):
         try:
             skill_path = Path(__file__).parent / "skills" / "oracle-import" / "SKILL.md"

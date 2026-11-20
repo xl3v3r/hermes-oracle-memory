@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.301] - 2026-11-20
+
+Findings of #38: an `oracle_only` deployment that disables the `memory` toolset lost its `oracle_*` tools and the memory rules. There is no schema change.
+
+### Added
+- **The `oracle` toolset (#38)**: the eight `oracle_*` tools are also registered under the plugin's own `oracle` toolset, which resolves separately from `memory` and is on by default. The tools now stay available when the `memory` toolset is disabled. Registry handlers route to the live provider of the caller's session, else to the registering provider, else return a clean "not available" error; an availability check reports the driver and settings state without opening a connection.
+- **`pre_llm_call` hook (#38)**: injects the memory rules on the first turn when Hermes withheld the provider's system-prompt block because `memory` is off (and does nothing when the block is present).
+- **`pre_tool_call` hook (#38)**: under `HERMES_ORACLE_OPTIONAL_RULES=oracle_only`, refuses the built-in `memory` tool and `write_file` / `patch` writes to `MEMORY.md` and `USER.md`.
+- **`scripts/doctor.py`**: standalone diagnostics (version, driver, which `OCI_DB_*` are set without values, a `SELECT 1` probe, the toolset gate and `memory.memory_enabled` when the Hermes config is readable). Exit 0/1.
+- **`scripts/memory_cli.py`**: add / search / get / delete for operators, running the same handlers as the tools, out of process.
+- Tests: `tests/test_toolset.py`.
+
+### Fixed
+- **#38**: the `oracle_*` tools and the rule block no longer vanish when the `memory` toolset is disabled.
+
+### Documentation
+- README and INSTALL gain "Tools and the memory toolset" (#38).
+- New `POSTMORTEM.md` (#38).
+
 ## [1.1.3] - 2026-11-18
 
 Findings of the 1.1.1.5 review that 1.1.2 left open (#23, #28, #29, #30, #31, #33, #34). Not in this release: one connection pool per provider (#28), and from #29 the explicit approximate search, the 1,200-character embedding window and the two indexes.

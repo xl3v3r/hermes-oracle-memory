@@ -96,15 +96,20 @@ class TestSkillLifecycleHook(unittest.TestCase):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         mock_ctx.register_memory_provider.assert_called_once()
-        mock_ctx.register_hook.assert_called_with("on_skill_lifecycle", unittest.mock.ANY)
-        cb = mock_ctx.register_hook.call_args[0][1]
+        # on_skill_lifecycle must stay the FIRST hook registration: the skill-usage
+        # tests pick the first callback (#38 added pre_llm_call and pre_tool_call).
+        self.assertEqual(
+            [c[0][0] for c in mock_ctx.register_hook.call_args_list],
+            ["on_skill_lifecycle", "pre_llm_call", "pre_tool_call"],
+        )
+        cb = mock_ctx.register_hook.call_args_list[0][0][1]
         self.assertTrue(callable(cb))
 
     def test_on_skill_lifecycle_used_action(self):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         with patch.object(provider, "_queue_background_insert") as mock_insert:
             hook_cb(action="used", skill_name="oracle-import", session_id="test-session-123")
@@ -131,7 +136,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         with patch.object(provider, "_queue_background_insert") as mock_insert:
             hook_cb(
@@ -161,7 +166,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         for ignored in ("created", "archived", "patched", "edited", "unknown"):
             with patch.object(provider, "_queue_background_insert") as mock_insert:
@@ -172,7 +177,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         with patch.object(provider, "_queue_background_insert") as mock_insert:
             hook_cb(action="used", skill_name="", session_id="s1")
@@ -182,7 +187,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         with patch.object(provider, "_queue_background_insert", side_effect=RuntimeError("Insert failed")):
             # Should not raise
@@ -195,7 +200,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
         mock_ctx = MagicMock()
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         with patch.object(provider, "_queue_background_insert") as mock_insert:
             hook_cb({"action": "used", "skill_name": "test-skill", "session_id": "sess-dict"})
@@ -209,7 +214,7 @@ class TestSkillLifecycleHook(unittest.TestCase):
         oracle_plugin.register(mock_ctx)
         provider = mock_ctx.register_memory_provider.call_args[0][0]
         provider._session_id = "provider-session-default"
-        hook_cb = mock_ctx.register_hook.call_args[0][1]
+        hook_cb = mock_ctx.register_hook.call_args_list[0][0][1]
 
         with patch.object(provider, "_queue_background_insert") as mock_insert:
             hook_cb(action="used", skill_name="test-skill")
